@@ -1,0 +1,30 @@
+# Covenant source data -- inputs, never modified by the app, not tracked in git
+/[0-9]*/
+/_textcache/
+/_textcache_v2/
+/_textcache_final/
+/_ocr2_work/
+/Covenant_Matrix/
+/Covenant_Matrix_SAMPLE/
+/_pilot/
+Covenant_App_Management_Brief.*
+.~lock.*
+
+# Postgres cluster (local dev data directory)
+/.pgdata/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# Secrets / local config
+.env
+*.local.env
+
+# OS cruft
+.DS_Store
+
+# Editor / temp
+*.tmp

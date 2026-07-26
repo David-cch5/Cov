@@ -1,0 +1,16 @@
+# Managed via the `covenant_app` conda environment (conda-forge):
+#   conda create -n covenant_app -c conda-forge python=3.12 postgresql postgis \
+#     psycopg2 geoalchemy2 sqlalchemy alembic shapely playwright pytesseract flask requests pyproj
+#
+# This file documents the same set for pip-based tooling / reference; prefer the conda env above.
+sqlalchemy>=2.0
+alembic>=1.13
+psycopg2-binary>=2.9
+geoalchemy2>=0.20
+shapely>=2.0
+playwright>=1.40
+pytesseract>=0.3
+flask>=3.0
+requests>=2.31
+anthropic>=0.40
+pyproj>=3.6
