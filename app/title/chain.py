@@ -89,20 +89,101 @@ from app.title import cad_deed_history, co_assessor_sales
 
 MAX_HOPS = 10
 
+# Both sets confirmed real by directly sampling live recorder-portal data across every
+# GovOS PublicSearch county this project currently has a recorder-portal process for
+# (Bexar's own Advanced Search "Document Types" filter list, plus real DOC TYPE values
+# seen in actual search results from Collin, Denton, Montgomery, and Nueces) -- not
+# guessed. CONVEYANCE_DOC_TYPES is deliberately the SMALLER, higher-confidence set:
+# never fabricate a Transfer of Title by assuming a type is a conveyance just because
+# it's absent from NON_CONVEYANCE_DOC_TYPES (see _unrecognized_doc_type_flags).
 CONVEYANCE_DOC_TYPES = {
     "DEED", "WARRANTY DEED", "GENERAL WARRANTY DEED", "SPECIAL WARRANTY DEED",
     "QUITCLAIM DEED", "QUIT CLAIM DEED", "TRUSTEE'S DEED", "TRUSTEE DEED",
     "EXECUTOR'S DEED", "EXECUTORS DEED", "ADMINISTRATOR'S DEED", "GIFT DEED",
     "DEED OF GIFT", "CORRECTION DEED", "SHERIFF'S DEED", "SHERIFFS DEED", "TAX DEED",
+    # foreclosure-related deeds -- real conveyances of title, not merely foreclosure
+    # PROCESS documents (see FORECLOSURE_DEED_TYPE_MARKERS below for classification).
+    "SUBSTITUTE TRUSTEE'S DEED", "SUBSTITUTE TRUSTEES DEED",
+    "TRUSTEE'S/SUBSTITUTE TRUSTEE'S DEED",  # confirmed real, Denton
+    "DEED IN LIEU OF FORECLOSURE",  # confirmed real, Denton (11 occurrences)
 }
 NON_CONVEYANCE_DOC_TYPES = {
-    "DECLARATION", "DEED OF TRUST", "RELEASE", "PARTIAL RELEASE", "RELEASE OF LIEN",
-    "RELEASE OF STATE TAX LIEN", "MODIFICATION", "UCC 1 REAL PROPERTY", "UCC", "UCC1",
-    "LIEN", "MECHANICS LIEN", "MECHANIC LIEN AFFIDAVIT", "JUDGMENT", "AFFIDAVIT",
-    "NOTICE", "EASEMENT", "AGREEMENT", "APPOINTMENT", "ASSIGNMENT", "BOND",
+    "DECLARATION", "DEED OF TRUST", "DEED OF TRUST SECURED", "RELEASE", "PARTIAL RELEASE",
+    "RELEASE OF LIEN", "RELEASE OF STATE TAX LIEN", "MODIFICATION", "UCC 1 REAL PROPERTY",
+    "UCC", "UCC1", "UCC RP", "LIEN", "MECHANICS LIEN", "MECHANIC LIEN AFFIDAVIT", "JUDGMENT",
+    "AFFIDAVIT", "NOTICE", "EASEMENT", "AGREEMENT", "APPOINTMENT", "ASSIGNMENT", "BOND",
     "CERTIFIED COPY", "EXTENSION", "LIS PENDENS", "RESOLUTION",
+    # confirmed real via Bexar's own Advanced Search "Document Types" filter list (the
+    # county clerk's own canonical category names) -- covers a lot of document types
+    # this project hadn't encountered in a live search result yet, so wasn't previously
+    # classified either way; none of these convey title.
+    "ACKNOWLEDGEMENT", "ADDENDUM", "AFFIDAVIT RESTITUTION LIEN", "AMENDMENT", "APPLICATION",
+    "ARTICLES OF INC", "ASSIGNMENT OF JUDGMENT", "ASSIGNMENT SECURED", "ASSUMPTION",
+    "BILL OF SALE", "BOND TO INDEMNIFY", "CANCELLATION", "CANCELLATION OF JUDGMENT",
+    "CERTIFICATE", "CHILD SUPPORT LN", "CONDOMINIUM ASSOCIATION MANAGEMENT CERTIFICATE",
+    "CONDOMINIUM PLAN", "CONFLICT OF INTEREST QUESTIONNAIRE", "CORPORATE",
+    "DEED AFFIDAVIT", "DECREE", "DESIGNATION", "DISMISSAL", "HOMESTEAD AFFIDAVIT",
+    "HOSPITAL LIEN", "LANDLORD LIEN", "LEASE", "LETTERS", "LEVY", "LOAN",
+    "MASTER MORTGAGE", "MEMORANDUM", "MISCELLANEOUS", "MORTGAGE",
+    "NOTE", "ORDER", "ORDINANCE", "PARTIAL ASSIGNMENT OF JUDGMENT",
+    "PARTIAL RELEASE OF JUDGMENT", "PARTIAL TRANSFER OF JUDGMENT", "POWER OF ATTORNEY",
+    "POWER OF ATTORNEY SECURED", "PROBATE", "PUBLIC WEIGHER BOND", "RECONVEYANCE",
+    "REFERENCE SHEET", "REINSTATEMENT", "RELEASE OF HL", "RELEASE OF JUDGMENT",
+    "REMOVAL", "RENEWAL", "REPLACEMENT", "RESCISSION", "RESIGNATION", "RESTRICTIONS",
+    "RETAIL INST CONTRACT", "REVOCATION", "RIGHT OF WAY AGREEMENT", "SATISFACTION",
+    "SATISFACTION OF JUDGMENT", "STATEMENT", "SUBORDINATION", "SUBSTITUTION",
+    "TERMINATION", "TRANSCRIPT OF JUDGMENT", "TRANSFER OF JUDGMENT", "TRUST",
+    "VARIANCE", "WAIVER", "WATER PERMIT", "WATER PERMIT MAPS", "WATER RIGHTS/PERMIT",
+    "WILL & TESTAMENT", "FEDERAL TAX LIENS", "STATE TAX LIENS", "STATE TAX LIEN",
+    # confirmed real, Collin/Denton/Nueces samples.
+    "TRUST AGREEMENT", "TRUST AGREEMENT/DECLARATION", "MEMORANDUM OF TRUST AGREEMENT",
+    "TERMINATION OF TRUST", "APPOINTMENT OF TRUSTEE/SUBSTITUTE TRUSTEE",
+    "RESIGNATION OF TRUSTEE", "LEASE TERMINATION", "HOMESTEAD AFFIDAVIT/DECLARATION/DESIGNATION",
+    "ASSUMED NAME", "PLAT", "PLAT INFORMATION", "FINANCING STATEMENT",
+    "FINANCING STATEMENT - NON STND", "HOMEOWNERS ASSOC DOCS",
+    # a document that voids a PRIOR foreclosure sale -- doesn't itself convey title, but
+    # a real signal that an earlier recorded conveyance in the chain may need re-review
+    # (the same "a later document can retroactively change an earlier one's effect"
+    # pattern already seen with covenant terminations -- not yet acted on automatically,
+    # just correctly kept out of the conveyance chain rather than mistaken for one).
+    "DECLARATION OF INVALIDITY OF FORECLOSURE SALE",
+    # confirmed real, Montgomery/covid 3297 -- this vendor's own spelling/formatting
+    # varies even for a type already covered under a different exact string (singular
+    # vs plural, a dropped "OF") -- surfaced by _unrecognized_doc_type_flags rather than
+    # silently dropped, exactly as designed.
+    "UCC6 TERMINATION", "POWER ATTORNEY", "MECHANIC LIEN",
+    "ABSTRACT OF JUDGMENT", "CERTIFIED COPY DIVORCE",
+}
+
+# GovOS PublicSearch's own DOC TYPE vocabulary for foreclosure-related deeds -- an
+# actual Transfer of Title (already in CONVEYANCE_DOC_TYPES above), just one this
+# project can classify "foreclosure" with confidence from the type name alone, the
+# same way FORECLOSURE_DEED_TYPE_MARKERS does for Harris Govern PACS's own vocabulary
+# (deed_type_cd/deed_type_desc) in _walk_via_cad_deed_history. Deliberately NOT
+# including "TAX DEED" here -- a tax-sale foreclosure is a real but distinct concept
+# this project hasn't confirmed the templates treat the same way.
+GOVOS_FORECLOSURE_DEED_TYPES = {
+    "TRUSTEE'S DEED", "TRUSTEE DEED", "SUBSTITUTE TRUSTEE'S DEED", "SUBSTITUTE TRUSTEES DEED",
+    "TRUSTEE'S/SUBSTITUTE TRUSTEE'S DEED", "SHERIFF'S DEED", "SHERIFFS DEED",
+    "DEED IN LIEU OF FORECLOSURE",
 }
 FORECLOSURE_DEED_TYPE_MARKERS = {"FC", "FORECLOSURE"}
+
+# Per direct guidance (confirmed independently: Texas real property is conveyed via
+# specifically-named deeds -- warranty, special warranty, quitclaim, trustee's, etc. --
+# not a generically-labeled "Conveyance"), a bare "CONVEYANCE" DOC TYPE in a Texas
+# county's own index is usually NOT a Transfer of Title of the encumbered property at
+# all. It's commonly an assignment of some OTHER interest that still references the same
+# lot/block in its legal description -- most relevant here, an assignment of the
+# covenant's OWN beneficiary/trustee interest (who has the right to collect the transfer
+# fee), not a sale of the land. Confirmed real and consistent with this: covid 3297's own
+# "CONVEYANCE" document (FCP Holdings I LLC -> Cinco West Development LLC) didn't
+# connect to the rest of that lot's real title chain at all. Deliberately kept OUT of
+# CONVEYANCE_DOC_TYPES (never assumed a real transfer) and OUT of NON_CONVEYANCE_DOC_TYPES
+# (never silently dropped either -- it could genuinely matter for tracking who holds the
+# covenant's own benefit) -- flagged for manual review instead, state-scoped since this is
+# specifically a Texas recording-practice fact, not a general one.
+TX_AMBIGUOUS_CONVEYANCE_TYPES = {"CONVEYANCE"}
 
 # a trailing "w/ vendor's lien" (or "with vendor's lien") is a financing detail, not a
 # distinct instrument type -- confirmed real on covid 3297/Montgomery: "WARRANTY DEED
@@ -335,8 +416,10 @@ def walk_chain_of_title(session, covid: int, tract_no: int = 1, max_parcels: int
     happens to return."""
     covenant = session.execute(
         text("""
-            SELECT county_fips, declarant_raw, recording_instrument, recording_date, template_version_id
-            FROM covenant WHERE covid = :covid
+            SELECT c.county_fips, c.declarant_raw, c.recording_instrument, c.recording_date,
+                   c.template_version_id, co.state_code
+            FROM covenant c JOIN county co ON co.county_fips = c.county_fips
+            WHERE c.covid = :covid
         """), {"covid": covid},
     ).fetchone()
     if covenant is None:
@@ -696,14 +779,13 @@ def _walk_via_recorder_portal(session, covid: int, covenant, parcel, registry,
 
         next_row = same_day[0]
         doc_num = next_row["DOC NUMBER"]
-        category, basis = _classify_pre_effective_date(earliest_date, covenant, rules)
-        if category is None and _names_match(next_row.get("GRANTOR", ""), covenant.declarant_raw):
-            category, basis = "declarant_sale", "grantor matches covenant's own declarant"
-
-        review_reason = None if category else (
+        category, basis, affidavit_note = _classify_recorder_portal_link(
+            next_row.get("DOC TYPE"), next_row.get("GRANTOR", ""), earliest_date, covenant, rules,
+        )
+        review_reason = affidavit_note if affidavit_note else (None if category else (
             "exemption category not auto-classifiable from recorder index alone (grantor/grantee "
             "names only) -- needs manual review of the deed's own recitals"
-        )
+        ))
         if declarant_link_unconfirmed:
             unconfirmed_note = (
                 f"this is the earliest post-covenant conveyance found for this lot/block, but its "
@@ -727,14 +809,22 @@ def _walk_via_recorder_portal(session, covid: int, covenant, parcel, registry,
             "prior_instrument_number": prior_instrument_number,
             "exemption_category": category,
             "exemption_basis": basis,
-            # declarant_link_unconfirmed does NOT force review_flag here: it can only
-            # co-occur with category in {None, "pre_effective_date"} (declarant_sale
-            # requires a grantor match, which is exactly what's absent when this flag is
-            # set) -- pre_effective_date is a pure recording-date comparison, unaffected
-            # by whether the grantor is confirmed to trace back to the declarant. The
-            # caveat is still recorded in review_reason for a human reviewer, but doesn't
-            # override an otherwise fully-confirmed exemption into a false "fee owed."
-            "review_flag": category is None,
+            # declarant_link_unconfirmed does NOT itself force review_flag: it can only
+            # co-occur with category in {None, "pre_effective_date", "foreclosure"} (never
+            # "declarant_sale", which requires the very grantor match that's absent when
+            # this flag is set) -- pre_effective_date is a pure recording-date fact, and a
+            # foreclosure classification comes from the deed's own DOC TYPE, neither
+            # affected by whether the grantor is confirmed to trace back to the declarant.
+            # The caveat is still recorded in review_reason for a human reviewer, but
+            # doesn't override an otherwise fully-confirmed exemption into a false "fee
+            # owed." affidavit_note (migration 0030's V02/V03/V12 gate) is the one thing
+            # that DOES still force review, same as _walk_via_cad_deed_history.
+            "review_flag": category is None or affidavit_note is not None,
+            # a category match under an affidavit-gated template is a real signal, just
+            # not a confirmable one from index data alone -- half confidence, not the
+            # usual full 1.0 for an auto-classified category (mirrors the CAD deed
+            # history path's own exemption_confidence handling).
+            "exemption_confidence": 0.5 if affidavit_note else (1.0 if category else None),
             "review_reason": review_reason,
         })
         consumed.add(doc_num)
@@ -746,7 +836,84 @@ def _walk_via_recorder_portal(session, covid: int, covenant, parcel, registry,
             if d and _matches_anchor(row):
                 candidate_pool.setdefault(d, row)
 
+    chain.extend(_unrecognized_doc_type_flags(candidate_pool, consumed, covenant))
     return chain
+
+
+def _classify_recorder_portal_link(doc_type: str | None, grantor: str, recorded: date,
+                                    covenant, rules: dict[str, dict] | None) -> tuple[str | None, str | None, str | None]:
+    """Exemption classification for one recorder-portal conveyance, checked
+    in the same priority order as every other walker in this module:
+    pre_effective_date (a plain date comparison, checked first since it
+    doesn't depend on any name/type heuristic), then foreclosure (this
+    vendor's own DOC TYPE naming a foreclosure-related deed -- confirmed
+    real across Bexar/Collin/Denton/Nueces, see GOVOS_FORECLOSURE_DEED_TYPES),
+    then declarant_sale (grantor matches the covenant's own declarant).
+    Returns (category, basis, affidavit_note) -- affidavit_note is the same
+    migration-0030 V02/V03/V12 gate _walk_via_cad_deed_history already
+    applies, non-None only when the matched category is one of the four
+    that template family requires a Grantor's affidavit for."""
+    category, basis = _classify_pre_effective_date(recorded, covenant, rules)
+    doc_type_normalized = _normalize_doc_type((doc_type or "").strip().upper())
+    if category is None and doc_type_normalized in GOVOS_FORECLOSURE_DEED_TYPES:
+        category, basis = "foreclosure", "recorder index's own DOC TYPE marks this a foreclosure-related deed"
+    if category is None and _names_match(grantor, covenant.declarant_raw):
+        category, basis = "declarant_sale", "grantor matches covenant's own declarant"
+    affidavit_note = _affidavit_gate_note(category, rules or {})
+    return category, basis, affidavit_note
+
+
+def _unrecognized_doc_type_flags(candidate_pool: dict[str, dict], consumed: set[str], covenant) -> list[dict]:
+    """Anything left in the candidate pool that's neither a recognized
+    conveyance nor a recognized non-conveyance is a real gap in this
+    project's own type vocabulary, not something to silently treat as non-
+    conveyance -- exactly the failure mode that missed "WARRANTY DEED
+    W/VENDORS LIEN" on covid 3297 before that variant was catalogued (see
+    CONVEYANCE_DOC_TYPES' own comment). Since candidate_pool is already
+    filtered to rows matching this parcel's own lot/block/subdivision
+    (_matches_anchor), an unrecognized type found here is likely actually
+    about this property, not unrelated noise -- flagged the same way an
+    ambiguous same-day split already is (never silently dropped, never
+    silently assumed a conveyance either), so a genuinely new county's
+    vocabulary surfaces for review instead of quietly under-counting real
+    Transfers of Title. TX_AMBIGUOUS_CONVEYANCE_TYPES gets its own more
+    specific note (a known reason for the ambiguity), rather than the
+    generic "totally unrecognized" one, when the covenant is in Texas."""
+    flags = []
+    for doc_num, row in candidate_pool.items():
+        if doc_num in consumed:
+            continue
+        doc_type = _normalize_doc_type((row.get("DOC TYPE") or "").strip().upper())
+        if not doc_type or doc_type in CONVEYANCE_DOC_TYPES or doc_type in NON_CONVEYANCE_DOC_TYPES:
+            continue
+        recorded = _parse_slash_date(row.get("RECORDED DATE", ""))
+        if recorded is None or recorded < covenant.recording_date:
+            continue
+        if covenant.state_code == "TX" and doc_type in TX_AMBIGUOUS_CONVEYANCE_TYPES:
+            review_reason = (
+                f"document type {row.get('DOC TYPE')!r} is a generic Texas recorder label that's "
+                f"usually NOT a Transfer of Title of the encumbered property -- real Texas "
+                f"conveyances use a specifically-named deed instead. This is commonly an "
+                f"assignment of some other interest (e.g. the covenant's own beneficiary/trustee "
+                f"interest, i.e. who has the right to collect the transfer fee, not a sale of the "
+                f"land) that still references the same lot/block in its legal description. Needs a "
+                f"human to read the actual document before treating it as either a real conveyance "
+                f"or unrelated noise."
+            )
+        else:
+            review_reason = (
+                f"document type {row.get('DOC TYPE')!r} is not in this project's known "
+                f"conveyance/non-conveyance vocabulary -- could be a real Transfer of Title this "
+                f"walk would otherwise silently miss; needs manual classification, not assumed "
+                f"either way."
+            )
+        flags.append({
+            "ambiguous_split": True,
+            "recording_date": str(recorded),
+            "candidates": [row],
+            "review_reason": review_reason,
+        })
+    return flags
 
 
 def _walk_hop1_candidates(candidate_pool: dict[str, dict], consumed: set[str], current_holder: str,

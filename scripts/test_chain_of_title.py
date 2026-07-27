@@ -18,13 +18,19 @@ sys.path.insert(0, ".")
 
 from app.db.session import get_session
 from app.title.chain import (
+    CONVEYANCE_DOC_TYPES,
+    GOVOS_FORECLOSURE_DEED_TYPES,
+    NON_CONVEYANCE_DOC_TYPES,
+    TX_AMBIGUOUS_CONVEYANCE_TYPES,
     _address_seed,
     _affidavit_gate_note,
     _anchor_lot_is_unreliable,
     _classify_pre_effective_date,
+    _classify_recorder_portal_link,
     _normalize_doc_type,
     _row_lots,
     _subdivisions_match,
+    _unrecognized_doc_type_flags,
     _walk_hop1_candidates,
     walk_chain_of_title,
 )
@@ -195,6 +201,118 @@ def test_walk_hop1_candidates_relaxed_fallback() -> None:
           "actually matches the declarant")
 
 
+def test_doc_type_vocabulary_no_overlap() -> None:
+    """CONVEYANCE_DOC_TYPES and NON_CONVEYANCE_DOC_TYPES were substantially
+    expanded from real live samples across every GovOS PublicSearch county
+    this project has a recorder-portal process for (Bexar's own Advanced
+    Search "Document Types" filter, plus real DOC TYPE values seen in
+    Collin/Denton/Montgomery/Nueces results) -- must never classify the
+    same string both ways, and every foreclosure-marking type must itself
+    already be a recognized conveyance (a foreclosure deed IS a real
+    Transfer of Title, just one this project can auto-classify)."""
+    assert CONVEYANCE_DOC_TYPES & NON_CONVEYANCE_DOC_TYPES == set()
+    assert GOVOS_FORECLOSURE_DEED_TYPES <= CONVEYANCE_DOC_TYPES
+    print("PASS: CONVEYANCE_DOC_TYPES/NON_CONVEYANCE_DOC_TYPES don't overlap; "
+          "every foreclosure marker is a recognized conveyance")
+
+
+def test_classify_recorder_portal_link_foreclosure() -> None:
+    """Confirmed real (Denton): "SUBSTITUTE TRUSTEE'S DEED" and "DEED IN
+    LIEU OF FORECLOSURE" are genuine conveyances this vendor's own DOC TYPE
+    marks as foreclosure-related -- classified the same way
+    _walk_via_cad_deed_history already does for Harris Govern PACS's own
+    vocabulary, including the same V02/V03/V12 affidavit gate."""
+    covenant = SimpleNamespace(recording_date=date(2009, 1, 1), declarant_raw="SOME DECLARANT LP")
+
+    category, basis, note = _classify_recorder_portal_link(
+        "SUBSTITUTE TRUSTEE'S DEED", "UNRELATED BANK NA", date(2020, 1, 1), covenant, {},
+    )
+    assert category == "foreclosure", (category, basis)
+    assert note is None, note  # not gated -- no requires_grantor_affidavit rule for this template
+
+    category, basis, note = _classify_recorder_portal_link(
+        "DEED IN LIEU OF FORECLOSURE", "UNRELATED BANK NA", date(2020, 1, 1), covenant, {},
+    )
+    assert category == "foreclosure", (category, basis)
+
+    # a V02/V03/V12-style template gates foreclosure behind a Grantor's affidavit --
+    # still a real, positive classification, just flagged rather than blanked out.
+    gated_rules = {"foreclosure": {"requires_grantor_affidavit": True}}
+    category, basis, note = _classify_recorder_portal_link(
+        "SUBSTITUTE TRUSTEE'S DEED", "UNRELATED BANK NA", date(2020, 1, 1), covenant, gated_rules,
+    )
+    assert category == "foreclosure", (category, basis)
+    assert note is not None and "affidavit" in note, note
+
+    # an ordinary warranty deed from an unrelated grantor is not auto-classifiable at all
+    category, basis, note = _classify_recorder_portal_link(
+        "WARRANTY DEED", "UNRELATED SELLER LLC", date(2020, 1, 1), covenant, {},
+    )
+    assert category is None, (category, basis)
+    print("PASS: _classify_recorder_portal_link -> foreclosure-marking DOC TYPEs auto-classify, "
+          "gated by the same V02/V03/V12 affidavit requirement as the CAD deed history path")
+
+
+def test_unrecognized_doc_type_flags() -> None:
+    """A doc_type that's neither a recognized conveyance nor a recognized
+    non-conveyance must be flagged for review, not silently treated as a
+    non-conveyance -- the exact failure mode that missed "WARRANTY DEED
+    W/VENDORS LIEN" on covid 3297 before that variant was catalogued. A
+    recognized type (either bucket) or one already consumed as part of the
+    resolved chain must NOT be flagged."""
+    covenant = SimpleNamespace(recording_date=date(2009, 1, 1), state_code="TX")
+    pool = {
+        "1": {"DOC NUMBER": "1", "DOC TYPE": "SOME BRAND NEW DEED VARIANT NOBODY HAS SEEN",
+              "RECORDED DATE": "6/1/2020"},
+        "2": {"DOC NUMBER": "2", "DOC TYPE": "WARRANTY DEED", "RECORDED DATE": "6/1/2020"},  # recognized
+        "3": {"DOC NUMBER": "3", "DOC TYPE": "RELEASE OF LIEN", "RECORDED DATE": "6/1/2020"},  # recognized
+        "4": {"DOC NUMBER": "4", "DOC TYPE": "SOME BRAND NEW DEED VARIANT NOBODY HAS SEEN",
+              "RECORDED DATE": "6/1/2020"},  # would be flagged, but already consumed
+        "5": {"DOC NUMBER": "5", "DOC TYPE": "SOME BRAND NEW DEED VARIANT NOBODY HAS SEEN",
+              "RECORDED DATE": "1/1/2000"},  # unrecognized, but predates the covenant -- ignored
+    }
+    flags = _unrecognized_doc_type_flags(pool, consumed={"4"}, covenant=covenant)
+    assert len(flags) == 1, flags
+    assert flags[0]["ambiguous_split"] is True, flags[0]
+    assert flags[0]["candidates"][0]["DOC NUMBER"] == "1", flags[0]
+    assert "not in this project's known" in flags[0]["review_reason"], flags[0]
+    print("PASS: _unrecognized_doc_type_flags -> flags unrecognized types for review, "
+          "never silently treats them as non-conveyances")
+
+
+def test_tx_conveyance_type_flagged_not_trusted() -> None:
+    """Per direct guidance (confirmed independently: Texas real property is
+    conveyed via specifically-named deeds, not a generic "Conveyance"
+    label): a bare "CONVEYANCE" DOC TYPE in a Texas county is commonly an
+    assignment of some OTHER interest -- most relevant here, the covenant's
+    own beneficiary/trustee interest, not a sale of the land -- so it must
+    NEVER be silently trusted as a real Transfer of Title (removed from
+    CONVEYANCE_DOC_TYPES entirely) but also never silently dropped as a
+    non-conveyance either (deliberately absent from NON_CONVEYANCE_DOC_TYPES
+    too) -- it must be flagged with its own specific, TX-focused note. In a
+    non-Texas covenant, the same literal DOC TYPE still gets flagged (it's
+    still unrecognized either way), just with the generic note instead,
+    since this specific ambiguity is a Texas recording-practice fact, not a
+    general one."""
+    assert "CONVEYANCE" not in CONVEYANCE_DOC_TYPES
+    assert "CONVEYANCE" not in NON_CONVEYANCE_DOC_TYPES
+    assert "CONVEYANCE" in TX_AMBIGUOUS_CONVEYANCE_TYPES
+
+    pool = {"1": {"DOC NUMBER": "1", "DOC TYPE": "CONVEYANCE", "RECORDED DATE": "6/1/2020"}}
+
+    tx_covenant = SimpleNamespace(recording_date=date(2009, 1, 1), state_code="TX")
+    flags = _unrecognized_doc_type_flags(pool, consumed=set(), covenant=tx_covenant)
+    assert len(flags) == 1, flags
+    assert "beneficiary/trustee" in flags[0]["review_reason"], flags[0]
+
+    non_tx_covenant = SimpleNamespace(recording_date=date(2009, 1, 1), state_code="CO")
+    flags = _unrecognized_doc_type_flags(pool, consumed=set(), covenant=non_tx_covenant)
+    assert len(flags) == 1, flags
+    assert "beneficiary/trustee" not in flags[0]["review_reason"], flags[0]
+    print("PASS: a bare 'CONVEYANCE' DOC TYPE is never trusted as a real title transfer -- "
+          "flagged with a TX-specific note in Texas, the generic note elsewhere")
+
+
 def test_walk_chain_bexar_2497() -> None:
     """Three real Transfers of Title since the covenant was recorded, per
     Bexar CAD's own deed history (the recorder-portal name-walk this
@@ -282,17 +400,31 @@ def test_walk_chain_montgomery_3297() -> None:
     LOT columns, a vendor's-lien deed-type variant, an anchor document
     whose own indexed lot ("263... ET AL") undersold its true subdivision-
     wide scope, and a declarant who bulk-sold through an intermediate
-    builder (Long Lake Ltd) never surfaced by either seed search -- see
-    this module's own docstrings for each fix's specifics.
+    builder (Long Lake Ltd) never surfaced by either seed search.
+
+    Recognizing the generic "CONVEYANCE" DOC TYPE at one point surfaced an
+    even earlier document (FCP Holdings I LLC -> Cinco West Development
+    LLC, 2012-02-21) that briefly broke every parcel's chain -- but per
+    direct correction, Texas real property conveys via specifically-named
+    deeds, never a bare "Conveyance" label, so that document was never a
+    real Transfer of Title in the first place. Confirmed independently by
+    its own metadata: no LOT/BLOCK/SUBDIVISION at all, and its COMMENT
+    references "FILE #2009075992" -- this covenant's OWN recording
+    instrument -- meaning it's almost certainly an assignment of the
+    covenant's own declarant/beneficiary interest, not a lot sale.
+    CONVEYANCE was removed from CONVEYANCE_DOC_TYPES entirely and now
+    always surfaces as its own flagged, TX-specific ambiguous entry
+    (TX_AMBIGUOUS_CONVEYANCE_TYPES) rather than being trusted OR silently
+    dropped -- restoring every parcel's real, historically-connected chain
+    to its current owner.
 
     Built from the actual persisted results of a live run (not fully
     deterministic re-run to re-run: this is many independent live searches
     against a real portal, not a single deterministic bulk query like the
     CAD/assessor paths above) -- if a live re-run finds a different but
-    still-real chain (e.g. an extra hop the portal's result ordering
-    happened to surface differently), that's the fallback path working as
-    designed, not necessarily a regression; recheck against the DB before
-    assuming a real break."""
+    still-real chain, that's the fallback path working as designed, not
+    necessarily a regression; recheck against the DB before assuming a
+    real break."""
     with get_session() as session:
         outer = walk_chain_of_title(session, covid=3297, tract_no=1, max_parcels=5)
 
@@ -303,30 +435,34 @@ def test_walk_chain_montgomery_3297() -> None:
     expected_apns = {"93070", "93088", "93089", "93090", "93091"}
     assert set(outer["parcels"]) == expected_apns, outer["parcels"].keys()
 
-    # 93070: single hop, correctly exempt under V01's own fixed pre_effective_date cutoff
-    # (2013-01-01) -- despite the declarant-link being unconfirmed, this must NOT be forced
-    # fee-owed, since pre_effective_date is a pure recording-date fact, unaffected by who
-    # the grantor is (the actual bug this test guards against).
-    r93070 = outer["parcels"]["93070"]
-    assert len(r93070["chain"]) == 1, r93070["chain"]
-    link = r93070["chain"][0]
-    assert link["instrument_number"] == "2012093064", link
-    assert (link["grantor"], link["grantee"]) == ("LONG LAKE LTD", "SOUTHERLAND MARK ANTHONY"), link
-    assert link["exemption_category"] == "pre_effective_date", link
-    assert link["review_flag"] is False, link  # confirmed exemption stands despite the unconfirmed declarant link
-    assert r93070["holder_matches_current_owner"] is True, r93070
-
-    # every parcel's walk must end on a holder matching its current owner of record, and
-    # every real link found must be review-flagged unless independently confirmed exempt
-    # (pre_effective_date, checked above) -- never silently assumed either way.
+    expected_final_holder = {
+        "93070": "SOUTHERLAND MARK ANTHONY", "93088": "NOTARIANNI CARMELA",
+        "93089": "BASHLOR KIMBERLY M", "93090": "BAMGBOSE IDOWU O", "93091": "CANTER LUCY MICHELLE",
+    }
     for apn, result in outer["parcels"].items():
-        assert result["gap_note"] is None, (apn, result)
-        assert result["holder_matches_current_owner"] is True, (apn, result)
+        # exactly one ambiguous entry per parcel -- the same anomalous "CONVEYANCE"
+        # document (it references the same subdivision-wide covenant, so it's in every
+        # parcel's own candidate pool), flagged with the TX-specific note rather than
+        # trusted as a real hop or silently dropped.
+        assert len(result["ambiguous"]) == 1, (apn, result["ambiguous"])
+        flagged = result["ambiguous"][0]["candidates"][0]
+        assert flagged["DOC TYPE"] == "CONVEYANCE", (apn, flagged)
+        assert "beneficiary/trustee" in result["ambiguous"][0]["review_reason"], (apn, result["ambiguous"][0])
+
+        assert result["chain"], (apn, result["chain"])  # every parcel has a real, non-empty chain
         for link in result["chain"]:
+            assert link["doc_type"] != "CONVEYANCE", (apn, link)  # never trusted as a real hop
+            # every real link is review-flagged unless independently confirmed exempt
+            # (pre_effective_date) -- never silently assumed either way.
             assert link["review_flag"] or link["exemption_category"] is not None, (apn, link)
 
+        assert result["chain"][-1]["grantee"] == expected_final_holder[apn], (apn, result["chain"])
+        assert result["holder_matches_current_owner"] is True, (apn, result)
+        assert result["gap_note"] is None, (apn, result)
+
     print(f"PASS: chain-of-title walk (Montgomery covid 3297, via {outer['method']}) -> "
-          f"5 parcels, each resolving to a final holder matching current owner of record")
+          f"5 parcels, each with a real chain reaching its current owner, and the "
+          f"anomalous 'CONVEYANCE' document correctly flagged rather than trusted or dropped")
 
 
 if __name__ == "__main__":
@@ -339,6 +475,10 @@ if __name__ == "__main__":
     test_normalize_doc_type_vendors_lien()
     test_anchor_lot_is_unreliable_and_subdivisions_match()
     test_walk_hop1_candidates_relaxed_fallback()
+    test_doc_type_vocabulary_no_overlap()
+    test_classify_recorder_portal_link_foreclosure()
+    test_unrecognized_doc_type_flags()
+    test_tx_conveyance_type_flagged_not_trusted()
     test_walk_chain_bexar_2497()
     test_walk_chain_douglas_co_3595()
     test_walk_chain_montgomery_3297()

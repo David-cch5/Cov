@@ -40,6 +40,29 @@ from sqlalchemy import text
 from app.db.repository import insert_source, upsert_fee_collection
 
 
+def _clear_stale_fee_collection(session, county_fips: str, instrument_number: str,
+                                 recording_date: date, parcel_apn: str) -> None:
+    """A transfer confirmed exempt must have NO fee_collection row -- but an
+    earlier computation, before this exemption was recognized (e.g. before
+    a later chain.py classification fix), may have left one behind.
+    Confirmed real: covid 3297's parcel 93070 had a stale status='owed'
+    fee_collection row survive a prior compute_fee_for_transfer call from
+    before chain.py stopped forcing review_flag=True on a confirmed
+    pre_effective_date exemption just because its chain's declarant-link
+    was unconfirmed. Only clears rows with no actual collection activity
+    recorded -- never silently removes evidence of a real invoiced/
+    collected fee, which would need human handling, not a silent delete."""
+    session.execute(
+        text("""
+            DELETE FROM fee_collection
+            WHERE county_fips = :cf AND instrument_number = :inst
+              AND recording_date = :rd AND parcel_apn = :apn
+              AND invoiced_amount IS NULL AND collected_amount IS NULL
+        """),
+        {"cf": county_fips, "inst": instrument_number, "rd": recording_date, "apn": parcel_apn},
+    )
+
+
 def compute_fee_for_transfer(session, county_fips: str, instrument_number: str,
                               recording_date: date, parcel_apn: str) -> dict:
     """One transfer -> at most one fee_collection row (collection_seq=1 --
@@ -60,6 +83,7 @@ def compute_fee_for_transfer(session, county_fips: str, instrument_number: str,
         raise RuntimeError(f"no transfer found for ({county_fips}, {instrument_number}, {recording_date}, {parcel_apn})")
 
     if row.exemption_category is not None and not row.review_flag:
+        _clear_stale_fee_collection(session, county_fips, instrument_number, recording_date, parcel_apn)
         return {"fee_owed": False, "reason": f"confirmed exempt ({row.exemption_category})"}
 
     fee_percent = row.fee_percent
