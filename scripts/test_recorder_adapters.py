@@ -58,8 +58,22 @@ def test_publicsearch_nueces() -> None:
     print(f"PASS: publicsearch (Nueces) -> {len(rows)} rows, found the 2008 replat")
 
 
+def test_publicsearch_montgomery() -> None:
+    """covid 4780: AVALON HARBOR II, LP's declaration, doc 2009089679 --
+    confirms the adapter works unmodified against Montgomery's instance of
+    the same GovOS PublicSearch product (the county the cost probe in
+    BUILD_SPEC.md Section 7 is built around)."""
+    with recorder_context() as context:
+        row = publicsearch.search_by_document_number(context, "https://montgomery.tx.publicsearch.us", "2009089679")
+    assert row is not None, "expected to find doc 2009089679"
+    assert row.get("DOC TYPE") == "DECLARATION", row
+    assert row.get("GRANTOR") == "AVALON HARBOR LP", row
+    print(f"PASS: publicsearch (Montgomery) -> found doc 2009089679, {row.get('DOC TYPE')}")
+
+
 if __name__ == "__main__":
     test_acclaim_ellis()
     test_ava_fidlar_kerr()
     test_publicsearch_nueces()
+    test_publicsearch_montgomery()
     print("\nall recorder adapter smoke tests passed")

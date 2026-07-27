@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(export PATH=/opt/anaconda3/envs/covenant_app/bin:$PATH)",
+      "Bash(alembic current)",
+      "Bash(alembic --version)",
+      "mcp__Claude_Browser__navigate",
+      "mcp__Claude_Browser__get_page_text",
+      "mcp__Claude_Browser__read_network_requests",
+      "mcp__Claude_Browser__read_page",
+      "mcp__Claude_Browser__tabs_context",
+      "mcp__Claude_Browser__find"
+    ]
+  }
+}

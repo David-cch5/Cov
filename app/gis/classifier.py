@@ -13,7 +13,7 @@ from sqlalchemy import text
 
 from app.db.repository import insert_source, upsert_parcel
 from app.gis.adapters import (
-    bexar_tx, collin_tx, dallas_tx, denton_tx, harris_tx, hunt_tx, kerr_tx, llano_tx,
+    bexar_tx, collin_tx, dallas_tx, denton_tx, douglas_co, harris_tx, hunt_tx, kerr_tx, llano_tx,
     montgomery_tx, nueces_tx, tarrant_tx, travis_tx,
 )
 from app.queue.job_queue import run_with_job_queue
@@ -31,6 +31,7 @@ COUNTY_ADAPTERS = {
     "48121": denton_tx,
     "48231": hunt_tx,
     "48265": kerr_tx,
+    "08035": douglas_co,
 }
 
 # Adapters without a structured Lot/Block field can only text-match the legal
@@ -40,8 +41,10 @@ COUNTY_ADAPTERS = {
 # tract_or_lot/Block-style columns, but they're inconsistently populated (see
 # each adapter's docstring), so they belong in this set too despite the schema
 # looking structured. Harris/Collin/Denton/Travis have genuinely reliable
-# structured lot/tract columns and are NOT in this set.
-_TEXT_MATCH_ONLY_COUNTIES = {"48439", "48113", "48299", "48029", "48355", "48453", "48231", "48265"}
+# structured lot/tract columns and are NOT in this set. Douglas Co (CO) only
+# has a structured Block field (no Lot field at all -- see douglas_co.py), so
+# it belongs here too.
+_TEXT_MATCH_ONLY_COUNTIES = {"48439", "48113", "48299", "48029", "48355", "48453", "48231", "48265", "08035"}
 
 
 def resolve_subdivision_plat_tract(session, covid: int, tract_no: int = 1) -> dict:

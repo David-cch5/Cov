@@ -45,6 +45,21 @@ EXTRACTION_TOOL = {
                                 "when the description is fundamentally a lot/block/plat citation."},
             "exemptions_raw": {"type": "string", "description": "The exemptions clause (usually Section 6) text, verbatim or near-verbatim."},
             "fee_due_days": {"type": ["integer", "null"], "description": "Days after a qualifying transfer the fee is due, if a specific number is stated."},
+            "trustee_name": {"type": ["string", "null"], "description": "The named Trustee's name exactly as recited (the party fees are paid to, usually named in the Definitions section or a 'TRUSTEE'/administrator clause). Null if no trustee is named or the document says the trustee cannot be identified."},
+            "trustee_address": {"type": ["string", "null"], "description": "The Trustee's mailing address, if stated."},
+            "beneficiaries": {
+                "type": "array",
+                "description": "Every Beneficiary named in the BENEFICIARIES section, in the order listed. Omit this entirely (empty array) rather than guessing if that section is missing/illegible. A garbled OCR list (e.g. missing letters, percentages that don't sum to ~100%) is expected sometimes -- report exactly what's legible per beneficiary rather than inferring a missing one's share.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "The beneficiary's name exactly as recited."},
+                        "address": {"type": ["string", "null"]},
+                        "percentage_interest": {"type": ["number", "null"], "description": "This beneficiary's percentage share, e.g. 33.0 for (33%). Null if the document names this beneficiary but the percentage itself is illegible/not stated -- never split the remainder evenly or guess."},
+                    },
+                    "required": ["name"],
+                },
+            },
             "confidence": {"type": "number", "description": "Extractor's own confidence in this extraction, 0-1."},
             "extraction_notes": {"type": ["string", "null"], "description": "Anything ambiguous, missing, or uncertain -- for the human review queue, never omit a concern to force a clean-looking result."},
         },
