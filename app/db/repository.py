@@ -114,6 +114,43 @@ def upsert_covenant_beneficiary(session, covid: int, beneficiary_seq: int, effec
     )
 
 
+def upsert_fee_collection(session, county_fips: str, instrument_number: str, recording_date: str,
+                           parcel_apn: str, collection_seq: int, fee_percent_applied: float,
+                           base_amount: float | None, due_date: str | None, status: str,
+                           notes: str | None, source_id: int | None) -> None:
+    """Only the fields app/title/fee_compute.py actually establishes at
+    computation time (the base obligation) are set here -- invoiced_amount/
+    invoice_date/collected_amount/collected_date/payer_contact_id/
+    remittance_reference/collectibility_* belong to later stages (invoicing,
+    collection, a statute-of-limitations check) this project hasn't built
+    yet, and are left at their schema defaults rather than guessed."""
+    session.execute(
+        text("""
+            INSERT INTO fee_collection (
+                county_fips, instrument_number, recording_date, parcel_apn, collection_seq,
+                fee_percent_applied, base_amount, due_date, status, notes, source_id
+            ) VALUES (
+                :county_fips, :instrument_number, :recording_date, :parcel_apn, :collection_seq,
+                :fee_percent_applied, :base_amount, :due_date, :status, :notes, :source_id
+            )
+            ON CONFLICT (county_fips, instrument_number, recording_date, parcel_apn, collection_seq)
+            DO UPDATE SET
+                fee_percent_applied = EXCLUDED.fee_percent_applied,
+                base_amount = EXCLUDED.base_amount,
+                due_date = EXCLUDED.due_date,
+                status = EXCLUDED.status,
+                notes = EXCLUDED.notes,
+                source_id = EXCLUDED.source_id
+        """),
+        {
+            "county_fips": county_fips, "instrument_number": instrument_number,
+            "recording_date": recording_date, "parcel_apn": parcel_apn, "collection_seq": collection_seq,
+            "fee_percent_applied": fee_percent_applied, "base_amount": base_amount,
+            "due_date": due_date, "status": status, "notes": notes, "source_id": source_id,
+        },
+    )
+
+
 def upsert_covenant_document(session, relpath: str, covid: int, doc_type: str,
                               pages: int | None, ocr_engine: str | None,
                               vocab_score: float | None, confidence: float | None,

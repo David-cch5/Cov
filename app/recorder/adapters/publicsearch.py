@@ -16,6 +16,8 @@ came up empty even though the DOM populates with real data) -- something in
 its bundle serves results by a mechanism neither intercepts. Hence: a real
 Playwright-rendered page, not a REST client.
 """
+import re
+
 from playwright.sync_api import BrowserContext
 
 SEARCH_SCOPE_FULL_TEXT_ID = "withOcr"
@@ -45,14 +47,31 @@ def search_by_name(context: BrowserContext, base_url: str, query: str, full_text
         page.close()
 
 
+def _digits_only(s: str) -> str:
+    return re.sub(r"\D", "", s or "")
+
+
 def search_by_document_number(context: BrowserContext, base_url: str, doc_number: str) -> dict | None:
     """Exact instrument-number lookup. Uses the quick-search box (doc# is one
     of the fields it matches per the portal's own placeholder text) rather
     than the advanced-search field IDs, which were observed to vary/break
-    across a page reload in a way the quick box did not."""
-    results = search_by_name(context, base_url, doc_number, full_text_ocr=False)
+    across a page reload in a way the quick box did not.
+
+    Both the QUERY sent to the search box and the DOC NUMBER comparison are
+    digits-only, not the raw string: a covenant's own extracted
+    recording_instrument sometimes carries a dash as printed on the actual
+    document (e.g. "2009-089679", confirmed on covid 4780/Montgomery) even
+    though this vendor's own DOC NUMBER field never has one ("2009089679")
+    -- every DOC NUMBER seen from this vendor across Montgomery/Denton/
+    Nueces/Collin/Bexar has been purely numeric, so stripping to digits is
+    safe, not just a Montgomery-specific patch. Stripping the comparison
+    alone was confirmed NOT enough on covid 4780: the portal's own quick
+    search returns zero rows for a dashed query string, so there's nothing
+    left to compare against unless the query itself is normalized first."""
+    wanted = _digits_only(doc_number)
+    results = search_by_name(context, base_url, wanted, full_text_ocr=False)
     for row in results:
-        if row.get("DOC NUMBER", "").strip() == doc_number.strip():
+        if _digits_only(row.get("DOC NUMBER", "")) == wanted:
             return row
     return results[0] if len(results) == 1 else None
 
