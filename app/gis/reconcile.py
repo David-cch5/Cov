@@ -8,19 +8,23 @@ and covid 4955 both already carry a manually-set reconciliation_status from earl
 work in this project, before this module existed -- this module's own results
 reproduce both by the same rule, not a coincidence).
 
-Only 'current_parcel_match' tracts (subdivision-plat or Texas-abstract legal
-descriptions, resolved by app/gis/classifier.py's resolve_subdivision_plat_tract) are
-reconciled here. That resolution method's own tract.geom is BY CONSTRUCTION the union
-of whatever parcels were matched -- there's no INDEPENDENT footprint to compute a
-geometric residual against, so residual_geom stays NULL and the only real signal is
-classified_acreage vs. the covenant's own stated_acreage. A genuinely independent,
-geometry-first residual check (ST_Difference against a metes-and-bounds-derived
-polygon, populating residual_geom for real) needs a metes-and-bounds tract's interior
-parcels to be spatially classified against tract.geom first -- confirmed real: every
-metes_and_bounds_traverse tract in this project currently has ZERO parcel_covenant
-rows, meaning that spatial-first parcel census (CLAUDE.md's own non-negotiable) hasn't
-actually been built yet for this resolution method. Deliberately not attempted here --
-a real, separate, larger piece of work, not something to fold into reconciliation.
+'current_parcel_match' tracts (subdivision-plat or Texas-abstract legal descriptions,
+resolved by app/gis/classifier.py's resolve_subdivision_plat_tract) are reconciled by
+comparing classified_acreage against the covenant's own stated_acreage -- that
+resolution method's tract.geom is BY CONSTRUCTION the union of whatever parcels were
+matched, so there's no INDEPENDENT footprint to diff against and residual_geom stays
+NULL for them.
+
+'metes_and_bounds_traverse' tracts (resolved by classifier.py's
+classify_metes_and_bounds_tract) get a genuinely stronger check: tract.geom there is an
+independently-derived polygon (from the deed's own courses/distances, anchored to a
+real surveyed tie point -- see app/gis/state_plane_anchor.py), so residual_geom
+(ST_Difference against every spatially-matched parcel's union) is a real geometric
+fact, not a derived non-signal. unaccounted_acreage comes directly from that residual's
+own area, not from a stated_acreage comparison -- there's no "over_classified" concept
+here (a residual can't represent more area than the tract itself, unlike a set of
+matched parcels that might). A metes_and_bounds_traverse tract with no parcel_covenant
+rows yet (classification not yet run) is reported not-checkable, same as before.
 """
 import re
 from datetime import date
@@ -45,7 +49,10 @@ def reconcile_tract(session, covid: int, tract_no: int = 1) -> dict:
     rather than being marked anything else)."""
     row = session.execute(
         text("""
-            SELECT t.boundary_resolution_method, t.classified_acreage, c.stated_acreage
+            SELECT t.boundary_resolution_method, t.classified_acreage, c.stated_acreage,
+                   ST_Area(t.residual_geom::geography) / 4046.8564224 AS residual_acreage,
+                   EXISTS(SELECT 1 FROM parcel_covenant pc WHERE pc.covid = t.covid AND pc.tract_no = t.tract_no)
+                       AS has_parcel_census
             FROM tract t JOIN covenant c ON c.covid = t.covid
             WHERE t.covid = :covid AND t.tract_no = :tract_no
         """), {"covid": covid, "tract_no": tract_no},
@@ -56,15 +63,32 @@ def reconcile_tract(session, covid: int, tract_no: int = 1) -> dict:
     if row.boundary_resolution_method is None:
         return {"checked": False, "reason": "tract boundary not yet confirmed (a rough geocode-approximate "
                                              "placement, not a real boundary) -- nothing to reconcile against"}
-    if row.boundary_resolution_method != "current_parcel_match":
+    if row.boundary_resolution_method not in ("current_parcel_match", "metes_and_bounds_traverse"):
+        return {"checked": False, "reason": f"{row.boundary_resolution_method!r} is not a recognized, "
+                                             f"reconcilable boundary_resolution_method"}
+    if row.boundary_resolution_method == "metes_and_bounds_traverse" and not row.has_parcel_census:
         return {"checked": False, "reason": f"{row.boundary_resolution_method!r} tracts need their interior "
-                                             f"parcels spatially classified against tract.geom first (a real, "
-                                             f"separate, not-yet-built capability) before there's anything to "
-                                             f"reconcile"}
+                                             f"parcels spatially classified against tract.geom first (via "
+                                             f"classifier.classify_metes_and_bounds_tract) before there's "
+                                             f"anything to reconcile"}
 
     classified = row.classified_acreage
     stated = row.stated_acreage
-    if stated is None:
+
+    if row.boundary_resolution_method == "metes_and_bounds_traverse":
+        # A real, independent geometric fact (see module docstring) -- not a comparison
+        # against stated_acreage, so a missing/wrong stated_acreage extraction can't mask
+        # or manufacture a discrepancy here. No 'over_classified': a residual can never
+        # represent more area than the tract's own polygon.
+        unaccounted = float(row.residual_acreage or 0)
+        if unaccounted <= RECONCILIATION_TOLERANCE_ACRES:
+            status, note = "reconciled", None
+        else:
+            status = "unaccounted_area"
+            note = (f"{unaccounted:.3f} ac of this metes-and-bounds tract's own surveyed polygon is not "
+                    f"covered by any spatially-matched parcel ({classified} ac classified) -- may be "
+                    f"unplatted remainder, road ROW, or a missing parcel match, needs human review")
+    elif stated is None:
         status = "reconciled"
         unaccounted = None
         note = None

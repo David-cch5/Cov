@@ -2,6 +2,8 @@
 cap, whether returnGeometry needs to be false for bulk attribute pulls, etc.) live
 in each county's county_gis_registry row, not hardcoded here.
 """
+import json
+
 import requests
 
 DEFAULT_TIMEOUT = 60  # some county-hosted (non-ArcGIS-Online) servers, e.g. Travis's, are noticeably slower
@@ -24,7 +26,11 @@ def query_features(base_url: str, where: str = "1=1", out_fields: str = "*",
     if result_record_count is not None:
         params["resultRecordCount"] = result_record_count
     if geometry is not None:
-        params["geometry"] = geometry
+        # confirmed real: passing the envelope dict directly left `requests` to
+        # serialize it with Python's own str(dict) (single-quoted, not valid JSON),
+        # which the ArcGIS REST API rejects outright ("'geometry' parameter is
+        # invalid") -- this parameter had never actually been exercised until now.
+        params["geometry"] = json.dumps(geometry)
         params["geometryType"] = "esriGeometryEnvelope"
         params["spatialRel"] = "esriSpatialRelIntersects"
         params["inSR"] = out_sr

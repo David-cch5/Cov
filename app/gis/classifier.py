@@ -169,3 +169,154 @@ def resolve_subdivision_plat_tract(session, covid: int, tract_no: int = 1) -> di
         "missing_lots": missing_lots,
         "run_seq": run_seq,
     }
+
+
+def classify_metes_and_bounds_tract(session, covid: int, tract_no: int = 1) -> dict:
+    """Spatial-first parcel census for a tract whose boundary came from a metes-and-bounds
+    traverse (parsed courses/distances -> closed polygon), not from unioning already-existing
+    plat lots. Unlike resolve_subdivision_plat_tract, tract.geom here is an independent
+    geometric fact -- so this queries live county parcels, does a TRUE polygon intersection
+    test against it in PostGIS, and computes a real residual (the part of the tract no
+    matched parcel covers) rather than assuming full coverage by construction.
+    """
+    row = session.execute(
+        text("""
+            SELECT c.county_fips, t.boundary_resolution_method,
+                   ST_XMin(t.geom) AS xmin, ST_YMin(t.geom) AS ymin,
+                   ST_XMax(t.geom) AS xmax, ST_YMax(t.geom) AS ymax
+            FROM tract t JOIN covenant c ON c.covid = t.covid
+            WHERE t.covid = :covid AND t.tract_no = :tract_no
+        """),
+        {"covid": covid, "tract_no": tract_no},
+    ).fetchone()
+    if row is None:
+        raise RuntimeError(f"covid {covid} tract {tract_no} not found")
+    if row.boundary_resolution_method != "metes_and_bounds_traverse":
+        raise RuntimeError(
+            f"covid {covid} tract {tract_no} is {row.boundary_resolution_method!r}, not a metes-and-bounds "
+            f"traverse -- use resolve_subdivision_plat_tract instead"
+        )
+
+    county_fips = row.county_fips
+    adapter = COUNTY_ADAPTERS.get(county_fips)
+    if adapter is None:
+        raise RuntimeError(f"no GIS adapter registered for county_fips={county_fips}")
+    if not hasattr(adapter, "iter_parcels"):
+        raise RuntimeError(f"{adapter.__name__} has no iter_parcels -- can't run a spatial query against it")
+
+    envelope = {"xmin": row.xmin, "ymin": row.ymin, "xmax": row.xmax, "ymax": row.ymax,
+                "spatialReference": {"wkid": 4326}}
+
+    # Same job_queue retry/logging treatment as the name-first path's network call above --
+    # this bbox query is only a cheap candidate prefilter (never pull a whole county's roll,
+    # per iter_all_features's own docstring); the real classification decision below is a true
+    # polygon test in PostGIS, never the bbox itself (CLAUDE.md: no bounding-box approximation).
+    candidates = run_with_job_queue(
+        lambda: list(adapter.iter_parcels(geometry=envelope)),
+        job_type="gis_classifier_spatial_query", county_fips=county_fips, covid=covid,
+        payload={"adapter": adapter.__name__, "base_url": adapter.BASE_URL, "envelope": envelope},
+    )
+    if not candidates:
+        raise RuntimeError(
+            f"no parcels found within covid {covid} tract {tract_no}'s bounding box at all -- "
+            f"check the tract's own geometry before assuming the area is truly empty"
+        )
+
+    gis_source_id = insert_source(
+        session, source_type="gis_api", reference=f"{adapter.BASE_URL} (spatial query)", confidence=None,
+    )
+    for p in candidates:
+        upsert_parcel(
+            session, county_fips=p["county_fips"], apn=p["apn"], owner_name_raw=p["owner_name_raw"],
+            situs_address=p["situs_address"], city=p.get("city"), zip_code=p.get("zip_code"),
+            acreage=p["acreage"], geojson=p["geojson"], source_id=gis_source_id,
+        )
+
+    matched = session.execute(
+        text("""
+            SELECT p.apn,
+                   ST_Contains(t.geom, p.geom) AS is_interior,
+                   ST_Area(ST_Intersection(t.geom, p.geom)::geography)
+                       / NULLIF(ST_Area(p.geom::geography), 0) AS overlap_fraction
+            FROM parcel p, tract t
+            WHERE p.county_fips = :county_fips AND p.apn = ANY(:apns)
+              AND t.covid = :covid AND t.tract_no = :tract_no
+              AND ST_Intersects(t.geom, p.geom)
+        """),
+        {"county_fips": county_fips, "apns": [p["apn"] for p in candidates], "covid": covid, "tract_no": tract_no},
+    ).fetchall()
+    if not matched:
+        raise RuntimeError(
+            f"covid {covid} tract {tract_no}: {len(candidates)} candidates found in the bounding box, but none "
+            f"actually intersect the tract's own polygon -- check the tract's geometry (may be mis-anchored) "
+            f"before assuming the area is truly empty"
+        )
+
+    run_seq = session.execute(
+        text("SELECT COALESCE(MAX(run_seq), 0) + 1 AS n FROM monitor_run WHERE covid = :covid"),
+        {"covid": covid},
+    ).fetchone().n
+
+    session.execute(
+        text("""
+            INSERT INTO monitor_run (covid, run_seq, run_type, new_parcels_found, status)
+            VALUES (:covid, :run_seq, 'initial', :n, 'ok')
+        """),
+        {"covid": covid, "run_seq": run_seq, "n": len(matched)},
+    )
+
+    for m in matched:
+        classification = "interior" if m.is_interior else "boundary"
+        confidence = 1.0 if m.is_interior else float(m.overlap_fraction or 0)
+        session.execute(
+            text("""
+                INSERT INTO parcel_covenant (county_fips, apn, covid, tract_no, run_seq, classification,
+                                              overlap_fraction, confidence, rationale)
+                VALUES (:county_fips, :apn, :covid, :tract_no, :run_seq, :classification,
+                        :overlap_fraction, :confidence, :rationale)
+                ON CONFLICT (county_fips, apn, covid, tract_no, run_seq) DO NOTHING
+            """),
+            {
+                "county_fips": county_fips, "apn": m.apn, "covid": covid, "tract_no": tract_no,
+                "run_seq": run_seq, "classification": classification,
+                "overlap_fraction": float(m.overlap_fraction) if m.overlap_fraction is not None else None,
+                "confidence": confidence,
+                "rationale": (
+                    f"parcel geometry {'fully within' if m.is_interior else 'partially overlaps'} the covenant's "
+                    f"own metes-and-bounds tract polygon (real spatial intersection, not a name/lot match)"
+                ),
+            },
+        )
+
+    # Real geometric residual -- the part of the tract's own independently-derived polygon
+    # that no matched parcel actually covers. A single CTE so the union is computed once and
+    # reused for both residual_geom and classified_acreage, rather than a naive sum of each
+    # matched parcel's own acreage (which would over-count a 'boundary' parcel's area lying
+    # outside the tract).
+    session.execute(
+        text("""
+            WITH matched_union AS (
+                SELECT ST_Union(p.geom) AS geom
+                FROM parcel p
+                JOIN parcel_covenant pc ON pc.county_fips = p.county_fips AND pc.apn = p.apn
+                WHERE pc.covid = :covid AND pc.tract_no = :tract_no AND pc.run_seq = :run_seq
+            )
+            UPDATE tract SET
+                residual_geom = ST_Multi(ST_Difference(tract.geom, matched_union.geom)),
+                classified_acreage = (
+                    ST_Area(tract.geom::geography) - ST_Area(ST_Difference(tract.geom, matched_union.geom)::geography)
+                ) / 4046.8564224,
+                source_id = :source_id, updated_at = now()
+            FROM matched_union
+            WHERE tract.covid = :covid AND tract.tract_no = :tract_no
+        """),
+        {"covid": covid, "tract_no": tract_no, "run_seq": run_seq, "source_id": gis_source_id},
+    )
+
+    return {
+        "candidates_in_bbox": len(candidates),
+        "matched_parcels": len(matched),
+        "interior": sum(1 for m in matched if m.is_interior),
+        "boundary": sum(1 for m in matched if not m.is_interior),
+        "run_seq": run_seq,
+    }

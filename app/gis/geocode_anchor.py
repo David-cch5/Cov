@@ -73,6 +73,11 @@ def traverse_to_geojson(vertices_ft: list[tuple[float, float]], anchor_lat: floa
         lon = anchor_lon + (x - pob_x) / ft_per_deg_lon
         lat = anchor_lat + (y - pob_y) / FT_PER_DEG_LAT
         ring.append([lon, lat])
+    # walk_traverse's last vertex is the raw traverse close -- off from vertices[0] by the
+    # real (sub-survey-tolerance) closure error, which walk_traverse reports separately as
+    # closure_ratio. GEOS requires a ring's start/end points to be bit-identical, not just
+    # close, so snap the ring shut here rather than storing an unparseable geometry.
+    ring[-1] = ring[0]
     return {"type": "MultiPolygon", "coordinates": [[ring]]}
 
 

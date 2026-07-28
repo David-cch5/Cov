@@ -50,6 +50,11 @@ def traverse_to_geojson_state_plane(
         real_y = origin_y + (y - origin_local_y)
         lon, lat = transformer.transform(real_x, real_y)
         ring.append([lon, lat])
+    # walk_traverse's last vertex is the raw traverse close -- off from vertices[0] by the
+    # real (sub-survey-tolerance) closure error, which walk_traverse reports separately as
+    # closure_ratio. GEOS requires a ring's start/end points to be bit-identical, not just
+    # close, so snap the ring shut here rather than storing an unparseable geometry.
+    ring[-1] = ring[0]
     return {"type": "MultiPolygon", "coordinates": [[ring]]}
 
 
