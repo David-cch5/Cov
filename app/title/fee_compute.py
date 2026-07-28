@@ -135,13 +135,17 @@ def compute_fee_for_transfer(session, county_fips: str, instrument_number: str,
 
 
 def compute_fees_for_covid(session, covid: int, tract_no: int = 1) -> dict:
-    """Every transfer row app/title/chain.py has already written for this
-    covid/tract -- one result per (county_fips, instrument_number,
-    recording_date, parcel_apn)."""
+    """Every CURRENT transfer row app/title/chain.py has already written for
+    this covid/tract -- one result per (county_fips, instrument_number,
+    recording_date, parcel_apn). Excludes superseded_at rows (migration
+    0031): a re-walk that finds a different chain marks its predecessor's
+    rows superseded rather than deleting them (real fee_collection history
+    can hang off a transfer row), so this must not recompute a fee against
+    a conveyance the walker no longer believes is real."""
     transfers = session.execute(
         text("""
             SELECT county_fips, instrument_number, recording_date, parcel_apn
-            FROM transfer WHERE covid = :covid AND tract_no = :tract_no
+            FROM transfer WHERE covid = :covid AND tract_no = :tract_no AND superseded_at IS NULL
         """),
         {"covid": covid, "tract_no": tract_no},
     ).fetchall()

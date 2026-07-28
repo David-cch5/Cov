@@ -42,7 +42,13 @@ FIELD_MAPPING = {
 OUT_FIELDS = ",".join(FIELD_MAPPING.values())
 
 _STOPWORDS = {"THE", "AT", "OF", "AND", "FILING", "NO", "SECTION", "SEC", "AMENDMENT"}
-_LOT_RE = re.compile(r"\bLOT\s+([0-9A-Z\-]+)\s+BLK\b", re.IGNORECASE)
+_LOT_BLK_RE = re.compile(r"\bLOT\s+([0-9A-Z\-]+)\s+BLK\b", re.IGNORECASE)
+# fallback for subdivisions with no BLK at all in the legal description (confirmed real:
+# covid 4123's "Country Meadows Square", e.g. "LOT 6 COUNTRY MEADOWS SQUARE 3RD AMD" --
+# _LOT_BLK_RE alone silently parsed every one of these as lot=None, which then failed
+# query_by_subdivision_and_lots' client-side lot filter for every real parcel, even
+# though the server-side subdivision-keyword filter found them all correctly).
+_LOT_BARE_RE = re.compile(r"\bLOT\s+([0-9A-Z\-]+)\b", re.IGNORECASE)
 
 
 def _subdivision_tokens(subdivision_name: str) -> list[str]:
@@ -53,7 +59,10 @@ def _subdivision_tokens(subdivision_name: str) -> list[str]:
 def _parse_lot(legal_desc: str | None) -> str | None:
     if not legal_desc:
         return None
-    m = _LOT_RE.search(legal_desc)
+    m = _LOT_BLK_RE.search(legal_desc)
+    if m:
+        return m.group(1)
+    m = _LOT_BARE_RE.search(legal_desc)
     return m.group(1) if m else None
 
 

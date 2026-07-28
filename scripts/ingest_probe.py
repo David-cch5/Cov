@@ -66,6 +66,15 @@ def ingest_one(session, c) -> None:
         text("SELECT status, review_reason FROM covenant WHERE covid = :covid"), {"covid": c.covid},
     ).fetchone()
 
+    if existing is None and c.county_fips is None:
+        # covenant.county_fips is NOT NULL -- confirmed real (covid 4123): a candidate
+        # whose county genuinely can't be resolved would otherwise crash here with a raw
+        # NotNullViolation instead of a clear, review-queue-style message. Nothing
+        # meaningful can be recorded without a county anyway (every downstream table is
+        # county_fips-keyed), so this is surfaced via run()'s own failed-list reporting
+        # rather than forcing a broken row or silently reporting a false "succeeded."
+        raise RuntimeError(f"cannot record covid {c.covid}: {c.review_reason}")
+
     if existing is None:
         # covenant row must exist first -- covenant_document.covid is a FK to it. Only
         # done for a covid never seen before; an existing row is left alone here and

@@ -16,7 +16,10 @@ from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
-from app.db.session import get_session
+from app.config import DB_SCHEMA
+from app.db.repository import upsert_transfer
+from app.db.session import SessionLocal, get_session
+from sqlalchemy import text
 from app.title.chain import (
     CONVEYANCE_DOC_TYPES,
     GOVOS_FORECLOSURE_DEED_TYPES,
@@ -27,6 +30,7 @@ from app.title.chain import (
     _anchor_lot_is_unreliable,
     _classify_pre_effective_date,
     _classify_recorder_portal_link,
+    _mark_superseded_transfers,
     _normalize_doc_type,
     _row_lots,
     _subdivisions_match,
@@ -313,6 +317,75 @@ def test_tx_conveyance_type_flagged_not_trusted() -> None:
           "flagged with a TX-specific note in Texas, the generic note elsewhere")
 
 
+def test_mark_superseded_transfers() -> None:
+    """Confirmed real (covid 3297, parcel 93070, multiple times this
+    session): a re-walk that finds a DIFFERENT chain for a parcel (a newly
+    recognized doc type, a corrected anchor match, ...) left the previous
+    walk's transfer rows behind with no way to tell they're stale.
+    superseded_at (migration 0031) marks rather than deletes -- real
+    fee_collection history can hang off a transfer row -- and
+    upsert_transfer un-supersedes a key a later walk re-confirms. Uses two
+    synthetic, rolled-back transfer rows against a real covid/parcel
+    (3595/R0334407) -- never persisted."""
+    session = SessionLocal()
+    try:
+        session.execute(text(f"SET search_path TO {DB_SCHEMA}, public"))
+        parcel = SimpleNamespace(county_fips="08035", apn="R0334407")
+
+        for inst, rd in [("TEST-SUPERSEDE-OLD", "2015-01-01"), ("TEST-SUPERSEDE-KEEP", "2016-01-01")]:
+            upsert_transfer(
+                session, county_fips="08035", instrument_number=inst, covid=3595, tract_no=1,
+                parcel_county_fips="08035", parcel_apn="R0334407",
+                prior_county_fips=None, prior_instrument_number=None,
+                instrument_type="Warranty Deed", recording_date=rd, book=None, page=None,
+                grantor_contact_id=None, grantee_contact_id=None,
+                consideration_amount=None, legal_description_snapshot=None, recorder_source_id=None,
+                review_flag=True, review_reason="synthetic test transfer, not a real conveyance",
+                exemption_category=None, exemption_basis=None, exemption_confidence=None,
+            )
+
+        def _superseded_at(instrument_number: str):
+            row = session.execute(
+                text("""
+                    SELECT superseded_at FROM transfer
+                    WHERE covid = 3595 AND parcel_apn = 'R0334407' AND instrument_number = :inst
+                """), {"inst": instrument_number},
+            ).fetchone()
+            return row.superseded_at
+
+        # a re-walk's real_links only re-confirms the "KEEP" key -- "OLD" must be marked
+        # superseded, "KEEP" must stay current.
+        real_links = [{"instrument_number": "TEST-SUPERSEDE-KEEP", "recording_date": "2016-01-01"}]
+        _mark_superseded_transfers(session, covid=3595, tract_no=1, parcel=parcel, real_links=real_links)
+        assert _superseded_at("TEST-SUPERSEDE-OLD") is not None
+        assert _superseded_at("TEST-SUPERSEDE-KEEP") is None
+
+        # an empty real_links must be a no-op -- a transient walk failure (confirmed real
+        # this session: a live recorder-portal anchor lookup randomly failed once) must
+        # never silently supersede everything previously found for this parcel.
+        _mark_superseded_transfers(session, covid=3595, tract_no=1, parcel=parcel, real_links=[])
+        assert _superseded_at("TEST-SUPERSEDE-KEEP") is None
+
+        # re-upserting the superseded "OLD" key, as a later walk re-confirming it would,
+        # must un-supersede it.
+        upsert_transfer(
+            session, county_fips="08035", instrument_number="TEST-SUPERSEDE-OLD", covid=3595, tract_no=1,
+            parcel_county_fips="08035", parcel_apn="R0334407",
+            prior_county_fips=None, prior_instrument_number=None,
+            instrument_type="Warranty Deed", recording_date="2015-01-01", book=None, page=None,
+            grantor_contact_id=None, grantee_contact_id=None,
+            consideration_amount=None, legal_description_snapshot=None, recorder_source_id=None,
+            review_flag=True, review_reason="synthetic test transfer, not a real conveyance",
+            exemption_category=None, exemption_basis=None, exemption_confidence=None,
+        )
+        assert _superseded_at("TEST-SUPERSEDE-OLD") is None
+    finally:
+        session.rollback()  # never persisted
+        session.close()
+    print("PASS: _mark_superseded_transfers -> marks a no-longer-current key superseded (not deleted), "
+          "never touches anything on an empty result, and upsert_transfer un-supersedes a reconfirmed key")
+
+
 def test_walk_chain_bexar_2497() -> None:
     """Three real Transfers of Title since the covenant was recorded, per
     Bexar CAD's own deed history (the recorder-portal name-walk this
@@ -465,6 +538,65 @@ def test_walk_chain_montgomery_3297() -> None:
           f"anomalous 'CONVEYANCE' document correctly flagged rather than trusted or dropped")
 
 
+def test_walk_chain_douglas_co_4123() -> None:
+    """covid 4123 (Douglas Co CO, template V01, TS Holdings LLC declarant),
+    5 lots across two distinct subdivision tracts: tract 1 (Lots 5/6/7/8,
+    "Country Meadows Square") and tract 2 (Lot 2C, "Meadows Square 2nd
+    Amend"). Real, disclosed sale prices throughout (Colorado is a full-
+    disclosure state) on what turned out to be commercial-scale parcels
+    (transfers up to $7.7M).
+
+    Drove two real fixes: app/gis/adapters/douglas_co.py's _parse_lot
+    required "BLK" to follow the lot number, silently parsing every lot in
+    this BLK-less subdivision as None (which would have failed the client-
+    side lot filter for every real parcel despite the server-side
+    subdivision-keyword filter finding them all); and the covenant's own
+    Lot 2C no longer exists in current GIS data at all -- it was renumbered
+    to Lot 2 under a 3rd plat amendment, confirmed via matching situs
+    address (12245 S Parker Rd) and acreage (1.2608 vs. stated 1.261 ac),
+    documented in covenant.review_reason rather than silently assumed."""
+    with get_session() as session:
+        outer1 = walk_chain_of_title(session, covid=4123, tract_no=1)
+        outer2 = walk_chain_of_title(session, covid=4123, tract_no=2)
+
+    assert outer1["walked"] and outer2["walked"], (outer1, outer2)
+    assert outer1["method"] == outer2["method"] == "assessor_sales_data", (outer1, outer2)
+    assert outer1["parcel_count"] == 4, outer1
+    assert outer2["parcel_count"] == 1, outer2
+
+    expected_final_holder = {
+        "R0460303": "PRAKRITIS COUNTRY MEADOWS LLC", "R0460304": "FDL LLC",
+        "R0497418": "PARKER RENTALS LLC ", "R0497419": "COBBLESTONE DENVER PROPCO LLC",
+    }
+    for apn, result in outer1["parcels"].items():
+        assert result["chain"], (apn, result["chain"])
+        assert result["chain"][-1]["grantee"] == expected_final_holder[apn], (apn, result["chain"])
+        assert result["holder_matches_current_owner"] is True, (apn, result)
+        assert result["gap_note"] is None, (apn, result)
+        for link in result["chain"]:
+            assert link["review_flag"] or link["exemption_category"] is not None, (apn, link)
+
+    # the first hop is shared across all 4 tract-1 parcels (a single bulk conveyance),
+    # recorded 2012-08-14 -- before V01's fixed 2013-01-01 pre_effective_date cutoff --
+    # and a real, disclosed $0 (Colorado full-disclosure), correctly exempt.
+    first_hop = outer1["parcels"]["R0460303"]["chain"][0]
+    assert first_hop["instrument_number"] == "2012059895", first_hop
+    assert first_hop["exemption_category"] == "pre_effective_date", first_hop
+    assert first_hop["review_flag"] is False, first_hop
+    assert first_hop["consideration_amount"] == 0.0, first_hop
+
+    # tract 2's single parcel (the renumbered Lot 2C/Lot 2) reaches its own current owner
+    # with a real, disclosed $750,000 price.
+    r2 = outer2["parcels"]["R0497417"]
+    assert len(r2["chain"]) == 1, r2["chain"]
+    assert r2["chain"][0]["consideration_amount"] == 750000.0, r2["chain"]
+    assert r2["holder_matches_current_owner"] is True, r2
+    assert r2["gap_note"] is None, r2
+
+    print(f"PASS: chain-of-title walk (Douglas Co CO covid 4123, via {outer1['method']}) -> "
+          f"5 parcels across 2 tracts, each reaching its current owner with real disclosed prices")
+
+
 if __name__ == "__main__":
     test_classify_pre_effective_date_fixed_date()
     test_classify_pre_effective_date_recording_date_basis()
@@ -479,7 +611,9 @@ if __name__ == "__main__":
     test_classify_recorder_portal_link_foreclosure()
     test_unrecognized_doc_type_flags()
     test_tx_conveyance_type_flagged_not_trusted()
+    test_mark_superseded_transfers()
     test_walk_chain_bexar_2497()
     test_walk_chain_douglas_co_3595()
     test_walk_chain_montgomery_3297()
+    test_walk_chain_douglas_co_4123()
     print("\nall chain-of-title smoke tests passed")

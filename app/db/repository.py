@@ -253,7 +253,11 @@ def upsert_transfer(session, county_fips: str, instrument_number: str, covid: in
                 review_flag = EXCLUDED.review_flag, review_reason = EXCLUDED.review_reason,
                 exemption_category = EXCLUDED.exemption_category,
                 exemption_basis = EXCLUDED.exemption_basis,
-                exemption_confidence = EXCLUDED.exemption_confidence
+                exemption_confidence = EXCLUDED.exemption_confidence,
+                -- re-upserting means a walk's CURRENT real_links include this key again --
+                -- un-supersede it even if a prior walk had marked it superseded (see
+                -- migration 0031 / chain.py's _finalize).
+                superseded_at = NULL
         """),
         {
             "county_fips": county_fips, "instrument_number": instrument_number,

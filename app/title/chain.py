@@ -947,6 +947,51 @@ def _walk_hop1_candidates(candidate_pool: dict[str, dict], consumed: set[str], c
     return fallback, bool(fallback)
 
 
+def _mark_superseded_transfers(session, covid: int, tract_no: int, parcel, real_links: list[dict]) -> None:
+    """Confirmed real (covid 3297, parcel 93070, multiple times this
+    session): a re-walk that finds a DIFFERENT chain for this parcel (a
+    newly-recognized doc type, a corrected anchor match, ...) left the
+    PREVIOUS walk's transfer rows behind with no way to tell they're no
+    longer current. Never deleted (see migration 0031's own docstring on
+    why: real fee_collection history can hang off a transfer row) -- just
+    marked superseded_at, and upsert_transfer already clears it back to
+    NULL if a later walk re-confirms the same (instrument_number,
+    recording_date) key.
+
+    Deliberately a no-op when real_links is empty: an empty result here is
+    indistinguishable from "genuinely nothing to find" and "this
+    particular run hit a transient failure" (confirmed real: a live
+    recorder-portal anchor lookup randomly failed this session on an
+    otherwise-fine covenant) -- superseding every prior row on an empty
+    result would risk real data loss on exactly the kind of flaky run this
+    project has already hit."""
+    if not real_links:
+        return
+    current_keys = {(link["instrument_number"], link["recording_date"]) for link in real_links}
+    existing = session.execute(
+        text("""
+            SELECT instrument_number, recording_date FROM transfer
+            WHERE covid = :covid AND tract_no = :tract_no
+              AND parcel_county_fips = :county_fips AND parcel_apn = :apn
+              AND superseded_at IS NULL
+        """),
+        {"covid": covid, "tract_no": tract_no, "county_fips": parcel.county_fips, "apn": parcel.apn},
+    ).fetchall()
+    for row in existing:
+        if (row.instrument_number, str(row.recording_date)) in current_keys:
+            continue
+        session.execute(
+            text("""
+                UPDATE transfer SET superseded_at = now()
+                WHERE covid = :covid AND tract_no = :tract_no
+                  AND parcel_county_fips = :county_fips AND parcel_apn = :apn
+                  AND instrument_number = :inst AND recording_date = :rd
+            """),
+            {"covid": covid, "tract_no": tract_no, "county_fips": parcel.county_fips,
+             "apn": parcel.apn, "inst": row.instrument_number, "rd": row.recording_date},
+        )
+
+
 def _finalize(session, covid: int, tract_no: int, covenant, parcel, chain: list[dict], method: str,
               source_id: int) -> dict:
     real_links = [link for link in chain if not link.get("ambiguous_split")]
@@ -979,6 +1024,7 @@ def _finalize(session, covid: int, tract_no: int, covenant, parcel, chain: list[
                 "exemption_confidence", 1.0 if link["exemption_category"] else None
             ),
         )
+    _mark_superseded_transfers(session, covid, tract_no, parcel, real_links)
 
     current_holder = real_links[-1]["grantee"] if real_links else covenant.declarant_raw
     current_owner = parcel.owner_name_raw

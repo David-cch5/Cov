@@ -17,6 +17,16 @@ COVID_INDEX_PATH = os.path.join(PROJECT_ROOT, "_pilot", "covid_index.csv")
 # Per BUILD_SPEC section 2: these covids have no PDF on file at all.
 MISSING_PDF_COVIDS = {"2506", "3504", "3516", "7642"}
 
+# Confirmed real OCR/data-entry artifacts in _pilot/covid_index.csv's own county column
+# (covid 4123: "DOUGLAS OQ." instead of "DOUGLAS", the county table's actual name for
+# Colorado's Douglas County) -- corrected here rather than in the source index file
+# itself (a read-only data location per CLAUDE.md), and kept as an explicit, narrowly-
+# scoped map rather than fuzzy-matching county names in general, which risks silently
+# mismatching a genuinely different multi-word county name.
+_KNOWN_COUNTY_NAME_TYPOS = {
+    ("COLORADO", "DOUGLAS OQ."): "DOUGLAS",
+}
+
 
 @dataclass
 class CovenantCandidate:
@@ -104,7 +114,7 @@ def iter_candidates(session, covids: list[str]):
             vocab_score = cached.get("vocab_score")
 
         state_name = idx_row["state"]
-        county_name = idx_row["county"]
+        county_name = _KNOWN_COUNTY_NAME_TYPOS.get((state_name, idx_row["county"]), idx_row["county"])
         state_code = _state_code_for_name(session, state_name)
         county_fips = fips_lookup.get((state_code, county_name)) if state_code else None
 

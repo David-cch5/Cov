@@ -17,7 +17,9 @@ import sys
 
 sys.path.insert(0, ".")
 
-from scripts.ingest_probe import _merge_ingestion_note
+from app.db.session import get_session
+from app.ingestion.walk import CovenantCandidate, _KNOWN_COUNTY_NAME_TYPOS
+from scripts.ingest_probe import _merge_ingestion_note, ingest_one
 
 
 def test_merge_preserves_unrelated_existing_note() -> None:
@@ -60,9 +62,49 @@ def test_merge_clears_when_ingestion_now_clean() -> None:
     print("PASS: _merge_ingestion_note -> a resolved ingestion concern clears, unrelated note remains")
 
 
+def test_known_county_name_typo_correction() -> None:
+    """Confirmed real: _pilot/covid_index.csv's own county column for covid
+    4123 reads "DOUGLAS OQ." instead of "DOUGLAS" (the county table's
+    actual name for Colorado's Douglas County) -- an OCR/data-entry
+    artifact in a read-only data location, corrected here rather than by
+    editing the source index file itself."""
+    assert _KNOWN_COUNTY_NAME_TYPOS[("COLORADO", "DOUGLAS OQ.")] == "DOUGLAS"
+    print("PASS: _KNOWN_COUNTY_NAME_TYPOS -> covid 4123's real county-name typo is corrected")
+
+
+def test_ingest_one_raises_clear_error_on_unresolved_county() -> None:
+    """Confirmed real: a candidate whose county can't be resolved at all
+    (county_fips=None) used to crash ingest_one() with a raw
+    psycopg2.errors.NotNullViolation (covenant.county_fips is NOT NULL)
+    instead of a clear, review-queue-style message -- run()'s own
+    failed-list reporting caught the exception either way, but the
+    traceback was uninformative. Uses a covid guaranteed not to already
+    exist (so `existing` is None, the exact condition that used to crash);
+    nothing is ever written, so there's nothing to roll back -- get_session's
+    own exception handling closes the session cleanly either way."""
+    candidate = CovenantCandidate(
+        covid=999999999, relpath=None, state_name="COLORADO", county_name=None,
+        county_fips=None, template_version_id=None, template_confidence=None,
+        text=None, pages=None, ocr=None, vocab_score=None,
+        needs_review=True, review_reason="county not resolved (COLORADO/NOWHERE COUNTY)",
+    )
+    try:
+        with get_session() as session:
+            ingest_one(session, candidate)
+        raised = False
+    except RuntimeError as exc:
+        raised = True
+        assert "county not resolved" in str(exc), exc
+    assert raised, "expected a clear RuntimeError, not a silent success or a raw DB exception"
+    print("PASS: ingest_one -> a genuinely unresolvable county raises a clear error instead of "
+          "crashing on a raw NOT NULL violation")
+
+
 if __name__ == "__main__":
     test_merge_preserves_unrelated_existing_note()
     test_merge_appends_ingestion_note()
     test_merge_replaces_only_its_own_prior_tag()
     test_merge_clears_when_ingestion_now_clean()
+    test_known_county_name_typo_correction()
+    test_ingest_one_raises_clear_error_on_unresolved_county()
     print("\nall ingest_probe smoke tests passed")
