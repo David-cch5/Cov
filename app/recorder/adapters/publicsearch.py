@@ -36,7 +36,11 @@ def search_by_name(context: BrowserContext, base_url: str, query: str, full_text
         if full_text_ocr:
             page.check(f"#{SEARCH_SCOPE_FULL_TEXT_ID}", force=True)
         page.fill(f"#{SEARCH_BOX_ID}", query)
-        page.click('button:has-text("Search")')
+        # not button:has-text("Search") -- confirmed live (Montgomery, Nueces) that it
+        # ambiguously matches 2 buttons ("Reset Search" contains "Search" too); Playwright
+        # picks the first by DOM order, which happens to be correct today but is fragile.
+        # This test-id is confirmed stable across every PublicSearch county checked.
+        page.click('[data-testid="searchSubmitButton"]')
         try:
             page.wait_for_selector("table", timeout=20000)
         except Exception:
