@@ -9,6 +9,8 @@ from typing import Optional
 
 from sqlalchemy import text
 
+from app.ingestion.ocr_escalation import prefer_fuller_cache
+
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 TEXTCACHE = os.path.join(PROJECT_ROOT, "_textcache_final")
 COVENANT_MATRIX_PATH = os.path.join(PROJECT_ROOT, "Covenant_Matrix", "covenant_matrix.json")
@@ -112,6 +114,21 @@ def iter_candidates(session, covids: list[str]):
             pages = cached.get("pages")
             ocr_flag = cached.get("ocr")
             vocab_score = cached.get("vocab_score")
+
+            # Free, deterministic, zero-cost check -- no LLM call, just comparing two
+            # already-existing cached extractions -- run for EVERY candidate, not just
+            # low-vocab_score ones. Confirmed real and necessary: covid 8245's own
+            # _textcache_final carried a 0.9927 vocab_score (a whole-document average)
+            # despite having lost its Exhibit A's opening courses entirely -- the
+            # vocab_score gate below would never have caught it. _textcache's own JSON
+            # has no vocab_score field at all (only ever computed during whatever
+            # produced _textcache_final), so using its fuller text means quality is
+            # honestly unknown rather than assumed good -- falls through to the "no OCR
+            # vocab score computed" reason below, same as any other un-scored text.
+            fuller = prefer_fuller_cache(covid)
+            if fuller is not None:
+                doc_text = fuller["text"]
+                vocab_score = fuller.get("vocab_score")
 
         state_name = idx_row["state"]
         county_name = _KNOWN_COUNTY_NAME_TYPOS.get((state_name, idx_row["county"]), idx_row["county"])

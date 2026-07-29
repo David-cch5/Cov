@@ -469,93 +469,143 @@ def test_walk_chain_douglas_co_3595() -> None:
 def test_walk_chain_montgomery_3297() -> None:
     """covid 3297 (Montgomery, TX, template V01, HFG-Centerra Development /
     Gleneagles subdivision), 5 of its 43 matched parcels (max_parcels cap).
-    The recorder-portal name-walk fallback -- this is the test case that
-    drove most of this module's real bug fixes: Montgomery's HIGH LOT/LOW
-    LOT columns, a vendor's-lien deed-type variant, an anchor document
-    whose own indexed lot ("263... ET AL") undersold its true subdivision-
-    wide scope, and a declarant who bulk-sold through an intermediate
-    builder (Long Lake Ltd) never surfaced by either seed search.
 
-    Recognizing the generic "CONVEYANCE" DOC TYPE at one point surfaced an
-    even earlier document (FCP Holdings I LLC -> Cinco West Development
-    LLC, 2012-02-21) that briefly broke every parcel's chain -- but per
-    direct correction, Texas real property conveys via specifically-named
-    deeds, never a bare "Conveyance" label, so that document was never a
-    real Transfer of Title in the first place. Confirmed independently by
-    its own metadata: no LOT/BLOCK/SUBDIVISION at all, and its COMMENT
-    references "FILE #2009075992" -- this covenant's OWN recording
-    instrument -- meaning it's almost certainly an assignment of the
-    covenant's own declarant/beneficiary interest, not a lot sale.
-    CONVEYANCE was removed from CONVEYANCE_DOC_TYPES entirely and now
-    always surfaces as its own flagged, TX-specific ambiguous entry
-    (TX_AMBIGUOUS_CONVEYANCE_TYPES) rather than being trusted OR silently
-    dropped -- restoring every parcel's real, historically-connected chain
-    to its current owner.
+    Originally walked via the recorder-portal name-walk fallback -- the
+    test case that drove most of this module's real bug fixes:
+    Montgomery's HIGH LOT/LOW LOT columns, a vendor's-lien deed-type
+    variant, an anchor document whose own indexed lot ("263... ET AL")
+    undersold its true subdivision-wide scope, a declarant who bulk-sold
+    through an intermediate builder never surfaced by either seed search,
+    and a generic "CONVEYANCE" DOC TYPE (an assignment of the covenant's
+    own beneficiary interest, not a lot sale -- see TX_AMBIGUOUS_
+    CONVEYANCE_TYPES) that had to be kept out of both the conveyance and
+    non-conveyance vocabularies. That path was also demonstrably flaky
+    run to run (many independent live name-searches against a real
+    portal, not a single deterministic bulk query).
 
-    Built from the actual persisted results of a live run (not fully
-    deterministic re-run to re-run: this is many independent live searches
-    against a real portal, not a single deterministic bulk query like the
-    CAD/assessor paths above). Confirmed real and repeatedly reproduced:
-    on a given run, the live portal can transiently fail to (re)find a
-    parcel's real chain at all (a different parcel each time across four
-    consecutive runs) -- but chain.py's own supersede-safety design
-    (migration 0031) means a transient empty result never wipes out a
-    parcel's previously-established real transfer rows, only a later run
-    that finds a genuinely DIFFERENT chain does. So the per-parcel chain
-    assertions below check the database's own current (non-superseded)
-    state -- what the system actually knows, cumulatively -- rather than
-    this one specific run's possibly-flaky immediate return value, which
-    would otherwise make this test flaky for a reason that has nothing to
-    do with correctness."""
+    Superseded here (migration 0032) by mcad_deed_history -- Montgomery
+    CAD's own per-parcel Deed History table, discovered while chain-
+    walking covid 8245's declarant-name mismatch. A single deterministic
+    per-APN fetch, not a name-search walk, so every parcel resolves
+    cleanly to its real current owner with zero ambiguous entries -- the
+    CONVEYANCE assignment-of-beneficiary-interest document simply isn't a
+    deed in MCAD's own per-parcel deed history at all, so it never
+    surfaces here in the first place. Confirmed real: this run correctly
+    superseded (not deleted -- migration 0031) every one of the old
+    recorder-portal-derived transfer rows, several of which even
+    differed by a day or two on the same instrument_number's own
+    recording_date between the two sources."""
     with get_session() as session:
         outer = walk_chain_of_title(session, covid=3297, tract_no=1, max_parcels=5)
 
         assert outer["walked"], outer
-        assert outer["method"] == "recorder_portal_name_walk", outer
+        assert outer["method"] == "mcad_deed_history", outer
         assert outer["parcel_count"] == 5, outer
 
         expected_apns = {"93070", "93088", "93089", "93090", "93091"}
         assert set(outer["parcels"]) == expected_apns, outer["parcels"].keys()
 
-        for apn, result in outer["parcels"].items():
-            # the anomalous "CONVEYANCE" document has no lot/block/address of its own to
-            # anchor on -- it's only discoverable via a capped, broad declarant-name
-            # search, so whether it surfaces in a given parcel's candidate pool on a
-            # given run varies (confirmed real). At most one such entry is possible; IF
-            # one is found, it must be this exact document, correctly flagged rather
-            # than trusted as a real hop.
-            assert len(result["ambiguous"]) <= 1, (apn, result["ambiguous"])
-            if result["ambiguous"]:
-                flagged = result["ambiguous"][0]["candidates"][0]
-                assert flagged["DOC TYPE"] == "CONVEYANCE", (apn, flagged)
-                assert "beneficiary/trustee" in result["ambiguous"][0]["review_reason"], (apn, result["ambiguous"][0])
-
         expected_final_holder = {
-            "93070": "SOUTHERLAND MARK ANTHONY", "93088": "NOTARIANNI CARMELA",
-            "93089": "BASHLOR KIMBERLY M", "93090": "BAMGBOSE IDOWU O", "93091": "CANTER LUCY MICHELLE",
+            "93070": "SOUTHERLAND, MARK ANTHONY", "93088": "NOTARIANNI, CARMELA",
+            "93089": "BASHLOR, KIMBERLY M", "93090": "BAMGBOSE, IDOWU O", "93091": "CANTER, LUCY M",
         }
-        for apn, expected_holder in expected_final_holder.items():
-            persisted = session.execute(
-                text("""
-                    SELECT t.instrument_number, t.recording_date, t.exemption_category, t.review_flag,
-                           t.instrument_type, g.name_raw AS grantee, p.owner_name_raw
-                    FROM transfer t
-                    JOIN contact g ON g.contact_id = t.grantee_contact_id
-                    JOIN parcel p ON p.county_fips = t.parcel_county_fips AND p.apn = t.parcel_apn
-                    WHERE t.covid = 3297 AND t.parcel_apn = :apn AND t.superseded_at IS NULL
-                    ORDER BY t.recording_date
-                """), {"apn": apn},
-            ).fetchall()
-            assert persisted, (apn, "no current (non-superseded) transfer rows in the database")
-            for link in persisted:
-                assert link.instrument_type != "CONVEYANCE", (apn, link)  # never trusted as a real hop
-                assert link.review_flag or link.exemption_category is not None, (apn, link)
-            assert persisted[-1].grantee == expected_holder, (apn, persisted)
-            assert _names_match(persisted[-1].grantee, persisted[-1].owner_name_raw), (apn, persisted)
+        for apn, result in outer["parcels"].items():
+            assert result["chain"], (apn, result["chain"])
+            assert not result["ambiguous"], (apn, result["ambiguous"])
+            assert result["holder_matches_current_owner"] is True, (apn, result)
+            assert result["gap_note"] is None, (apn, result)
+            assert _names_match(result["final_holder_found"], expected_final_holder[apn]), (apn, result)
+            for link in result["chain"]:
+                assert link["review_flag"] or link["exemption_category"] is not None, (apn, link)
+
+        # confirms migration 0031's supersede mechanism actually fired for this real
+        # re-walk: the OLD recorder-portal-derived rows are still in the database
+        # (never deleted), just correctly marked no-longer-current.
+        superseded_count = session.execute(
+            text("""
+                SELECT count(*) FROM transfer
+                WHERE covid = 3297 AND parcel_apn = ANY(:apns) AND superseded_at IS NOT NULL
+            """),
+            {"apns": list(expected_apns)},
+        ).scalar()
+        assert superseded_count > 0, "expected at least one prior recorder-portal row to be superseded"
 
     print(f"PASS: chain-of-title walk (Montgomery covid 3297, via {outer['method']}) -> "
-          f"5 parcels, the database's own current chain for each reaching its current "
-          f"owner, and the anomalous 'CONVEYANCE' document never trusted as a real hop")
+          f"5 parcels, every one reaching its real current owner with zero ambiguous "
+          f"entries, and the prior recorder-portal chain correctly superseded")
+
+
+def test_walk_chain_montgomery_8245() -> None:
+    """covid 8245 (Montgomery, TX, ANANTA LLC declarant) -- the covenant that
+    motivated building the MCAD deed-history adapter in the first place: a
+    recorder-portal name-walk for "ANANTA LLC" (the covenant's own extracted
+    declarant name) can't find the real conveyances at all, since MCAD's own
+    grantor of record is "ANANTA PARTNERS, LLC", a related-but-distinct
+    entity (_names_match's subset rule still recognizes the shared "ANANTA"
+    token, so declarant_sale still auto-classifies the first hop on both
+    real parcels below).
+
+    6 matched parcels total, only 2 of which are the tract's real dominant
+    geometry (41116 at 99.1% overlap, 451910 at 94.4% -- see
+    scripts/test_classifier.py); the other 4 are negligible sliver
+    artifacts (<3% overlap, some exactly 0%) from the spatial join, walked
+    anyway since chain.py walks every row in parcel_covenant regardless of
+    overlap fraction -- two of those slivers happen to have their own real,
+    unrelated MCAD deed history (they're real neighboring parcels, just not
+    part of this covenant's actual encumbered acreage), and two have none
+    at all (chain stays empty, current_holder falls back to the covenant's
+    own declarant).
+
+    41116's own most recent deed (2026-03-27, to HENDAYA CAPITAL LLC) is
+    real and correctly captured, but parcel.owner_name_raw (from MCAD's
+    separate assessment/ownership-roll feed, captured at ingestion) still
+    shows the PRIOR owner (COXCO8 LLC) -- a real lag between MCAD's two own
+    data feeds, not a chain-walk error, correctly flagged rather than
+    silently trusted or silently ignored."""
+    with get_session() as session:
+        outer = walk_chain_of_title(session, covid=8245, tract_no=1)
+
+        assert outer["walked"], outer
+        assert outer["method"] == "mcad_deed_history", outer
+        assert outer["parcel_count"] == 6, outer
+
+        parcels = outer["parcels"]
+        for apn in ("451910", "129590", "129591"):
+            assert parcels[apn]["chain"], (apn, parcels[apn])
+            assert not parcels[apn]["ambiguous"], (apn, parcels[apn])
+            assert parcels[apn]["holder_matches_current_owner"] is True, (apn, parcels[apn])
+            assert parcels[apn]["gap_note"] is None, (apn, parcels[apn])
+
+        # 41116: a real chain, but MCAD's own ownership-roll feed lags its deed-recording
+        # feed (see docstring) -- correctly flagged, not silently trusted.
+        r41116 = parcels["41116"]
+        assert r41116["chain"], r41116
+        assert r41116["chain"][0]["exemption_category"] == "declarant_sale", r41116["chain"][0]
+        assert r41116["chain"][0]["grantor"] == "ANANTA PARTNERS, LLC", r41116["chain"][0]
+        assert r41116["holder_matches_current_owner"] is False, r41116
+        assert r41116["gap_note"] is not None, r41116
+
+        # 451910: fully resolved, first hop is the same declarant_sale from ANANTA PARTNERS.
+        assert parcels["451910"]["chain"][0]["exemption_category"] == "declarant_sale", parcels["451910"]
+
+        # 129592/363641: no MCAD deed history of their own at all (real sliver artifacts,
+        # not part of this covenant's actual tract) -- empty chain, declarant fallback,
+        # correctly flagged as a mismatch rather than silently assumed resolved.
+        for apn in ("129592", "363641"):
+            assert not parcels[apn]["chain"], (apn, parcels[apn])
+            assert parcels[apn]["holder_matches_current_owner"] is False, (apn, parcels[apn])
+            assert parcels[apn]["gap_note"] is not None, (apn, parcels[apn])
+
+        covenant = session.execute(
+            text("SELECT status, review_reason FROM covenant WHERE covid = 8245"),
+        ).fetchone()
+        assert covenant.status == "needs_review", covenant
+        assert "CHAIN-OF-TITLE GAP" in covenant.review_reason, covenant
+
+    print(f"PASS: chain-of-title walk (Montgomery covid 8245, via {outer['method']}) -> "
+          f"6 parcels, both of the tract's real dominant parcels reach a resolved chain "
+          f"(one fully matching its current owner, one correctly flagged for a real "
+          f"ownership-roll lag)")
 
 
 def test_walk_chain_douglas_co_4123() -> None:
@@ -635,5 +685,6 @@ if __name__ == "__main__":
     test_walk_chain_bexar_2497()
     test_walk_chain_douglas_co_3595()
     test_walk_chain_montgomery_3297()
+    test_walk_chain_montgomery_8245()
     test_walk_chain_douglas_co_4123()
     print("\nall chain-of-title smoke tests passed")

@@ -9,14 +9,14 @@ recording_date, parcel_apn) key exists precisely because a single
 instrument routinely conveys a whole group of lots at once -- confirmed
 directly: covid 3595's 6 lots share the exact same 2 historical sales).
 
-THREE DATA SOURCES, IN PRIORITY ORDER -- learned the hard way on covid 2497
+FOUR DATA SOURCES, IN PRIORITY ORDER -- learned the hard way on covid 2497
 (Bexar): the first version of this walker only searched the county CLERK's
 recorder portal (grantor/grantee name search, app/recorder/adapters/
 publicsearch.py) and came up with a chain whose last known holder didn't
 match the parcel's current owner of record. Checking the county APPRAISAL
 DISTRICT's own website (a third system, distinct from both the ArcGIS
 layer county_gis_registry otherwise points at and the recorder portal in
-county_recorder_registry) turned up two better sources, both recorded as
+county_recorder_registry) turned up better sources, all recorded as
 quirks on county_gis_registry:
 
   - cad_deed_history_url (migration 0019, confirmed for Bexar): some CADs
@@ -32,12 +32,23 @@ quirks on county_gis_registry:
     (app/title/co_assessor_sales.py) -- same kind of complete, per-parcel,
     correctly-ordered history, but with an ACTUAL disclosed SALE_PRICE
     included, captured directly into transfer.consideration_amount.
+  - mcad_deed_history_url (migration 0032, confirmed for Montgomery): a CAD
+    whose own Deed History table has no discoverable public API (unlike
+    the two above) -- fetched via a Playwright-rendered page instead
+    (app/title/mcad_deed_history.py), same access pattern as the recorder
+    portal below but far more reliable, since it's indexed by the parcel
+    itself rather than a grantor/grantee name (sidesteps covid 8245's own
+    declarant-name-vs-actual-grantor mismatch entirely). Foreclosure
+    auto-classification isn't attempted here (MCAD's own deed-type
+    vocabulary hasn't been confirmed to reliably mark one) -- an
+    unclassified transfer is left for manual review, same as the assessor
+    sales-data path.
 
-Both CAD paths already separate real conveyances from everything else, so
-no DOC-TYPE classification is needed there. Only when NEITHER quirk is
-present does this fall back to the recorder-portal name-walk
-(_walk_via_recorder_portal) built for the first county tried, which is
-real but demonstrably less complete (see its own docstring).
+All three CAD paths already separate real conveyances from everything
+else, so no DOC-TYPE classification is needed there. Only when NONE of
+these quirks is present does this fall back to the recorder-portal
+name-walk (_walk_via_recorder_portal) built for the first county tried,
+which is real but demonstrably less complete (see its own docstring).
 
 EXEMPTION CLASSIFICATION is deliberately conservative in every path: only
 two categories are auto-detected --
@@ -85,7 +96,7 @@ from app.db.repository import insert_source, upsert_contact, upsert_transfer
 from app.queue.job_queue import run_with_job_queue
 from app.recorder.adapters import publicsearch
 from app.recorder.session import recorder_context
-from app.title import cad_deed_history, co_assessor_sales
+from app.title import cad_deed_history, co_assessor_sales, mcad_deed_history
 
 MAX_HOPS = 10
 
@@ -325,6 +336,13 @@ def _parse_epoch_ms_date(ms) -> date | None:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).date()
 
 
+def _parse_iso_date(s: str | None) -> date | None:
+    try:
+        return date.fromisoformat((s or "").strip())
+    except ValueError:
+        return None
+
+
 def _fetch_template_exemption_rules(session, template_version_id: str | None) -> dict[str, dict]:
     """Every exemption rule this covenant's own template defines, keyed by
     category_code (covenant_template_exemption, migration 0001) --
@@ -444,6 +462,7 @@ def walk_chain_of_title(session, covid: int, tract_no: int = 1, max_parcels: int
     quirks = (gis_registry.quirks or {}) if gis_registry else {}
     cad_sales_url = quirks.get("cad_sales_data_url")
     cad_url = quirks.get("cad_deed_history_url")
+    mcad_url = quirks.get("mcad_deed_history_url")
     rules = _fetch_template_exemption_rules(session, covenant.template_version_id)
 
     if cad_sales_url:
@@ -461,6 +480,10 @@ def walk_chain_of_title(session, covid: int, tract_no: int = 1, max_parcels: int
     elif cad_url:
         method = "cad_deed_history"
         chains_by_apn = {p.apn: _walk_via_cad_deed_history(covenant, p, cad_url, rules)
+                         for p in parcels}
+    elif mcad_url:
+        method = "mcad_deed_history"
+        chains_by_apn = {p.apn: _walk_via_mcad_deed_history(covenant, p, mcad_url, rules)
                          for p in parcels}
     else:
         recorder_registry = session.execute(
@@ -493,7 +516,8 @@ def walk_chain_of_title(session, covid: int, tract_no: int = 1, max_parcels: int
 
     source_id = insert_source(
         session,
-        source_type="assessor_api" if method in ("cad_deed_history", "assessor_sales_data") else "recorder_portal",
+        source_type="assessor_api" if method in ("cad_deed_history", "assessor_sales_data", "mcad_deed_history")
+                     else "recorder_portal",
         reference=method, confidence=None,
     )
 
@@ -518,24 +542,61 @@ def _update_covenant_gap_notes(session, covid: int, results: dict) -> None:
     hedged note, never silently resolve" convention as
     app/recorder/diagnose.py's maybe_flag_missing_exhibit. Clears itself
     entirely once no parcel has a gap (e.g. a better source resolved it),
-    so a fixed problem doesn't linger in review_reason."""
+    so a fixed problem doesn't linger in review_reason.
+
+    A holder-mismatch gap_note (_finalize) is deliberately suppressed
+    whenever a parcel has ambiguous candidates -- the true final holder
+    isn't actually known yet in that case, so a confident "mismatch" claim
+    would be wrong. But that left a real, confirmed gap (found running this
+    live against covid 8245, where all 8 parcels' entire chains were
+    ambiguous): those parcels got NO covenant-level note at all, even though
+    a human needs to review the same specific candidate documents that
+    prevented a real chain from resolving in the first place. Surfaced here
+    too, separately from gap_note, so a parcel with zero confirmed hops is
+    never silently invisible at the covenant level.
+
+    Also advances covenant.status the same way app/gis/reconcile.py's own
+    reconcile_covenant does (never regress title_in_progress/done, otherwise
+    needs_review whenever review_reason ends up non-empty) -- confirmed real:
+    neither this function nor app/title/fee_compute.py had ever touched
+    status before, so a covenant could carry a brand-new, substantive
+    CHAIN-OF-TITLE GAP note while status stayed at whatever the GIS-
+    reconciliation stage last left it (e.g. 'reconciled'), silently out of
+    sync with what review_reason actually said."""
     gapped = {apn: r["gap_note"] for apn, r in results.items() if r["gap_note"]}
+    unresolved = {
+        apn: r["ambiguous"] for apn, r in results.items()
+        if not r["chain"] and r["ambiguous"] and apn not in gapped
+    }
 
     existing = session.execute(
-        text("SELECT review_reason FROM covenant WHERE covid = :covid"), {"covid": covid},
+        text("SELECT status, review_reason FROM covenant WHERE covid = :covid"), {"covid": covid},
     ).fetchone()
     reason = existing.review_reason or ""
     # matches to end-of-string, not the next ";" -- a gap note's own text can
     # itself contain a semicolon, and this note is always appended last.
     reason = re.sub(r";?\s*CHAIN-OF-TITLE GAP \(automated[^)]*\):.*$", "", reason).strip("; ").strip()
-    if gapped:
-        detail = "; ".join(f"{apn}: {note}" for apn, note in gapped.items())
-        note = f"CHAIN-OF-TITLE GAP (automated, {date.today().isoformat()}): {detail}"
+    details = [f"{apn}: {note}" for apn, note in gapped.items()]
+    for apn, ambiguous in unresolved.items():
+        doc_types = sorted({
+            c["candidates"][0].get("DOC TYPE", "?") for c in ambiguous if c.get("candidates")
+        })
+        details.append(
+            f"{apn}: no confirmed Transfer of Title found -- {len(ambiguous)} ambiguous candidate "
+            f"document(s) ({', '.join(doc_types) if doc_types else 'unclassified'}) need manual review"
+        )
+    if details:
+        note = f"CHAIN-OF-TITLE GAP (automated, {date.today().isoformat()}): " + "; ".join(details)
         reason = f"{reason}; {note}" if reason else note
-    if reason != (existing.review_reason or ""):
+
+    _DO_NOT_REGRESS = {"title_in_progress", "done"}
+    status = existing.status if existing.status in _DO_NOT_REGRESS else (
+        "needs_review" if reason else existing.status
+    )
+    if reason != (existing.review_reason or "") or status != existing.status:
         session.execute(
-            text("UPDATE covenant SET review_reason = :r, updated_at = now() WHERE covid = :covid"),
-            {"r": reason or None, "covid": covid},
+            text("UPDATE covenant SET status = :status, review_reason = :r, updated_at = now() WHERE covid = :covid"),
+            {"status": status, "r": reason or None, "covid": covid},
         )
 
 
@@ -664,6 +725,96 @@ def _walk_via_cad_deed_history(covenant, parcel, cad_url: str, rules: dict | Non
             # a category match under an affidavit-gated template (migration 0030) is a real
             # signal, just not a confirmable one from index data alone -- half confidence,
             # not the usual full 1.0 for an auto-classified category.
+            "exemption_confidence": 0.5 if affidavit_note else (1.0 if category else None),
+        })
+        prior_instrument_number = instrument_number
+
+    return chain
+
+
+def _walk_via_mcad_deed_history(covenant, parcel, mcad_url: str, rules: dict | None) -> list[dict]:
+    """Montgomery CAD (MCAD, mcad-tx.org)'s own per-parcel Deed History
+    table (migration 0032) -- confirmed live to reconstruct a chain the
+    recorder-portal name-walk couldn't (covid 8245: the covenant's own
+    declarant name "ANANTA LLC" doesn't match the actual grantor "ANANTA
+    PARTNERS, LLC" on the real conveyances). Unlike the other two CAD
+    paths, this has no public API -- fetched via a Playwright-rendered
+    page (app/title/mcad_deed_history.py), so a fresh browser context is
+    opened per parcel, same access pattern _walk_via_recorder_portal uses
+    for its own per-query lookups.
+
+    A "DELETED" deed_type is MCAD's own determination that an instrument
+    does NOT actually apply to this parcel (confirmed real: APN 41116's
+    own 2015037102 entry, mistakenly associated with the wrong parcel) --
+    excluded entirely, never surfaced as an ambiguous candidate, since MCAD
+    itself has already resolved the question rather than leaving it
+    uncertain.
+
+    Foreclosure auto-classification is deliberately NOT attempted here
+    (unlike _walk_via_cad_deed_history's Harris Govern PACS path): MCAD's
+    own deed_type vocabulary (WD, SWD, STD, WDV, ...) hasn't been
+    confirmed to reliably mark one, so an unclassified transfer is
+    correctly left for manual review rather than guessed either way --
+    same conservative default as _walk_via_assessor_sales_data."""
+    def _call():
+        with recorder_context() as context:
+            return mcad_deed_history.fetch_deed_history(context, mcad_url, parcel.apn)
+    deeds = run_with_job_queue(_call, job_type="title_mcad_deed_history", county_fips=covenant.county_fips,
+                                covid=None, payload={"mcad_url": mcad_url, "apn": parcel.apn})
+
+    dated = []
+    for d in deeds:
+        if (d.get("deed_type") or "").strip().upper() == "DELETED":
+            continue
+        recorded = _parse_iso_date(d.get("deed_date"))
+        if recorded is not None:
+            dated.append((recorded, d))
+    dated.sort(key=lambda t: t[0])
+
+    chain = []
+    prior_instrument_number = None
+    for recorded, d in dated:
+        if recorded < covenant.recording_date:
+            continue
+        instrument_number = (d.get("instrument") or "").strip()
+        grantor, grantee = d.get("grantor"), d.get("grantee")
+        if not instrument_number or not grantor or not grantee:
+            chain.append({
+                "ambiguous_split": True,
+                "recording_date": str(recorded),
+                "candidates": [d],
+                "review_reason": f"MCAD deed history has a post-covenant entry with no usable instrument "
+                                  f"number/grantor/grantee ({d!r}) -- needs manual review rather than a guess",
+            })
+            continue
+
+        category, basis = _classify_pre_effective_date(recorded, covenant, rules)
+        if category is None and _names_match(grantor, covenant.declarant_raw):
+            category, basis = "declarant_sale", "grantor matches covenant's own declarant"
+
+        affidavit_note = _affidavit_gate_note(category, rules or {})
+        if affidavit_note:
+            review_reason = affidavit_note
+        elif category is None:
+            review_reason = ("exemption category not auto-classifiable from MCAD deed history alone "
+                              "(grantor/grantee names and deed type only) -- needs manual review of the "
+                              "deed's own recitals")
+        else:
+            review_reason = None
+
+        chain.append({
+            "instrument_number": instrument_number,
+            "recording_date": str(recorded),
+            "grantor": grantor,
+            "grantee": grantee,
+            "doc_type": d.get("description") or d.get("deed_type"),
+            "book": d.get("book"),
+            "page": d.get("page"),
+            "prior_instrument_number": prior_instrument_number,
+            "exemption_category": category,
+            "exemption_basis": basis,
+            "review_flag": category is None or affidavit_note is not None,
+            "review_reason": review_reason,
             "exemption_confidence": 0.5 if affidavit_note else (1.0 if category else None),
         })
         prior_instrument_number = instrument_number

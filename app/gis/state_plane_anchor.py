@@ -125,3 +125,73 @@ def apply_similarity_transform(
         ry = (dx * sin_r + dy * cos_r) * length_ratio
         out.append((real_origin[0] + rx, real_origin[1] + ry))
     return out
+
+
+FT_PER_DEG_LAT = 364000.0  # matches app/gis/geocode_anchor.py's own constant
+
+
+def traverse_to_geojson_via_parcel_ties(
+    vertices_ft: list[tuple[float, float]],
+    local_ties_ft: list[tuple[float, float]],
+    real_ties_lonlat: list[tuple[float, float]],
+    anchor_lat: float,
+) -> dict:
+    """Anchor a metes-and-bounds traverse using real corners of already-
+    platted, already-existing parcels the deed's own courses explicitly tie
+    to (e.g. "passing... the common corner of Lot 527 and 528") -- a THIRD
+    anchoring path alongside a stated State Plane POB coordinate and a
+    shared-corner registration onto an already-anchored sibling tract.
+
+    Confirmed real: covid 8245's (Charles Eisterwall Survey) original
+    tract.geom -- built from an incomplete _textcache_final copy of its
+    deed's Exhibit A, missing the opening courses -- was shifted enough to
+    spatially miss its own two real parcels entirely and instead catch 8
+    unrelated ones. Re-derived from the deed's complete metes-and-bounds
+    text and anchored to 4 real corners of the adjoining Oak Ridge North
+    Sec. 5 lots that deed's own course explicitly ties to (matching corners
+    found by exact coincidence between adjoining parcels' own polygon
+    vertices, then a least-squares fit) -- corrected classified_acreage
+    landed within 0.03% of the deed's own stated acreage, up from a tract
+    that had matched zero of its real parcels.
+
+    Real drawback, not just a formality: this only ever anchors as
+    accurately as the REFERENCE parcels' own GIS geometry. County assessor/
+    GIS parcel layers are typically digitized for tax purposes, not survey-
+    grade -- they can drift a few feet from the true legal boundary, and if
+    the reference parcels were themselves resurveyed or replatted after this
+    deed's own date, their current corners may not sit exactly where they
+    did when the deed was written. A tight least-squares residual confirms
+    internal consistency (the tie points really do form a rigid, undistorted
+    set), not that the reference geometry itself is accurate -- there's no
+    independent way to detect a systematic error in the county's own data
+    from this fit alone. Only usable, too, when the deed actually ties to an
+    identifiable already-platted lot; plenty of metes-and-bounds tracts
+    don't.
+
+    local_ties_ft / real_ties_lonlat must correspond position-for-position
+    (the Nth local tie is the same physical corner as the Nth real tie) and
+    should be at least 2, ideally more per solve_similarity_leastsquares'
+    own over-determined-fit robustness -- e.g. computed by interpolating
+    along a straight course at the deed's own stated cumulative tie
+    distances, matched against real corners shared consecutively between
+    adjoining platted lots. anchor_lat is used only for the local flat-earth
+    degree-per-foot approximation (fine at a single tract's extent, same
+    approximation app/gis/geocode_anchor.py's own traverse_to_geojson uses).
+    """
+    ft_per_deg_lon = FT_PER_DEG_LAT * math.cos(math.radians(anchor_lat))
+    origin_lon, origin_lat = real_ties_lonlat[0]
+    real_ties_ft = [
+        ((lon - origin_lon) * ft_per_deg_lon, (lat - origin_lat) * FT_PER_DEG_LAT)
+        for lon, lat in real_ties_lonlat
+    ]
+
+    a, b = solve_similarity_leastsquares(local_ties_ft, real_ties_ft)
+    transformed_ft = apply_similarity_complex(vertices_ft, a, b)
+
+    ring = []
+    for x, y in transformed_ft:
+        lon = origin_lon + x / ft_per_deg_lon
+        lat = origin_lat + y / FT_PER_DEG_LAT
+        ring.append([lon, lat])
+    ring.append(ring[0])  # GEOS requires a bit-identical closed ring, not just close
+    return {"type": "MultiPolygon", "coordinates": [[ring]]}

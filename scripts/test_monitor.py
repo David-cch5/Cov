@@ -279,15 +279,19 @@ def test_monitor_persisted_real_nothing_new_runs() -> None:
             SELECT run_type, new_parcels_found, residual_acreage_before, residual_acreage_after
             FROM monitor_run WHERE covid = 3194 AND run_seq = 5
         """)).fetchone()
+        # run_seq 4: the first real check after covid 8245's tract.geom was corrected
+        # 2026-07-28/29 (see app/gis/classifier.py's own test for the georeferencing fix
+        # this superseded) -- residual here is the tract's genuine small (~0.017 ac)
+        # over-tolerance gap, not the near-zero value the old, wrong geometry produced.
         r8245 = session.execute(text("""
             SELECT run_type, new_parcels_found, residual_acreage_before, residual_acreage_after
-            FROM monitor_run WHERE covid = 8245 AND run_seq = 2
+            FROM monitor_run WHERE covid = 8245 AND run_seq = 4
         """)).fetchone()
     assert r3194.run_type == "manual" and r3194.new_parcels_found == 0, r3194
     assert abs(float(r3194.residual_acreage_before) - float(r3194.residual_acreage_after)) < 0.001, r3194
     assert r8245.run_type == "manual" and r8245.new_parcels_found == 0, r8245
-    assert float(r8245.residual_acreage_before) < 0.001, r8245
-    print("PASS: monitor_run (covid 3194 run_seq 5, covid 8245 run_seq 2) -> real "
+    assert abs(float(r8245.residual_acreage_before) - 0.0174) < 0.001, r8245
+    print("PASS: monitor_run (covid 3194 run_seq 5, covid 8245 run_seq 4) -> real "
           "'manual' re-checks correctly found nothing new, residual unchanged")
 
 

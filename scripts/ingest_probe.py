@@ -6,6 +6,7 @@ document failing (e.g. an API error) never blocks or rolls back the others.
 
 Usage: python3 scripts/ingest_probe.py
 """
+import os
 import re
 import sys
 from datetime import date
@@ -15,7 +16,10 @@ from sqlalchemy import text
 sys.path.insert(0, ".")
 
 from app.db.session import get_session
-from app.ingestion.walk import iter_candidates
+from app.ingestion.ocr_escalation import (
+    MAX_PAGES_WITHOUT_APPROVAL, VOCAB_SCORE_THRESHOLD, escalate_to_vision_ocr,
+)
+from app.ingestion.walk import PROJECT_ROOT, iter_candidates
 from app.parsing.template_fields import extract_fields
 from app.db.repository import (
     upsert_contact, upsert_covenant, upsert_covenant_beneficiary, upsert_covenant_document,
@@ -46,6 +50,68 @@ def _merge_ingestion_note(existing_reason: str | None, ingestion_note: str | Non
         note = f"INGESTION-STAGE (automated, {date.today().isoformat()}): {ingestion_note}"
         reason = f"{reason}; {note}" if reason else note
     return reason
+
+_OCR_CONFIDENCE_REASON_PREFIXES = ("no OCR vocab score computed", "low OCR vocab score")
+
+
+def _strip_ocr_confidence_reason(review_reason: str | None) -> str | None:
+    """Removes just the OCR-confidence-gate reason(s) from a combined
+    review_reason string, leaving any other reason (county unresolved,
+    template not identified, etc.) untouched -- used after a vision-OCR
+    escalation successfully resolves the confidence concern, so a stale
+    "low OCR vocab score (0.11)" note doesn't linger once the text it
+    describes has been replaced."""
+    if not review_reason:
+        return review_reason
+    kept = [p for p in (part.strip() for part in review_reason.split(";"))
+            if p and not p.startswith(_OCR_CONFIDENCE_REASON_PREFIXES)]
+    return "; ".join(kept) if kept else None
+
+
+def escalate_ocr_confidence(candidates: list, max_pages: int = MAX_PAGES_WITHOUT_APPROVAL) -> None:
+    """Vision-OCR escalation (CLAUDE.md's OCR policy, tier 3) -- mutates
+    each candidate in place when resolved. Only for candidates whose text
+    already exists but is missing/low-confidence (app/ingestion/walk.py's
+    own iter_candidates has already applied the free fuller-cache fallback
+    to every candidate by this point; escalate_to_vision_ocr does NOT retry
+    that, so this only ever spends budget on genuinely still-unresolved
+    cases). Shared budget across the whole call -- capped at max_pages
+    total Fable page-transcriptions, small and explicit so this can run
+    without separate approval each time; anything beyond the cap is left
+    exactly as iter_candidates found it, still flagged needs_review."""
+    remaining = max_pages
+    for c in candidates:
+        if not (c.relpath and c.text is not None and
+                (c.vocab_score is None or c.vocab_score < VOCAB_SCORE_THRESHOLD)):
+            continue
+        pdf_path = os.path.join(PROJECT_ROOT, c.relpath)
+        if not os.path.exists(pdf_path):
+            continue
+
+        result = escalate_to_vision_ocr(str(c.covid), pdf_path, remaining)
+        remaining -= result.get("pages_escalated", 0)
+
+        if not result["resolved"]:
+            if result["capped"]:
+                print(f"  OCR escalation (covid {c.covid}): {result['reason']}")
+            continue
+
+        print(f"  OCR escalation (covid {c.covid}): resolved via {result['resolved_via']}"
+              + (f", {result['pages_escalated']} page(s)" if result["pages_escalated"] else " (cached)"))
+        c.text = result["text"]
+        c.vocab_score = result.get("min_confidence")
+        if c.vocab_score is not None and c.vocab_score >= VOCAB_SCORE_THRESHOLD:
+            c.review_reason = _strip_ocr_confidence_reason(c.review_reason)
+            c.needs_review = bool(c.review_reason)
+        else:
+            # still not confident even after vision OCR -- a genuinely bad scan, not
+            # something to force through; replace the stale Tesseract-based reason with
+            # one reflecting what was actually tried.
+            other_reasons = _strip_ocr_confidence_reason(c.review_reason)
+            new_reason = f"low confidence ({c.vocab_score}) even after vision-OCR escalation"
+            c.review_reason = f"{other_reasons}; {new_reason}" if other_reasons else new_reason
+            c.needs_review = True
+
 
 MONTGOMERY_TX_COVIDS = ["3346", "4781", "4440", "8245", "4780", "3194", "3297"]
 PILOT_COVIDS = ["7029", "5340", "5835", "3428"]
@@ -249,9 +315,11 @@ def ingest_one(session, c) -> None:
     )
 
 
-def run(covids: list[str]) -> None:
+def run(covids: list[str], max_ocr_escalation_pages: int = MAX_PAGES_WITHOUT_APPROVAL) -> None:
     with get_session() as lookup_session:
         candidates = list(iter_candidates(lookup_session, covids))
+
+    escalate_ocr_confidence(candidates, max_ocr_escalation_pages)
 
     succeeded, failed = [], []
     for c in candidates:

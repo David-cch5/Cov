@@ -101,25 +101,36 @@ def test_persisted_montgomery_3194_real_classification() -> None:
 
 
 def test_persisted_montgomery_8245_real_classification() -> None:
-    """The already-committed result for covid 8245 tract 1 (a small 4.61-ac
-    tract): 8 parcels matched, all boundary-classified (no parcel is wholly
-    contained by this small tract -- consistent with one or more larger
-    parent parcels straddling its edge rather than lots platted inside it),
-    residual ~0 (floating-point noise, not a real gap)."""
+    """The already-committed result for covid 8245 tract 1 -- corrected
+    2026-07-28/29 after a real georeferencing error was found (the tract's
+    original geom, likely built from an incomplete _textcache_final copy of
+    the deed's Exhibit A missing its opening courses, was shifted enough to
+    miss its true parcels and instead spatially catch 8 unrelated ones).
+    Re-derived from the deed's complete metes-and-bounds text (found in
+    _textcache) and anchored to 4 real corners of the adjoining Oak Ridge
+    North Sec. 5 lots the deed itself ties to. The corrected polygon
+    dominantly matches exactly 2 real parcels -- APN 451910 (94% overlap,
+    the "Alore Center" Reserve A equivalent) and APN 41116 (99% overlap,
+    Reserve B) -- classified_acreage lands within 0.01 ac of the deed's own
+    stated 4.6055 ac. A few negligible sliver matches (<3% overlap, low
+    confidence) from the polygon's own small residual imprecision may also
+    appear -- not asserted on by exact count, since that's sensitive to
+    live GIS data and floating-point noise at a sub-acre scale; the two
+    real, dominant matches are the actual regression check."""
     with get_session() as session:
         row = session.execute(text("""
             SELECT classified_acreage, ST_Area(residual_geom::geography) / 4046.8564224 AS residual_acreage
             FROM tract WHERE covid = 8245 AND tract_no = 1
         """)).fetchone()
-        counts = dict(session.execute(text("""
-            SELECT classification, count(*) AS n FROM parcel_covenant
-            WHERE covid = 8245 AND tract_no = 1 GROUP BY classification
+        overlaps = dict(session.execute(text("""
+            SELECT apn, overlap_fraction FROM parcel_covenant
+            WHERE covid = 8245 AND tract_no = 1 AND apn IN ('451910', '41116')
         """)).fetchall())
-    assert counts.get("interior", 0) == 0, counts
-    assert counts["boundary"] == 8, counts
-    assert float(row.residual_acreage) < 0.001, row
-    print("PASS: parcel_covenant (covid 8245 tract 1) -> real, committed spatial "
-          "classification (8 boundary parcels, near-zero residual) matches the live run's own result")
+    assert float(overlaps["451910"]) > 0.9, overlaps
+    assert float(overlaps["41116"]) > 0.9, overlaps
+    assert abs(float(row.classified_acreage) - 4.6055) < 0.05, row
+    print("PASS: parcel_covenant (covid 8245 tract 1) -> corrected classification "
+          "dominantly matches the real Alore Center Reserve A/B parcels (>90% overlap each)")
 
 
 if __name__ == "__main__":

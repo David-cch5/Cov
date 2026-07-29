@@ -102,21 +102,23 @@ def test_reconcile_tract_metes_and_bounds_real_residual_unaccounted() -> None:
           "spatial parcel classification correctly flagged as unaccounted_area")
 
 
-def test_reconcile_tract_metes_and_bounds_real_residual_reconciled() -> None:
-    """covid 8245 tract 1 (Montgomery): a small (4.61-ac) metes-and-bounds
-    tract whose spatial parcel census (8 parcels, all boundary-classified --
-    consistent with one or more larger parent parcels straddling the tract's
-    edge rather than lots platted wholly inside it) leaves a residual of
-    ~6.5e-7 acres -- floating-point noise, not a real gap. Confirms the
-    tolerance check (not a naive nonzero check) is what actually gates
-    'reconciled' here."""
+def test_reconcile_tract_metes_and_bounds_small_residual_over_tolerance() -> None:
+    """covid 8245 tract 1 (Montgomery): after its tract.geom was corrected
+    2026-07-28/29 (a real georeferencing error was found and fixed -- see
+    app/gis/classifier.py's own test for detail), the tract now dominantly
+    matches its two real parcels (APN 451910, 41116 -- the "Alore Center"
+    Reserve A/B equivalents) with a small residual of ~0.017 ac -- just over
+    RECONCILIATION_TOLERANCE_ACRES, unlike 3194's dramatically-over-tolerance
+    78-ac gap. Confirms the tolerance check is a real boundary, not a fudge
+    factor -- a small but genuine residual still gets flagged, not waved
+    through just because it's close."""
     with get_session() as session:
         result = reconcile_tract(session, covid=8245, tract_no=1)
     assert result["checked"] is True, result
-    assert result["status"] == "reconciled", result
-    assert result["unaccounted_acreage"] < RECONCILIATION_TOLERANCE_ACRES, result
-    print("PASS: reconcile_tract (covid 8245) -> a metes-and-bounds tract whose real "
-          "residual is within tolerance reconciles cleanly")
+    assert result["status"] == "unaccounted_area", result
+    assert RECONCILIATION_TOLERANCE_ACRES < result["unaccounted_acreage"] < 0.05, result
+    print("PASS: reconcile_tract (covid 8245) -> a small but genuine residual just over "
+          "tolerance is still correctly flagged, not waved through")
 
 
 def test_reconcile_covenant_advances_status_when_fully_clean() -> None:
@@ -162,17 +164,19 @@ def test_reconcile_covenant_metes_and_bounds_flags_real_residual() -> None:
           "correctly keep the covenant in needs_review")
 
 
-def test_reconcile_covenant_metes_and_bounds_advances_when_clean() -> None:
-    """covid 8245: a single metes-and-bounds tract whose real residual is
-    within tolerance, and no other outstanding review_reason note --
-    advances all the way to 'reconciled', same as a clean current_parcel_
-    match covenant does."""
+def test_reconcile_covenant_metes_and_bounds_small_residual_needs_review() -> None:
+    """covid 8245: the corrected tract's own small (~0.017 ac) over-tolerance
+    residual is enough, by itself, to keep the covenant in needs_review --
+    same behavior as covid 3194's much larger residual, at a very different
+    scale, confirming the covenant-level rollup doesn't have some implicit
+    minimum-severity threshold of its own beyond the tract-level tolerance
+    check that already gates it."""
     with get_session() as session:
         result = reconcile_covenant(session, covid=8245)
-    assert result["tract_results"][1]["status"] == "reconciled", result
-    assert result["final_status"] == "reconciled", result
-    print("PASS: reconcile_covenant (covid 8245) -> a clean metes-and-bounds "
-          "reconciliation advances the covenant same as current_parcel_match does")
+    assert result["tract_results"][1]["status"] == "unaccounted_area", result
+    assert result["final_status"] == "needs_review", result
+    print("PASS: reconcile_covenant (covid 8245) -> a small but genuine tract-level "
+          "residual alone is enough to keep the covenant in needs_review")
 
 
 if __name__ == "__main__":
@@ -181,9 +185,9 @@ if __name__ == "__main__":
     test_reconcile_tract_no_stated_acreage_is_reconciled()
     test_reconcile_tract_not_eligible_before_parcel_census()
     test_reconcile_tract_metes_and_bounds_real_residual_unaccounted()
-    test_reconcile_tract_metes_and_bounds_real_residual_reconciled()
+    test_reconcile_tract_metes_and_bounds_small_residual_over_tolerance()
     test_reconcile_covenant_advances_status_when_fully_clean()
     test_reconcile_covenant_never_silently_clears_an_unrelated_note()
     test_reconcile_covenant_metes_and_bounds_flags_real_residual()
-    test_reconcile_covenant_metes_and_bounds_advances_when_clean()
+    test_reconcile_covenant_metes_and_bounds_small_residual_needs_review()
     print("\nall reconcile smoke tests passed")
