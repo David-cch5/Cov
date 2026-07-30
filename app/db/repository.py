@@ -174,13 +174,19 @@ def upsert_covenant_document(session, relpath: str, covid: int, doc_type: str,
 
 def upsert_parcel(session, county_fips: str, apn: str, owner_name_raw: str | None,
                    situs_address: str | None, acreage: float | None, geojson: dict | None,
-                   source_id: int | None, city: str | None = None, zip_code: str | None = None) -> None:
+                   source_id: int | None, city: str | None = None, zip_code: str | None = None,
+                   recited_legal_description: str | None = None) -> None:
+    # recited_legal_description is never overwritten with NULL on a later sync that
+    # happens not to carry it (not every adapter/query passes it) -- COALESCE keeps
+    # whatever was last actually known, same "don't regress a real fact to unknown"
+    # convention already used elsewhere in this module.
     session.execute(
         text("""
-            INSERT INTO parcel (county_fips, apn, owner_name_raw, situs_address, city, zip_code, acreage, geom, last_synced_at, source_id)
+            INSERT INTO parcel (county_fips, apn, owner_name_raw, situs_address, city, zip_code, acreage, geom,
+                                 recited_legal_description, last_synced_at, source_id)
             VALUES (
                 :county_fips, :apn, :owner_name_raw, :situs_address, :city, :zip_code, :acreage,
-                ST_SetSRID(ST_GeomFromGeoJSON(:geojson), 4326), now(), :source_id
+                ST_SetSRID(ST_GeomFromGeoJSON(:geojson), 4326), :recited_legal_description, now(), :source_id
             )
             ON CONFLICT (county_fips, apn) DO UPDATE SET
                 owner_name_raw = EXCLUDED.owner_name_raw,
@@ -189,6 +195,7 @@ def upsert_parcel(session, county_fips: str, apn: str, owner_name_raw: str | Non
                 zip_code = EXCLUDED.zip_code,
                 acreage = EXCLUDED.acreage,
                 geom = EXCLUDED.geom,
+                recited_legal_description = COALESCE(EXCLUDED.recited_legal_description, parcel.recited_legal_description),
                 last_synced_at = now(),
                 source_id = EXCLUDED.source_id
         """),
@@ -196,8 +203,45 @@ def upsert_parcel(session, county_fips: str, apn: str, owner_name_raw: str | Non
             "county_fips": county_fips, "apn": apn, "owner_name_raw": owner_name_raw,
             "situs_address": situs_address, "city": city, "zip_code": zip_code, "acreage": acreage,
             "geojson": json.dumps(geojson) if geojson else None, "source_id": source_id,
+            "recited_legal_description": recited_legal_description,
         },
     )
+
+
+def upsert_plat(session, county_fips: str, subdivision_name: str, section: str,
+                 lookup_status: str, recording_instrument: str | None, recording_date,
+                 book_volume_page: str | None, abstract_name: str | None, source_id: int | None) -> int:
+    """One row per real plat filing (a subdivision's own section/phase), or a
+    single lookup_status='not_found' row (section='') recording that a real
+    recorder-portal search was tried and came up empty -- so a later run
+    never re-searches a subdivision this project has already asked about.
+    Returns plat_id."""
+    row = session.execute(
+        text("""
+            INSERT INTO plat (county_fips, subdivision_name, section, lookup_status,
+                               recording_instrument, recording_date, book_volume_page,
+                               abstract_name, source_id, updated_at)
+            VALUES (:county_fips, :subdivision_name, :section, :lookup_status,
+                    :recording_instrument, :recording_date, :book_volume_page,
+                    :abstract_name, :source_id, now())
+            ON CONFLICT (county_fips, subdivision_name, section) DO UPDATE SET
+                lookup_status = EXCLUDED.lookup_status,
+                recording_instrument = EXCLUDED.recording_instrument,
+                recording_date = EXCLUDED.recording_date,
+                book_volume_page = EXCLUDED.book_volume_page,
+                abstract_name = EXCLUDED.abstract_name,
+                source_id = EXCLUDED.source_id,
+                updated_at = now()
+            RETURNING plat_id
+        """),
+        {
+            "county_fips": county_fips, "subdivision_name": subdivision_name, "section": section,
+            "lookup_status": lookup_status, "recording_instrument": recording_instrument,
+            "recording_date": recording_date, "book_volume_page": book_volume_page,
+            "abstract_name": abstract_name, "source_id": source_id,
+        },
+    ).fetchone()
+    return row.plat_id
 
 
 def upsert_transfer(session, county_fips: str, instrument_number: str, covid: int, tract_no: int,

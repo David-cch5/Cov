@@ -171,6 +171,7 @@ def monitor_tract_for_new_plats(session, covid: int, tract_no: int = 1, run_type
             session, county_fips=p["county_fips"], apn=p["apn"], owner_name_raw=p["owner_name_raw"],
             situs_address=p["situs_address"], city=p.get("city"), zip_code=p.get("zip_code"),
             acreage=p["acreage"], geojson=p["geojson"], source_id=gis_source_id,
+            recited_legal_description=p.get("recited_legal_description"),
         )
 
     # -- Retirements: snapshot each retired apn's last-known state, then correlate it by

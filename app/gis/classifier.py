@@ -8,6 +8,7 @@ the county's current parcel layer shows, regardless of any later replat/rename -
 the discussion this was designed around.
 """
 import json
+import re
 
 from sqlalchemy import text
 
@@ -111,6 +112,7 @@ def resolve_subdivision_plat_tract(session, covid: int, tract_no: int = 1) -> di
             session, county_fips=p["county_fips"], apn=p["apn"], owner_name_raw=p["owner_name_raw"],
             situs_address=p["situs_address"], city=p.get("city"), zip_code=p.get("zip_code"),
             acreage=p["acreage"], geojson=p["geojson"], source_id=gis_source_id,
+            recited_legal_description=p.get("recited_legal_description"),
         )
         apns.append(p["apn"])
 
@@ -230,7 +232,26 @@ def classify_metes_and_bounds_tract(session, covid: int, tract_no: int = 1) -> d
             session, county_fips=p["county_fips"], apn=p["apn"], owner_name_raw=p["owner_name_raw"],
             situs_address=p["situs_address"], city=p.get("city"), zip_code=p.get("zip_code"),
             acreage=p["acreage"], geojson=p["geojson"], source_id=gis_source_id,
+            recited_legal_description=p.get("recited_legal_description"),
         )
+
+    # Confirmed real (covid 4440, a ~2500-candidate bounding box -- the first tract large
+    # enough to surface this): a small number of a county's OWN live GIS parcels can have
+    # genuinely invalid geometry (e.g. "Nested shells" -- self-intersecting rings), which
+    # crashes ST_Intersection with a GEOS TopologyException for the WHOLE batch, not just
+    # that one parcel. Never seen on the small candidate pools every prior tract had.
+    # Excluded from the real intersection test below (nothing correct can be computed
+    # against a broken polygon) but surfaced in the return value rather than silently
+    # dropped -- CLAUDE.md: never fabricate, flag for review instead.
+    invalid_geometry_apns = [
+        r.apn for r in session.execute(
+            text("""
+                SELECT apn FROM parcel
+                WHERE county_fips = :county_fips AND apn = ANY(:apns) AND NOT ST_IsValid(geom)
+            """),
+            {"county_fips": county_fips, "apns": [p["apn"] for p in candidates]},
+        ).fetchall()
+    ]
 
     matched = session.execute(
         text("""
@@ -241,6 +262,7 @@ def classify_metes_and_bounds_tract(session, covid: int, tract_no: int = 1) -> d
             FROM parcel p, tract t
             WHERE p.county_fips = :county_fips AND p.apn = ANY(:apns)
               AND t.covid = :covid AND t.tract_no = :tract_no
+              AND ST_IsValid(p.geom)
               AND ST_Intersects(t.geom, p.geom)
         """),
         {"county_fips": county_fips, "apns": [p["apn"] for p in candidates], "covid": covid, "tract_no": tract_no},
@@ -313,10 +335,124 @@ def classify_metes_and_bounds_tract(session, covid: int, tract_no: int = 1) -> d
         {"covid": covid, "tract_no": tract_no, "run_seq": run_seq, "source_id": gis_source_id},
     )
 
+    if invalid_geometry_apns:
+        session.execute(
+            text("""
+                UPDATE covenant SET status = 'needs_review', review_reason =
+                    CASE WHEN review_reason IS NULL OR review_reason = '' THEN :note
+                         ELSE review_reason || '; ' || :note END,
+                    updated_at = now()
+                WHERE covid = :covid
+            """),
+            {"covid": covid, "note": (
+                f"GEOMETRY DATA QUALITY (automated): {len(invalid_geometry_apns)} parcel(s) in this tract's "
+                f"bounding box have invalid geometry in the county's own GIS service ({', '.join(invalid_geometry_apns)}) "
+                f"-- excluded from spatial classification rather than guessed at; needs manual review to confirm "
+                f"whether any of them actually fall inside this covenant's tract"
+            )},
+        )
+
     return {
         "candidates_in_bbox": len(candidates),
         "matched_parcels": len(matched),
         "interior": sum(1 for m in matched if m.is_interior),
         "boundary": sum(1 for m in matched if not m.is_interior),
         "run_seq": run_seq,
+        "invalid_geometry_apns": invalid_geometry_apns,
     }
+
+
+def exclude_non_tract_parcels(session, covid: int, tract_no: int, apns: list[str], reason: str) -> dict:
+    """Removes specific parcels from a tract's own classification that the true
+    polygon intersection test matched, but that a human reading of the deed's
+    own legal description knows are NOT actually part of the encumbered land --
+    the spatial-first census is only as good as the tract polygon's own
+    precision (CLAUDE.md's own caveat on every anchoring technique in this
+    project), and a deed-cited ADJOINING tract (named only to tie a boundary
+    corner, e.g. "a called 30 acre tract described in deed to Tessie Belle
+    Carroll") can get spuriously caught if the polygon runs even slightly wide
+    at that edge.
+
+    Confirmed real (covid 4440, both tracts, 2026-07-30): Tract II's own deed
+    text ties a ~7,000+ ft stretch of its northern boundary to "the centerline
+    of F. M. 2090" -- any parcel actually north of that real road is adjoining
+    land, never this covenant's own. Tract I's deed cites dozens of small
+    adjoining tracts by name along its western/southern lines (Carroll 30 ac,
+    two separate Duke 5.104 ac tracts, the Bowdoin 12/13 ac tracts already
+    used as this tract's own anchor ties) -- all correctly excluded here by
+    matching the modern parcel's owner/acreage back to those specific deed
+    citations, not by geometry alone.
+
+    This is a genuine human judgment call, not a mechanical rule: a raw,
+    unplatted parcel sharing this deed's own survey abstract number is kept
+    when its owner or its own legal description ties it to one of this
+    tract's confirmed real subdivisions or the municipal utility districts
+    serving them (e.g. "TRACT ME13 DIR LOT" ties to MUD #13, already
+    confirmed elsewhere in this same tract at 100% interior overlap), and
+    excluded when it ties to nothing this project has independently confirmed
+    -- an unconnected commercial owner, a deed-cited adjoiner, or a generic
+    "director lot" cluster with no matching MUD number. Never deleted
+    silently: every excluded APN is named in the covenant's own review_reason,
+    same as this module's own GEOMETRY DATA QUALITY note.
+
+    Removes the parcel_covenant rows across every run_seq (these were never a
+    legitimate match at any point, unlike a genuine later replat), then
+    recomputes classified_acreage/residual_geom from the remaining matches at
+    the tract's own latest run_seq -- identical math to classify_metes_and_
+    bounds_tract's own residual computation, just re-run over a corrected
+    parcel set."""
+    row = session.execute(text("SELECT county_fips FROM covenant WHERE covid = :covid"), {"covid": covid}).fetchone()
+    if row is None:
+        raise RuntimeError(f"covid {covid} not found")
+    county_fips = row.county_fips
+
+    deleted = session.execute(
+        text("""
+            DELETE FROM parcel_covenant
+            WHERE covid = :covid AND tract_no = :tract_no AND county_fips = :county_fips AND apn = ANY(:apns)
+        """),
+        {"covid": covid, "tract_no": tract_no, "county_fips": county_fips, "apns": apns},
+    ).rowcount
+
+    run_seq = session.execute(
+        text("SELECT MAX(run_seq) AS n FROM parcel_covenant WHERE covid = :covid AND tract_no = :tract_no"),
+        {"covid": covid, "tract_no": tract_no},
+    ).fetchone().n
+    if run_seq is not None:
+        session.execute(
+            text("""
+                WITH matched_union AS (
+                    SELECT ST_Union(p.geom) AS geom
+                    FROM parcel p
+                    JOIN parcel_covenant pc ON pc.county_fips = p.county_fips AND pc.apn = p.apn
+                    WHERE pc.covid = :covid AND pc.tract_no = :tract_no AND pc.run_seq = :run_seq
+                )
+                UPDATE tract SET
+                    residual_geom = ST_Multi(ST_Difference(tract.geom, matched_union.geom)),
+                    classified_acreage = (
+                        ST_Area(tract.geom::geography) - ST_Area(ST_Difference(tract.geom, matched_union.geom)::geography)
+                    ) / 4046.8564224,
+                    updated_at = now()
+                FROM matched_union
+                WHERE tract.covid = :covid AND tract.tract_no = :tract_no
+            """),
+            {"covid": covid, "tract_no": tract_no, "run_seq": run_seq},
+        )
+
+    existing = session.execute(text("SELECT status, review_reason FROM covenant WHERE covid = :covid"), {"covid": covid}).fetchone()
+    tag = f"NON-TRACT PARCEL EXCLUSION (automated, tract {tract_no})"
+    prior = re.sub(rf";?\s*{re.escape(tag)}:.*?(?=;\s*[A-Z][A-Z0-9 -]*\(automated|$)", "",
+                   existing.review_reason or "", flags=re.DOTALL).strip("; ").strip()
+    note = f"{tag}: {reason} ({', '.join(apns)})"
+    new_reason = f"{prior}; {note}" if prior else note
+    status = existing.status if existing.status in ("title_in_progress", "done") else "needs_review"
+    session.execute(
+        text("UPDATE covenant SET status = :status, review_reason = :reason, updated_at = now() WHERE covid = :covid"),
+        {"status": status, "reason": new_reason, "covid": covid},
+    )
+
+    tract_row = session.execute(
+        text("SELECT classified_acreage FROM tract WHERE covid = :covid AND tract_no = :tract_no"),
+        {"covid": covid, "tract_no": tract_no},
+    ).fetchone()
+    return {"excluded_count": deleted, "classified_acreage": float(tract_row.classified_acreage) if tract_row and tract_row.classified_acreage is not None else None}

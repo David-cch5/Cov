@@ -51,6 +51,41 @@ def search_by_name(context: BrowserContext, base_url: str, query: str, full_text
         page.close()
 
 
+def search_plats_by_subdivision(context: BrowserContext, base_url: str, subdivision_name: str) -> list[dict]:
+    """Every Plats-department record matching a subdivision name -- confirmed
+    live (Montgomery) to return FILE NUMBER/VOL-BK-PG/DOC TYPE/GRANTOR/
+    RECORDED DATE/SECTION/ABSTRACT/ABSTRACT NAME columns, one row per
+    section/phase (e.g. searching "THE CANOPIES" returns Sections 1, 2, 3,
+    4, 18 at once, two different recording dates among them) -- so ONE
+    search per base subdivision name resolves every section's own real
+    plat date, not one search per section.
+
+    This vendor's quick-search box always defaults to the "Public Records"
+    department on a fresh page load; the Department control is a react-
+    select combobox (no native <select>, so Playwright's own select_option
+    can't drive it) -- confirmed by inspecting the live DOM: click the
+    current department label to open it, then click the "Plats" option by
+    its text (not by its dynamically-numbered react-select-N-option-M id,
+    which is not stable across reloads)."""
+    page = context.new_page()
+    try:
+        page.goto(base_url, wait_until="networkidle")
+        page.click("text=Public Records")
+        page.wait_for_timeout(300)
+        page.click("text=Plats", timeout=5000)
+        page.wait_for_timeout(300)
+        page.fill(f"#{SEARCH_BOX_ID}", subdivision_name)
+        page.click('[data-testid="searchSubmitButton"]')
+        try:
+            page.wait_for_selector("table", timeout=20000)
+        except Exception:
+            return []  # "No Results Found" -- no plat found under this name, not an error
+        page.wait_for_timeout(500)
+        return _parse_results_table(page)
+    finally:
+        page.close()
+
+
 def _digits_only(s: str) -> str:
     return re.sub(r"\D", "", s or "")
 
