@@ -157,22 +157,30 @@ def test_persisted_montgomery_4440_real_classification() -> None:
     bounding boxes overlap near the shared boundary).
 
     Counts here are POST-correction (see test_exclude_non_tract_parcels_
-    covid_4440 below). An initial correction pass excluded 22 parcels in
-    Tract I and 6 in Tract II by owner/name pattern alone -- but the
-    stakeholder caught that this heuristic was wrong for several parcels
-    held through generically-named land-banking SPVs (Andiron Multistate 1
-    LLC, Millrose Properties Texas LLC, Apogee Peak #1 LLC, Horizon Park
-    LLC, and a CBA Strategic Fund I LP-held lot cluster) that DO trace back
-    to the covenant's own declarant, JM Texas Land Fund No. 5 LP, per each
-    parcel's full MCAD deed history. 13 of the original 28 exclusions were
-    reversed on that basis, leaving 15 deed-history-CONFIRMED exclusions (10
-    Tract I, 5 Tract II) -- 4076 real parcels remain (Tract I: 2436 -- 2301
-    interior/135 boundary; Tract II: 1640 -- 1544 interior/96 boundary),
-    still closely matching the stakeholder's own recall of an early
-    Fable-driven pass returning "more than 4000 parcels" for this same
-    covenant (BUILD_SPEC.md Sec.4). ~60.0% of the anchored area is now
-    covered by any matched parcel; the rest is honestly unaccounted rather
-    than claimed."""
+    covid_4440 below), refined across TWO passes. An initial pass excluded
+    22 parcels in Tract I and 6 in Tract II by owner/name pattern alone --
+    but the stakeholder caught that this heuristic was wrong for several
+    parcels held through generically-named land-banking SPVs (Andiron
+    Multistate 1 LLC, Millrose Properties Texas LLC, Apogee Peak #1 LLC,
+    Horizon Park LLC, Forestar, and a CBA Strategic Fund I LP-held lot
+    cluster) that DO trace back to the covenant's own declarant, JM Texas
+    Land Fund No. 5 LP, per each parcel's full MCAD deed history -- 13 of
+    the 28 were restored on that basis. But checking each restored
+    parcel's own overlap_fraction (already on file) then caught a second,
+    subtler error: 7 of those 13 -- a "DIRECTOR LOT"/"TRACT DIR LOT"
+    cluster, all 0.1148-ac slivers under abstract survey A0494 -- have only
+    0.4%-8.7% of their own area actually inside the tract polygon, unlike
+    this tract's OWN confirmed MUD-director cluster ("TRACT ME13 DIR LOT
+    1-5") at 97.8%-98.2% overlap -- a different MUD's director lots, only
+    clipped by calibration imprecision, not genuinely part of this tract.
+    Those 7 were re-excluded. Net: only 6 of the original 28 are genuinely
+    restored, 22 remain excluded (17 Tract I, 5 Tract II) -- 4069 real
+    parcels remain (Tract I: 2429 -- 2301 interior/128 boundary; Tract II:
+    1640 -- 1544 interior/96 boundary), still closely matching the
+    stakeholder's own recall of an early Fable-driven pass returning "more
+    than 4000 parcels" for this same covenant (BUILD_SPEC.md Sec.4). ~60.0%
+    of the anchored area is now covered by any matched parcel; the rest is
+    honestly unaccounted rather than claimed."""
     # Counts use each tract's own LATEST run_seq only, not a raw row count: this
     # covenant's own classify_metes_and_bounds_tract was re-run more than once per
     # tract (once to backfill recited_legal_description for the plat-tracking work),
@@ -197,58 +205,66 @@ def test_persisted_montgomery_4440_real_classification() -> None:
         }
         cov = session.execute(text("SELECT review_reason FROM covenant WHERE covid = 4440")).fetchone()
 
-    assert counts[1]["interior"] == 2301 and counts[1]["boundary"] == 135, counts[1]
+    assert counts[1]["interior"] == 2301 and counts[1]["boundary"] == 128, counts[1]
     assert counts[2]["interior"] == 1544 and counts[2]["boundary"] == 96, counts[2]
-    assert abs(float(rows[1].classified_acreage) - 633.625) < 0.5, rows[1]
+    assert abs(float(rows[1].classified_acreage) - 633.599) < 0.5, rows[1]
     assert abs(float(rows[2].classified_acreage) - 482.615) < 0.5, rows[2]
-    assert "4076" in cov.review_reason, cov.review_reason
+    assert "4069" in cov.review_reason, cov.review_reason
     for apn in ("505224", "321958", "321960", "51921", "334709", "502901"):
         assert apn in cov.review_reason, (apn, cov.review_reason)
-    print("PASS: parcel_covenant (covid 4440, both tracts) -> 4076 real parcels matched "
-          "total (2436 + 1640) after correction, 6 distinct invalid-geometry parcels "
+    print("PASS: parcel_covenant (covid 4440, both tracts) -> 4069 real parcels matched "
+          "total (2429 + 1640) after correction, 6 distinct invalid-geometry parcels "
           "correctly excluded and flagged rather than crashing classification")
 
 
 def test_exclude_non_tract_parcels_covid_4440() -> None:
-    """The final, deed-history-CONFIRMED correction to covid 4440's own
-    spatial classification. An owner/name-pattern-only pass first excluded
-    28 parcels across both tracts as apparent adjoiners -- but the
-    stakeholder flagged that Andiron Multistate and Millrose Properties
-    tracts visibly fall inside the original tract boundary on the
-    assessor's own map, and a full MCAD deed-history trace for every
+    """The final correction to covid 4440's own spatial classification,
+    reached in TWO passes. Pass 1: an owner/name-pattern-only exclusion
+    first dropped 28 parcels across both tracts as apparent adjoiners --
+    but the stakeholder flagged that Andiron Multistate and Millrose
+    Properties tracts visibly fall inside the original tract boundary on
+    the assessor's own map, and a full MCAD deed-history trace for every
     excluded parcel confirmed it: 13 of the 28 (Andiron Multistate 1 LLC,
     Forestar, Millrose Properties Texas LLC x2, Apogee Peak #1 LLC, Horizon
     Park LLC, and a CBA Strategic Fund I LP-held DIRECTOR LOT/TRACT DIR LOT
     cluster of 7) trace back through intermediate land-banking entities to
-    JM Texas Land Fund No. 5 LP -- this covenant's own declarant -- and were
-    restored. The remaining 15 (Henderson/Bowdoin, Carroll, two separate
-    Duke tracts, Splendora ISD's two unrelated holdings, and the entire
-    Dusty Trails cluster of 8) each show a fully self-contained ownership
-    chain with zero tie to the declarant, confirming they really are the
-    deed-cited adjoining tracts and unconnected raw holdings described in
-    the deed's own legal description, and remain excluded (real civic/
-    utility infrastructure -- a MUD-district director-lot cluster tied to
-    an already-confirmed MUD number, school sites named "AT CANOPIES",
-    detention/WWTP reserves named "THE PRESSWOODS" -- was never touched by
-    either pass)."""
+    JM Texas Land Fund No. 5 LP and were restored.
+
+    Pass 2 caught an overreach in pass 1: the DIRECTOR LOT/TRACT DIR LOT
+    cluster of 7 was restored purely on the strength of its sellers
+    (Forestar, CBA Strategic Fund I LP) being confirmed JM Texas Land Fund
+    grantees elsewhere -- without checking each parcel's own already-
+    computed overlap_fraction, which tells a different story: each is a
+    0.1148-ac sliver (abstract survey A0494) with only 0.4%-8.7% of its own
+    area actually inside the tract polygon, unlike this tract's OWN
+    confirmed MUD-director cluster ("TRACT ME13 DIR LOT 1-5", kept
+    throughout at 97.8%-98.2% overlap). A different MUD's director lots,
+    only clipped by calibration imprecision -- re-excluded. Net: only 6 of
+    the original 28 are genuinely restored; 22 (Henderson/Bowdoin, Carroll,
+    two separate Duke tracts, Splendora ISD's two unrelated holdings, the
+    entire Dusty Trails cluster of 8, and the non-ME13 DIRECTOR LOT/TRACT
+    DIR LOT cluster of 7) remain excluded."""
     with get_session() as session:
         excluded = {r[0] for r in session.execute(text("""
             SELECT apn FROM parcel_covenant WHERE covid = 4440 AND apn = ANY(:apns)
         """), {"apns": [
             "51956", "51958", "289288", "339424", "87489", "87490", "87492", "87493",
             "87494", "87495", "51959", "51961", "51962", "280047", "52070",
+            "495596", "495597", "502120", "502121", "502122", "502123", "502124",
         ]}).fetchall()}
         # deed-history-confirmed as genuinely part of the original tract (trace back
-        # to JM Texas Land Fund No. 5 LP) -- must be present, not excluded.
+        # to JM Texas Land Fund No. 5 LP) AND with a high overlap_fraction (not a
+        # boundary-clip sliver) -- must be present, not excluded.
         restored = {r[0] for r in session.execute(text("""
             SELECT apn FROM parcel_covenant WHERE covid = 4440 AND apn = ANY(:apns)
         """), {"apns": [
             "495142", "496068", "802624", "802625", "834881", "498132",
-            "495596", "495597", "502120", "502121", "502122", "502123", "502124",
         ]}).fetchall()}
         # confirmed kept throughout: a MUD-district director-lot cluster tied to an
-        # already-confirmed MUD number elsewhere in this same tract (MUD #13), not a
-        # blanket exclusion of every unplatted "director lot"-shaped parcel.
+        # already-confirmed MUD number elsewhere in this same tract (MUD ME13, 97.8%-
+        # 98.2% overlap), not a blanket exclusion of every unplatted "director lot"-
+        # shaped parcel -- and not a blanket restoration of every one either (contrast
+        # the non-ME13 DIRECTOR LOT/TRACT DIR LOT cluster above, correctly excluded).
         kept = {r[0] for r in session.execute(text("""
             SELECT apn FROM parcel_covenant WHERE covid = 4440
               AND apn = ANY(ARRAY['530716','530719','530720','530721','551969'])
@@ -258,15 +274,14 @@ def test_exclude_non_tract_parcels_covid_4440() -> None:
     assert not excluded, f"these should have been excluded but are still matched: {excluded}"
     assert restored == {
         "495142", "496068", "802624", "802625", "834881", "498132",
-        "495596", "495597", "502120", "502121", "502122", "502123", "502124",
     }, restored
     assert kept == {"530716", "530719", "530720", "530721", "551969"}, kept
     assert "NON-TRACT PARCEL EXCLUSION (automated, tract 1)" in cov.review_reason, cov.review_reason
     assert "NON-TRACT PARCEL EXCLUSION (automated, tract 2)" in cov.review_reason, cov.review_reason
-    print("PASS: exclude_non_tract_parcels (covid 4440) -> 15 deed-history-CONFIRMED "
-          "adjoiner/unconnected parcels remain excluded across both tracts; 13 "
-          "wrongly-excluded parcels restored after deed-history verification; a "
-          "confirmed MUD-tied director-lot cluster correctly kept throughout")
+    print("PASS: exclude_non_tract_parcels (covid 4440) -> 22 deed-history/overlap-"
+          "CONFIRMED adjoiner/unconnected/sliver parcels remain excluded across both "
+          "tracts; 6 wrongly-excluded parcels restored after deed-history verification; "
+          "a confirmed MUD-tied director-lot cluster correctly kept throughout")
 
 
 if __name__ == "__main__":
