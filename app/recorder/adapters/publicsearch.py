@@ -23,6 +23,54 @@ from playwright.sync_api import BrowserContext
 SEARCH_SCOPE_FULL_TEXT_ID = "withOcr"
 SEARCH_BOX_ID = "basicSearchInputBox"
 
+# Some counties on this vendor (confirmed: Collin) expose no dedicated
+# SUBDIVISION/LOT/BLOCK columns in the results table at all -- every row jams
+# them into one free-text "LEGAL DESCRIPTION" field instead, e.g.
+# "Subdivision- Name: STAR TRAIL #1A PROSPER Lot: 7 Block: F Reference - 2017/721"
+# or "Survey- Name: COLLIN COUNTY SCHOOL LAND #12 Survey: 147 Acres: 269.506".
+_LEGAL_DESC_NAME_RE = re.compile(
+    r"(?:Subdivision|Survey)\s*-\s*Name:\s*(.+?)"
+    r"(?=\s*(?:,\s*Reference|\s+Lot:|\s+Block:|\s+Reference\s*-|\s+Survey:|\s+Acres:|$))",
+    re.IGNORECASE,
+)
+_LEGAL_DESC_LOT_RE = re.compile(r"\bLot:\s*(\S+)", re.IGNORECASE)
+_LEGAL_DESC_BLOCK_RE = re.compile(r"\bBlock:\s*(\S+)", re.IGNORECASE)
+
+
+def _enrich_row_from_legal_description(row: dict) -> dict:
+    """Derives SUBDIVISION/LOT/BLOCK from a row's own free-text LEGAL
+    DESCRIPTION field when the county's own results table has no dedicated
+    columns for them at all -- confirmed real and load-bearing, not a
+    cosmetic nicety: app/title/chain.py's own _matches_anchor treats a
+    MISSING field on either side of a comparison as "can't compare, don't
+    reject" (by design, so a genuinely blank field never wrongly rejects a
+    real match) -- but for a county with no such columns whatsoever, both
+    sides are always missing, so every comparison silently no-ops and
+    _matches_anchor accepts EVERY row unfiltered. Confirmed on covid 3028
+    (Collin): a chain walk picked up an entirely unrelated "Prosper Town
+    Center" deed from the same grantor (American Bank Texas, a bank with
+    hundreds of unrelated releases/deeds countywide) as if it were a real
+    hop in this covenant's own Star Trail chain, purely because there was no
+    SUBDIVISION field on either side to catch the mismatch. A no-op when the
+    row already has any of these as native keys (e.g. Montgomery, Bexar) --
+    never overrides a column the county's own table actually provides."""
+    if "SUBDIVISION" in row or "LOT" in row or "BLOCK" in row:
+        return row
+    legal = row.get("LEGAL DESCRIPTION")
+    if not legal:
+        return row
+    enriched = dict(row)
+    m = _LEGAL_DESC_NAME_RE.search(legal)
+    if m:
+        enriched["SUBDIVISION"] = m.group(1).strip().rstrip(",")
+    m = _LEGAL_DESC_LOT_RE.search(legal)
+    if m:
+        enriched["LOT"] = m.group(1).strip().rstrip(",")
+    m = _LEGAL_DESC_BLOCK_RE.search(legal)
+    if m:
+        enriched["BLOCK"] = m.group(1).strip().rstrip(",")
+    return enriched
+
 
 def search_by_name(context: BrowserContext, base_url: str, query: str, full_text_ocr: bool = True) -> list[dict]:
     """Quick-search by grantor/grantee/subdivision/doc-type/doc# text. With
@@ -60,17 +108,30 @@ def search_plats_by_subdivision(context: BrowserContext, base_url: str, subdivis
     search per base subdivision name resolves every section's own real
     plat date, not one search per section.
 
-    This vendor's quick-search box always defaults to the "Public Records"
-    department on a fresh page load; the Department control is a react-
-    select combobox (no native <select>, so Playwright's own select_option
-    can't drive it) -- confirmed by inspecting the live DOM: click the
-    current department label to open it, then click the "Plats" option by
-    its text (not by its dynamically-numbered react-select-N-option-M id,
-    which is not stable across reloads)."""
+    This vendor's quick-search box always defaults to the Department
+    combobox's own per-county default label ("Public Records" for
+    Montgomery, "Property Records" for Collin -- confirmed live to differ
+    across counties, not a fixed string); the Department control is a
+    react-select combobox (no native <select>, so Playwright's own
+    select_option can't drive it) -- confirmed by inspecting the live DOM:
+    the clickable control is the DIV whose class ends in "-control" (the
+    standard react-select-generated suffix), which several other, non-
+    clickable DIVs also happen to contain the same label text as (the
+    outer container, the value-display span) -- a plain text locator can
+    match any of those first and silently no-op, which is what broke a
+    Collin search: "text=Public Records" simply doesn't exist on that
+    county's page at all. Click the current department label to open it
+    (found by its "-control" class suffix, not its label text, so this
+    works whatever the current department happens to be), then click the
+    "Plats" option by its own text (not by its dynamically-numbered
+    react-select-N-option-M id, which is not stable across reloads)."""
     page = context.new_page()
     try:
         page.goto(base_url, wait_until="networkidle")
-        page.click("text=Public Records")
+        control = page.query_selector("div[class$='-control']")
+        if control is None:
+            raise RuntimeError("Department combobox control not found (page layout may have changed)")
+        control.click()
         page.wait_for_timeout(300)
         page.click("text=Plats", timeout=5000)
         page.wait_for_timeout(300)
@@ -136,5 +197,5 @@ def _parse_results_table(page) -> list[dict]:
             if headers[i]  # drop the empty-header checkbox/icon columns
         }
         if row:
-            rows.append(row)
+            rows.append(_enrich_row_from_legal_description(row))
     return rows

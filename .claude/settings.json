@@ -1,5 +1,6 @@
 {
   "permissions": {
+    "defaultMode": "bypassPermissions",
     "allow": [
       "Bash(export PATH=/opt/anaconda3/envs/covenant_app/bin:$PATH)",
       "Bash(alembic current)",

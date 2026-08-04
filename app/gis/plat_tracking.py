@@ -23,7 +23,7 @@ from datetime import date, datetime
 from sqlalchemy import text
 
 from app.db.repository import insert_source, upsert_plat
-from app.gis.plat_parser import normalize_section, parse_plat_reference
+from app.gis.plat_parser import extract_phase_key_from_text, normalize_section, parse_plat_reference
 from app.queue.job_queue import run_with_job_queue
 from app.recorder.adapters import publicsearch
 from app.recorder.session import recorder_context
@@ -145,13 +145,40 @@ def resolve_plats_for_tract(session, covid: int, tract_no: int) -> dict:
             )
             plats_not_found += 1
             continue
+
+        # Montgomery's own rows always carry a populated SECTION column; Collin's Plats
+        # department has no such column at all (confirmed real, covid 3028) -- one search
+        # of the shared base name ("STAR TRAIL") returns every phase's own row, but each
+        # row's own phase has to be pulled out of whichever free-text field states it
+        # (see extract_phase_key_from_text's own docstring for why that varies even
+        # within Collin's own index). A genuinely un-derivable row (no SECTION column and
+        # no phase-shaped text in any field) is skipped here, not guessed at -- it never
+        # reaches a real parcel's own assignment lookup below since that's keyed on the
+        # SAME extraction, so nothing is silently mismatched.
+        by_section: dict[str, list[dict]] = {}
         for r in rows:
+            section = (
+                normalize_section(r["SECTION"]) if r.get("SECTION")
+                else extract_phase_key_from_text(r.get("GRANTOR"), r.get("GRANTEE"), r.get("LEGAL DESCRIPTION"))
+            )
+            if section is None:
+                continue
+            by_section.setdefault(section, []).append(r)
+
+        for section, section_rows in by_section.items():
+            # The land's own FIRST real plat date is what this project tracks (a later
+            # amendment/replat of the same already-platted phase doesn't un-platt it) --
+            # confirmed real necessary: Collin's own "Star Trail" phase 8 has two rows,
+            # an original 2021-12-21 plat and a 2022-06-02 one, and upsert_plat's own
+            # ON CONFLICT is last-write-wins, so iterating rows in an arbitrary order
+            # could silently keep the LATER date instead.
+            earliest = min(section_rows, key=lambda r: _parse_slash_date(r.get("RECORDED DATE")) or date.max)
             upsert_plat(
                 session, county_fips=county_fips, subdivision_name=subdivision_name,
-                section=normalize_section(r.get("SECTION")), lookup_status="found",
-                recording_instrument=r.get("FILE NUMBER") or None,
-                recording_date=_parse_slash_date(r.get("RECORDED DATE")),
-                book_volume_page=r.get("VOL/BK/PG") or None, abstract_name=r.get("ABSTRACT NAME") or None,
+                section=section, lookup_status="found",
+                recording_instrument=earliest.get("FILE NUMBER") or earliest.get("DOC NUMBER") or None,
+                recording_date=_parse_slash_date(earliest.get("RECORDED DATE")),
+                book_volume_page=earliest.get("VOL/BK/PG") or None, abstract_name=earliest.get("ABSTRACT NAME") or None,
                 source_id=plat_source_id,
             )
             plats_found += 1

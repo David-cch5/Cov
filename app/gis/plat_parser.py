@@ -37,6 +37,48 @@ _LOT_BLOCK_RE = re.compile(r"^(.*?)\s+(\d+[A-Z]?)\s*,?\s*(?:BLK|BLOCK)\b", re.IG
 # "TIMBERS EDGE 01 RES D 1.453 ACRES" has none, "Harrington Trails 09, RES A" does).
 _RESERVE_RE = re.compile(r"^(.*?)\s+(\d+[A-Z]?)\s*,?\s*RES\b", re.IGNORECASE)
 
+# "<name, no trailing section number>, (BLK|BLOCK) <x>, (LT|LOT) <y>" -- Collin
+# County's own shape (e.g. "STAR TRAIL PHASE ONE B, BLK A, LOT 1"), where the
+# phase/section is already baked into the subdivision's own official plat name
+# rather than recited as a separate trailing digit the way Montgomery's is --
+# _LOT_BLOCK_RE never matches these (it requires a digit group right before
+# BLK/BLOCK) and they'd otherwise fall through to _LOT_ONLY_RE, which greedily
+# swallows the ", BLK A" portion into the subdivision name. Comma before BLK is
+# required here (unlike _LOT_BLOCK_RE) since without a section digit to anchor
+# on, an optional comma would make the name capture ambiguous.
+_BLOCK_LOT_NO_SECTION_RE = re.compile(r"^(.*?),\s*(?:BLK|BLOCK)\s+\S+\s*,\s*(?:LT|LOT)\b", re.IGNORECASE)
+
+# A trailing "PHASE <spelled-out-or-numeric>[<letter>]" on a name captured by
+# _BLOCK_LOT_NO_SECTION_RE (e.g. "STAR TRAIL PHASE ONE B" -> base "STAR TRAIL",
+# phase "ONE B") -- confirmed real and load-bearing (covid 3028, Collin
+# County): the recorder's own Plats-department index files each phase as its
+# own distinct subdivision ("STAR TRAIL #1B PROSPER", "STAR TRAIL PHASE 8",
+# etc, inconsistently even with each other) rather than "one base subdivision,
+# many numbered sections" the way Montgomery's own Harrington Trails/The
+# Canopies do -- but splitting the CAD's own "PHASE <x>" suffix off the base
+# name here lets resolve_plats_for_tract search the shared base name ONCE
+# (its own stated design) instead of once per phase, most of which never
+# match the recorder's differently-formatted phase index at all.
+_PHASE_SUFFIX_RE = re.compile(r"^(.*?)\s+PHASE\s+([A-Z0-9]+(?:\s+[A-Z])?)\s*$", re.IGNORECASE)
+
+_ORDINAL_WORDS = {
+    "ONE": "1", "TWO": "2", "THREE": "3", "FOUR": "4", "FIVE": "5",
+    "SIX": "6", "SEVEN": "7", "EIGHT": "8", "NINE": "9", "TEN": "10",
+}
+
+
+def normalize_phase(phase: str) -> str:
+    """'ONE B' -> '1B', 'TWO' -> '2', '8' -> '8' -- spelled-out ordinal words
+    map to digits (matching however the recorder's own index happens to spell
+    the same phase), a trailing bare letter stays attached with no space, and
+    an already-numeric phase passes through unchanged."""
+    tokens = phase.strip().upper().split()
+    if not tokens:
+        return ""
+    number = _ORDINAL_WORDS.get(tokens[0], tokens[0])
+    suffix = "".join(tokens[1:])
+    return number + suffix
+
 # "<name, no section number>[,] (LT|LOT) <unit>" -- a subdivision with no numbered
 # phase at all (confirmed real: "DUSTY TRAILS LT 9, ACRES 3.000", "Dusty Trails,
 # Lot 2-C, ..."), so there's no section digit to capture -- stored as "" (this
@@ -63,6 +105,33 @@ class PlatReference:
     subdivision_name: str | None = None  # normalized upper-case, e.g. "THE CANOPIES"
     section: str | None = None           # e.g. "03" -- kept as the string as recited (leading
                                           # zeros matter for matching plat.section, never re-cast to int)
+
+
+_HASH_PHASE_RE = re.compile(r"#\s*(\d+[A-Z]?)\b")
+_WORD_PHASE_RE = re.compile(r"\bPHASE\s+([A-Z]+(?:\s+[A-Z])?|\d+[A-Z]?)\b", re.IGNORECASE)
+
+
+def extract_phase_key_from_text(*texts: str | None) -> str | None:
+    """For a recorder-portal plats-department result row that has no
+    dedicated SECTION column at all (confirmed real: Collin County's own
+    Plats department -- unlike Montgomery's, whose rows always carry a
+    populated SECTION), pull a normalized phase identifier out of whichever
+    free-text field actually states it. Checked across every field a caller
+    passes, in order, since which field carries it is inconsistent even
+    within the same county's own index (confirmed real: Collin's "Star
+    Trail" plats variously carry it in GRANTOR as "STAR TRAIL #1B PROSPER",
+    in GRANTEE as "STAR TRAIL PHASE 8", or nowhere but the LEGAL DESCRIPTION).
+    Returns None (never guessed) if no field states one."""
+    for text in texts:
+        if not text:
+            continue
+        m = _HASH_PHASE_RE.search(text)
+        if m:
+            return normalize_phase(m.group(1))
+        m = _WORD_PHASE_RE.search(text)
+        if m:
+            return normalize_phase(m.group(1))
+    return None
 
 
 def normalize_section(section: str | None) -> str:
@@ -96,6 +165,17 @@ def parse_plat_reference(recited_legal_description: str | None) -> PlatReference
     m = _RESERVE_RE.match(stripped)
     if m:
         return PlatReference(platted=True, subdivision_name=m.group(1).strip().upper(), section=m.group(2))
+
+    m = _BLOCK_LOT_NO_SECTION_RE.match(stripped)
+    if m and m.group(1).strip():
+        name = m.group(1).strip().upper()
+        phase_m = _PHASE_SUFFIX_RE.match(name)
+        if phase_m:
+            return PlatReference(
+                platted=True, subdivision_name=phase_m.group(1).strip(),
+                section=normalize_phase(phase_m.group(2)),
+            )
+        return PlatReference(platted=True, subdivision_name=name, section="")
 
     m = _LOT_ONLY_RE.match(stripped)
     if m and m.group(1).strip():

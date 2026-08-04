@@ -66,6 +66,43 @@ def test_lot_only_no_section() -> None:
     print("PASS: parse_plat_reference -> lot-only subdivision with no numbered phase")
 
 
+def test_block_lot_phase_suffix_split() -> None:
+    """Collin County's own shape (covid 3028, Star Trail): the phase/section
+    is baked into the subdivision's own official plat name ("STAR TRAIL PHASE
+    ONE B") rather than recited as a separate trailing digit the way
+    Montgomery's is -- _LOT_BLOCK_RE never matches (no digit before BLK), and
+    without a dedicated pattern it fell through to _LOT_ONLY_RE, which
+    greedily swallowed the ", BLK A" portion into the subdivision name. The
+    trailing "PHASE <x>" is split off as its own section (spelled-out
+    ordinals normalized to digits, e.g. "ONE B" -> "1B") so resolve_plats_
+    for_tract can search the shared base name ("STAR TRAIL") once instead of
+    once per differently-formatted phase."""
+    ref = parse_plat_reference("STAR TRAIL PHASE ONE B, BLK A, LOT 1")
+    assert ref is not None and ref.platted, ref
+    assert ref.subdivision_name == "STAR TRAIL", ref
+    assert ref.section == "1B", ref
+
+    ref2 = parse_plat_reference("STAR TRAIL PHASE TWO, BLK S, LOT 5")
+    assert ref2 is not None and ref2.platted, ref2
+    assert ref2.subdivision_name == "STAR TRAIL", ref2
+    assert ref2.section == "2", ref2
+    print("PASS: parse_plat_reference -> lot/block with a 'PHASE <x>' suffix split "
+          "into base name + normalized section")
+
+
+def test_block_lot_no_phase_suffix() -> None:
+    """The same no-trailing-section shape, but genuinely with no "PHASE <x>"
+    suffix at all -- the whole captured name is kept as subdivision_name with
+    section="" (this project's own convention for "one implicit, unnumbered
+    phase"), same as _LOT_ONLY_RE's own convention."""
+    ref = parse_plat_reference("SOME SUBDIVISION, BLK A, LOT 1")
+    assert ref is not None and ref.platted, ref
+    assert ref.subdivision_name == "SOME SUBDIVISION", ref
+    assert ref.section == "", ref
+    print("PASS: parse_plat_reference -> lot/block with no trailing section number "
+          "and no PHASE suffix at all")
+
+
 def test_abstract_tract_with_dash() -> None:
     ref = parse_plat_reference("A0494 - Walker Co Sch L, TRACT 1C-1, ACRES 27.2696")
     assert ref is not None and not ref.platted, ref
@@ -119,6 +156,8 @@ if __name__ == "__main__":
     test_reserve_with_comma()
     test_reserve_no_comma()
     test_lot_only_no_section()
+    test_block_lot_phase_suffix_split()
+    test_block_lot_no_phase_suffix()
     test_abstract_tract_with_dash()
     test_abstract_tract_no_dash()
     test_abstract_tract_odd_terminology_not_misread_as_plat()

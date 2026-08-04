@@ -19,6 +19,7 @@ sys.path.insert(0, ".")
 from app.recorder.diagnose import check_corpus_completeness
 from app.recorder.session import recorder_context
 from app.recorder.adapters import publicsearch
+from app.recorder.adapters.publicsearch import _enrich_row_from_legal_description
 
 
 def test_acclaim_ellis() -> None:
@@ -71,9 +72,53 @@ def test_publicsearch_montgomery() -> None:
     print(f"PASS: publicsearch (Montgomery) -> found doc 2009089679, {row.get('DOC TYPE')}")
 
 
+def test_enrich_row_from_legal_description() -> None:
+    """Confirmed real and load-bearing (covid 3028, Collin): this vendor's
+    results table has no dedicated SUBDIVISION/LOT/BLOCK columns for some
+    counties at all -- everything is jammed into one free-text LEGAL
+    DESCRIPTION field. Without deriving them, app/title/chain.py's own
+    _matches_anchor treats a missing field on both sides as "can't compare,
+    don't reject" -- so EVERY row silently passed unfiltered, and a chain
+    walk accepted an entirely unrelated "Prosper Town Center" deed from the
+    same grantor (American Bank Texas, a bank with hundreds of unrelated
+    releases countywide) as if it were a real hop in this covenant's own
+    Star Trail chain."""
+    unrelated = _enrich_row_from_legal_description({
+        "GRANTOR": "AMERICAN BANK TEXAS", "GRANTEE": "TEXAS STATE OF",
+        "LEGAL DESCRIPTION": "Subdivision- Name: PROSPER TOWN CENTER I L2&3/A Q/504 Lot: 2, Reference - Q / 504",
+    })
+    assert unrelated["SUBDIVISION"] == "PROSPER TOWN CENTER I L2&3/A Q/504", unrelated
+    assert unrelated["LOT"] == "2", unrelated
+
+    declaration = _enrich_row_from_legal_description({
+        "GRANTOR": "PROSPER LEGACY LAKES LTD", "GRANTEE": "N/A",
+        "LEGAL DESCRIPTION": "Subdivision- Name: COLLIN COUNTY SCHOOL LAND #12, Reference - S / 147",
+    })
+    assert declaration["SUBDIVISION"] == "COLLIN COUNTY SCHOOL LAND #12", declaration
+
+    plat = _enrich_row_from_legal_description({
+        "GRANTOR": "BLUE STAR ALLEN LAND L/P", "GRANTEE": "STAR TRAIL #1A PROSPER",
+        "LEGAL DESCRIPTION": "Subdivision - Name: STAR TRAIL #1A PROSPER Lot: 7 Block: F Reference - 2017/721",
+    })
+    assert plat["SUBDIVISION"] == "STAR TRAIL #1A PROSPER", plat
+    assert plat["LOT"] == "7", plat
+    assert plat["BLOCK"] == "F", plat
+
+    no_structure = _enrich_row_from_legal_description({"LEGAL DESCRIPTION": "SEE INSTRUMENT"})
+    assert "SUBDIVISION" not in no_structure, no_structure
+
+    native_columns = _enrich_row_from_legal_description({"LOT": "5", "SECTION": "01"})
+    assert "SUBDIVISION" not in native_columns, native_columns  # never overrides a county that HAS real columns
+
+    print("PASS: _enrich_row_from_legal_description -> SUBDIVISION/LOT/BLOCK derived from free "
+          "text only when a county's own table has no such columns at all, confirming the "
+          "unrelated-grantor mismatch would now be caught, not silently passed through")
+
+
 if __name__ == "__main__":
     test_acclaim_ellis()
     test_ava_fidlar_kerr()
     test_publicsearch_nueces()
     test_publicsearch_montgomery()
+    test_enrich_row_from_legal_description()
     print("\nall recorder adapter smoke tests passed")
