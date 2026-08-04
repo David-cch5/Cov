@@ -39,11 +39,31 @@ lineage intact, and monitor remaining raw acreage for new plats.
    reading directly from the image. (Opus 4.8 is a ~half-price alternative if cost matters.)
 4. Still illegible → human-review queue.
 
+## Metes-and-bounds anchor resolution (tiered)
+`app/gis/anchor_resolver.py`'s `resolve_metes_and_bounds_anchor` is the single entrypoint —
+never anchor a tract by hand-writing a one-off script per covenant again.
+1. Deterministic techniques first, free: a stated State Plane coordinate in the deed itself,
+   a shared corner with an already-anchored sibling tract, a tie to a named adjoining platted
+   parcel (`app/gis/state_plane_anchor.py`) — each with its own sanity check (recomputed
+   closure/area; a parcel tie's implied `length_ratio` must be within ~5% of 1.0) before ever
+   being trusted.
+2. None pass → escalate to an agentic LLM search (`app/llm/anchor_agent.py`, real tools: live
+   GIS parcel queries, NGS survey-monument lookups, traverse walking, similarity solving) at
+   **Opus 5**, budget-capped (~80 tool-call turns / 90 min per attempt).
+3. Opus's own result doesn't independently verify (recomputed closure/acreage, a real
+   live-parcel spatial dry-run — never the model's own self-reported confidence alone) →
+   retry once at **Fable 5**.
+4. Still nothing confident → `app/gis/geocode_anchor.py`'s existing rough approximate-placement
+   fallback (shape validated, position unconfirmed, `needs_review`) — never a forced guess.
+A confident, independently-verified result at any tier commits automatically and the pipeline
+proceeds — this is the one place in the pipeline an LLM's output is trusted without a human
+checkpoint, and only because every claim is re-derived and checked in plain code first.
+
 ## Model use (routing)
 - **Default: Sonnet at high ("max smart") effort** for coding, bulk work, and field
   extraction — the efficient default that preserves Team seat allowance. Use **Haiku** for
   trivial subagent tasks (structuring clean OCR text).
-- **Hard reasoning / stubborn edge cases → Opus 4.8**; the very hardest → **Fable 5**.
+- **Hard reasoning / stubborn edge cases (incl. smart/edge-case classification) → Opus 5**; the very hardest → **Fable 5**.
 - **Bad-scan vision OCR → Fable 5** (smartest), with **Opus 4.8** as a cheaper fallback.
 - Keep per-covenant LLM usage minimal — most of the pipeline is deterministic code.
 

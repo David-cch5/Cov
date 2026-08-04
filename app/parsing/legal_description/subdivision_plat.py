@@ -8,6 +8,7 @@ document -- since phrasing varies too much across the corpus for a single regex
 import anthropic
 
 from app.config import ANTHROPIC_API_KEY, LLM_MODEL_DEFAULT
+from app.llm.usage import log_usage
 
 SUBDIVISION_TOOL = {
     "name": "record_subdivision_reference",
@@ -41,6 +42,12 @@ def parse_subdivision_reference(legal_description_raw: str) -> dict:
         tool_choice={"type": "tool", "name": "record_subdivision_reference"},
         messages=[{"role": "user", "content": legal_description_raw}],
     )
+    # Deliberately NOT attached to the returned dict, unlike this project's
+    # other LLM call sites -- classifier.py json.dumps()'s this function's
+    # return value verbatim into covenant.legal_description_parsed (a JSONB
+    # column); a "usage" key would leak logging metadata into stored title
+    # data. Logged here (print only) instead.
+    log_usage("subdivision_plat", response)
     for block in response.content:
         if block.type == "tool_use" and block.name == "record_subdivision_reference":
             return block.input

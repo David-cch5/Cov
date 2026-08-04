@@ -105,7 +105,10 @@ def escalate_to_vision_ocr(
             cached = json.load(f)
         return {"covid": covid, "resolved": True, "resolved_via": "vision_ocr_cached",
                 "text": cached["text"], "pages_escalated": 0, "capped": False,
-                "min_confidence": cached.get("min_confidence")}
+                "min_confidence": cached.get("min_confidence"),
+                # 0 tokens, not the original run's usage -- this call made no API request at all.
+                "usage": {"input_tokens": 0, "output_tokens": 0,
+                          "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}}
 
     if remaining_page_budget <= 0:
         return {"covid": covid, "resolved": False, "resolved_via": None,
@@ -119,6 +122,10 @@ def escalate_to_vision_ocr(
     pages_to_try = images[-n_pages:]  # last N pages -- see docstring's heuristic note
 
     texts, confidences, notes = [], [], []
+    usage_totals = {
+        "input_tokens": 0, "output_tokens": 0,
+        "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+    }
     with tempfile.TemporaryDirectory() as tmp_dir:
         for i, img in enumerate(pages_to_try):
             longest_side = max(img.size)
@@ -134,17 +141,21 @@ def escalate_to_vision_ocr(
             confidences.append(result.get("confidence", 0))
             if result.get("notes"):
                 notes.append(result["notes"])
+            for key in usage_totals:
+                usage_totals[key] += (result.get("usage") or {}).get(key, 0)
 
     combined_text = "\n\n".join(texts)
     min_confidence = min(confidences) if confidences else None
+    print(f"  [ocr_escalation] covid={covid} pages={n_pages} total_usage={usage_totals}")
 
     with open(cached_path, "w", encoding="utf-8") as f:
         json.dump({"covid": covid, "text": combined_text, "min_confidence": min_confidence,
-                   "notes": notes, "pages_escalated": n_pages, "model": model}, f)
+                   "notes": notes, "pages_escalated": n_pages, "model": model,
+                   "usage": usage_totals}, f)
 
     return {"covid": covid, "resolved": True, "resolved_via": "vision_ocr", "text": combined_text,
             "pages_escalated": n_pages, "capped": n_pages < total_pages, "min_confidence": min_confidence,
-            "notes": notes}
+            "notes": notes, "usage": usage_totals}
 
 
 def resolve_low_confidence_covenant(

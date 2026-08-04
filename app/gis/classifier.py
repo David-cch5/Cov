@@ -17,6 +17,7 @@ from app.gis.adapters import (
     bexar_tx, collin_tx, dallas_tx, denton_tx, douglas_co, harris_tx, hunt_tx, kerr_tx, llano_tx,
     montgomery_tx, nueces_tx, tarrant_tx, travis_tx,
 )
+from app.parsing.legal_description.subdivision_plat import parse_subdivision_reference
 from app.queue.job_queue import run_with_job_queue
 
 COUNTY_ADAPTERS = {
@@ -50,14 +51,30 @@ _TEXT_MATCH_ONLY_COUNTIES = {"48439", "48113", "48299", "48029", "48355", "48453
 
 def resolve_subdivision_plat_tract(session, covid: int, tract_no: int = 1) -> dict:
     row = session.execute(
-        text("SELECT county_fips, legal_description_parsed FROM covenant WHERE covid = :covid"),
+        text("SELECT county_fips, legal_description_raw, legal_description_parsed FROM covenant WHERE covid = :covid"),
         {"covid": covid},
     ).fetchone()
-    if row is None or row.legal_description_parsed is None:
-        raise RuntimeError(f"covid {covid} has no legal_description_parsed to resolve from")
+    if row is None:
+        raise RuntimeError(f"covid {covid} not found")
 
     county_fips = row.county_fips
     parsed = row.legal_description_parsed
+    if parsed is None:
+        # Confirmed real, previously-undetected gap: parse_subdivision_reference()
+        # existed and was correct in isolation but had no caller anywhere in the
+        # pipeline, so legal_description_parsed was never populated by anything --
+        # this raised "has no legal_description_parsed to resolve from" on
+        # essentially every subdivision_plat covenant rather than actually
+        # resolving one. Parse and persist it here, on first need, instead of
+        # requiring a separate ingestion-time step.
+        if not row.legal_description_raw:
+            raise RuntimeError(f"covid {covid} has no legal_description_raw to parse a subdivision reference from")
+        parsed = parse_subdivision_reference(row.legal_description_raw)
+        session.execute(
+            text("UPDATE covenant SET legal_description_parsed = (:parsed)::jsonb, updated_at = now() "
+                 "WHERE covid = :covid"),
+            {"covid": covid, "parsed": json.dumps(parsed)},
+        )
     adapter = COUNTY_ADAPTERS.get(county_fips)
     if adapter is None:
         raise RuntimeError(f"no GIS adapter registered for county_fips={county_fips}")

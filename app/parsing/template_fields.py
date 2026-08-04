@@ -12,6 +12,7 @@ import json
 import anthropic
 
 from app.config import ANTHROPIC_API_KEY, LLM_MODEL_DEFAULT
+from app.llm.usage import log_usage
 
 EXTRACTION_TOOL = {
     "name": "record_covenant_fields",
@@ -107,8 +108,9 @@ def extract_fields(covenant_text: str, template_version_id: str | None) -> dict:
         ],
     )
 
+    usage = log_usage(f"template_fields template={template_version_id}", response)
     for block in response.content:
         if block.type == "tool_use" and block.name == "record_covenant_fields":
-            return block.input
+            return {**block.input, "usage": usage}
 
     raise RuntimeError("model did not return the expected tool call")

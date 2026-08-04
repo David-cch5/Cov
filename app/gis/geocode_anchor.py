@@ -136,4 +136,5 @@ def resolve_metes_bounds_approximate(
         "area_acres": traverse["area_acres"],
         "extraction_confidence": extraction.get("confidence"),
         "extraction_notes": extraction.get("notes"),
+        "usage": extraction.get("usage"),
     }

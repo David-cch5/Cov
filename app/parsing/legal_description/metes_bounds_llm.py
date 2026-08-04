@@ -10,10 +10,13 @@ The traverse-walk math itself (walk_traverse in metes_bounds.py) stays pure
 deterministic code either way -- this module only replaces the text-to-structured-
 data step, per the tiered escalation CLAUDE.md already calls for on noisy scans.
 """
+import re
+
 import anthropic
 
-from app.config import ANTHROPIC_API_KEY, LLM_MODEL_DEFAULT
-from app.parsing.legal_description.metes_bounds import Course
+from app.config import ANTHROPIC_API_KEY, LLM_MODEL_DEFAULT, LLM_MODEL_HARD
+from app.llm.usage import log_usage
+from app.parsing.legal_description.metes_bounds import Course, extract_courses, walk_traverse
 
 COURSE_EXTRACTION_TOOL = {
     "name": "record_courses",
@@ -62,19 +65,20 @@ never guess a numeric digit with false confidence -- if a bearing or distance di
 ambiguous, give your best reading and set uncertain=true rather than silently picking one."""
 
 
-def extract_courses_llm(text_segment: str) -> dict:
+def extract_courses_llm(text_segment: str, model: str = LLM_MODEL_DEFAULT) -> dict:
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     response = client.messages.create(
-        model=LLM_MODEL_DEFAULT,
+        model=model,
         max_tokens=8192,
         system=SYSTEM_PROMPT,
         tools=[COURSE_EXTRACTION_TOOL],
         tool_choice={"type": "tool", "name": "record_courses"},
         messages=[{"role": "user", "content": text_segment}],
     )
+    usage = log_usage(f"metes_bounds_llm model={model}", response)
     for block in response.content:
         if block.type == "tool_use" and block.name == "record_courses":
-            return block.input
+            return {**block.input, "usage": usage}
     raise RuntimeError("model did not return the expected tool call")
 
 
@@ -86,3 +90,70 @@ def to_course_objects(result: dict) -> list[Course]:
         )
         for c in result["courses"]
     ]
+
+
+# Below this, a course count roughly this much lower than the raw text's own
+# "THENCE" count is treated as a likely regex-parser gap (missing a class of
+# phrasing the deterministic parser doesn't yet handle) rather than the deed
+# genuinely having fewer courses -- confirmed real this project's own way,
+# repeatedly: 3 separate real regex bugs (a curly-quote minutes marker, a
+# "(Deed = X feet)" aside, a compound multi-bearing clause) were each found
+# by noticing the extracted course count looked implausibly low relative to
+# the number of THENCE occurrences in the source text.
+_COURSE_COUNT_SHORTFALL_RATIO = 0.7
+# A closure this loose (perimeter-to-error ratio) also signals a likely
+# extraction gap rather than genuine survey imprecision -- real deeds in
+# this project's own corpus have closed tighter than 1:500 even before any
+# LLM-assisted fix.
+_MIN_ACCEPTABLE_CLOSURE_RATIO = 1 / 500
+
+
+def _looks_incomplete(text_segment: str, courses: list[Course]) -> bool:
+    thence_count = len(re.findall(r"\bTHENCE\b", text_segment, re.IGNORECASE))
+    if thence_count == 0:
+        return False  # nothing to compare against -- don't second-guess a clean zero-course case
+    if len(courses) < thence_count * _COURSE_COUNT_SHORTFALL_RATIO:
+        return True
+    if not courses:
+        return True
+    closure_ratio = walk_traverse(courses)["closure_ratio"]
+    return closure_ratio is None or closure_ratio > _MIN_ACCEPTABLE_CLOSURE_RATIO
+
+
+def extract_courses_with_escalation(text_segment: str) -> tuple[list[Course], dict]:
+    """Runs the deterministic regex parser (metes_bounds.extract_courses)
+    first -- free, and correct for the large majority of this project's own
+    corpus once the 3 real bugs found this session were fixed. Only escalates
+    to an LLM reading of the same text when the result looks genuinely
+    incomplete (see _looks_incomplete): first at this project's default
+    extraction tier (Sonnet, matching every other field-extraction call in
+    this codebase), then at the Opus tier if that still doesn't produce a
+    plausible course list. Returns (courses, diagnostics) -- diagnostics
+    records which tier actually produced the returned courses, for the
+    caller's own provenance/review-reason notes."""
+    regex_courses = extract_courses(text_segment)
+    zero_usage = {"input_tokens": 0, "output_tokens": 0,
+                  "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
+    if not _looks_incomplete(text_segment, regex_courses):
+        return regex_courses, {"tier": "regex", "courses_found": len(regex_courses), "usage": zero_usage}
+
+    sonnet_result = extract_courses_llm(text_segment, model=LLM_MODEL_DEFAULT)
+    sonnet_courses = to_course_objects(sonnet_result)
+    if not _looks_incomplete(text_segment, sonnet_courses):
+        return sonnet_courses, {
+            "tier": "llm_sonnet", "courses_found": len(sonnet_courses),
+            "extraction_confidence": sonnet_result.get("confidence"), "extraction_notes": sonnet_result.get("notes"),
+            "usage": sonnet_result["usage"],
+        }
+
+    opus_result = extract_courses_llm(text_segment, model=LLM_MODEL_HARD)
+    opus_courses = to_course_objects(opus_result)
+    tier = "llm_opus" if not _looks_incomplete(text_segment, opus_courses) else "llm_opus_still_incomplete"
+    combined_usage = {
+        key: sonnet_result["usage"][key] + opus_result["usage"][key] for key in zero_usage
+    }
+    return opus_courses, {
+        "tier": tier, "courses_found": len(opus_courses),
+        "extraction_confidence": opus_result.get("confidence"), "extraction_notes": opus_result.get("notes"),
+        "usage": combined_usage,
+    }

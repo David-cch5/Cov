@@ -13,6 +13,7 @@ import base64
 import anthropic
 
 from app.config import ANTHROPIC_API_KEY, LLM_MODEL_HARD, LLM_MODEL_HARDEST
+from app.llm.usage import log_usage
 
 TRANSCRIBE_TOOL = {
     "name": "record_transcription",
@@ -60,7 +61,8 @@ def ocr_page_image(image_path: str, model: str = LLM_MODEL_HARDEST) -> dict:
             ],
         }],
     )
+    usage = log_usage(f"vision_ocr page={image_path}", response)
     for block in response.content:
         if block.type == "tool_use" and block.name == "record_transcription":
-            return block.input
+            return {**block.input, "usage": usage}
     raise RuntimeError("model did not return the expected tool call")
