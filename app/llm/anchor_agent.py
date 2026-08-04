@@ -291,7 +291,16 @@ def _build_system_prompt(covid: int) -> str:
         "not a failure on your part, and a human reviewer would much rather see an honest "
         "'could not confidently anchor' than a forced guess.\n\n"
         "Start with get_covenant_context to read the covenant's own recorded fields and its "
-        "full deed text. Use query_gis_parcels to find real, currently-existing parcels (by "
+        "full deed text. Its Exhibit A may describe more than one distinct tract/parcel in the "
+        "same document -- sometimes explicitly as 'TRACT I'/'TRACT II', but sometimes only by "
+        "an individually named parcel (e.g. 'Parcel 1201', 'Parcel 1209', 'Phase IV') with no "
+        "Roman-numeral tract label at all. In that case, tract_no refers to that tract/parcel's "
+        "position in the ORDER the document introduces them (tract_no=1 is whichever is "
+        "described first, tract_no=2 the second, etc.) -- identify all of them before deciding "
+        "which one you're resolving, and state plainly in your reasoning which specific named "
+        "parcel/tract you determined tract_no to be, so that choice itself can be checked "
+        "against the deed rather than assumed correct. Use query_gis_parcels to find real, "
+        "currently-existing parcels (by "
         "name, survey abstract citation, or a bounding-box spatial query). Use "
         "query_ngs_datasheet if the deed or an adjoining survey ties to a named monument. Use "
         "walk_courses to check any traverse's closure before trusting it -- a real, correct "
@@ -331,7 +340,14 @@ def escalate_anchor_to_llm(covid: int, tract_no: int, model: str) -> dict:
     """
     result_holder: list[dict] = []
 
-    @beta_tool
+    # cache_control on the LAST tool in the tools list (below) caches this
+    # entire tool array as a single static prefix -- confirmed necessary, not
+    # a micro-optimization: a real run burns 17-39 tool_runner turns, and
+    # every turn resends the full system prompt + all 6 tool schemas
+    # unchanged (they never vary by covid/tract_no). Without this, that
+    # static prefix was being paid for in full on every single turn -- every
+    # anchor_agent log this session showed cache_write=0/cache_read=0.
+    @beta_tool(cache_control={"type": "ephemeral"})
     def report_anchor_conclusion(
         anchored: bool, confidence: float, reasoning: str,
         anchor_geojson: str | None = None, method: str | None = None,
@@ -388,7 +404,12 @@ def escalate_anchor_to_llm(covid: int, tract_no: int, model: str) -> dict:
             model=model,
             max_tokens=16000,
             output_config={"effort": "high"},
-            system=_build_system_prompt(covid),
+            # Second cache_control breakpoint: tools (marked above) + this
+            # system block together form the whole static per-turn prefix.
+            system=[{
+                "type": "text", "text": _build_system_prompt(covid),
+                "cache_control": {"type": "ephemeral"},
+            }],
             tools=tools,
             messages=[{"role": "user", "content": (
                 f"Resolve the metes-and-bounds anchor for covid {covid}, tract {tract_no}. "

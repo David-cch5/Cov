@@ -13,6 +13,7 @@ import anthropic
 
 from app.config import ANTHROPIC_API_KEY, LLM_MODEL_DEFAULT
 from app.llm.usage import log_usage
+from app.queue.job_queue import run_with_job_queue
 
 EXTRACTION_TOOL = {
     "name": "record_covenant_fields",
@@ -79,8 +80,6 @@ extraction_notes rather than silently picking one reading."""
 
 
 def extract_fields(covenant_text: str, template_version_id: str | None) -> dict:
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
     template_hint = (
         f"This document has already been matched to template {template_version_id}; "
         "its boilerplate structure is known, focus on the doc-specific values."
@@ -88,29 +87,33 @@ def extract_fields(covenant_text: str, template_version_id: str | None) -> dict:
         "This document's template is not yet identified -- extract from the raw text directly."
     )
 
-    response = client.messages.create(
-        model=LLM_MODEL_DEFAULT,
-        max_tokens=4096,
-        system=[
-            {
-                "type": "text",
-                "text": SYSTEM_PROMPT,
-                "cache_control": {"type": "ephemeral"},
-            }
-        ],
-        tools=[{**EXTRACTION_TOOL, "cache_control": {"type": "ephemeral"}}],
-        tool_choice={"type": "tool", "name": "record_covenant_fields"},
-        messages=[
-            {
-                "role": "user",
-                "content": f"{template_hint}\n\n--- COVENANT TEXT ---\n{covenant_text}",
-            }
-        ],
-    )
+    def _call() -> dict:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        response = client.messages.create(
+            model=LLM_MODEL_DEFAULT,
+            max_tokens=4096,
+            system=[
+                {
+                    "type": "text",
+                    "text": SYSTEM_PROMPT,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            tools=[{**EXTRACTION_TOOL, "cache_control": {"type": "ephemeral"}}],
+            tool_choice={"type": "tool", "name": "record_covenant_fields"},
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"{template_hint}\n\n--- COVENANT TEXT ---\n{covenant_text}",
+                }
+            ],
+        )
 
-    usage = log_usage(f"template_fields template={template_version_id}", response)
-    for block in response.content:
-        if block.type == "tool_use" and block.name == "record_covenant_fields":
-            return {**block.input, "usage": usage}
+        usage = log_usage(f"template_fields template={template_version_id}", response)
+        for block in response.content:
+            if block.type == "tool_use" and block.name == "record_covenant_fields":
+                return {**block.input, "usage": usage}
 
-    raise RuntimeError("model did not return the expected tool call")
+        raise RuntimeError("model did not return the expected tool call")
+
+    return run_with_job_queue(_call, job_type="llm_extract_fields", payload={"template_version_id": template_version_id})

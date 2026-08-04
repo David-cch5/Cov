@@ -11,6 +11,7 @@ import sys
 sys.path.insert(0, ".")
 
 from app.parsing.legal_description.metes_bounds import extract_courses, walk_traverse
+from app.parsing.legal_description.metes_bounds_llm import to_course_objects
 
 
 def test_spelled_out_bearing_units() -> None:
@@ -157,6 +158,23 @@ def test_covid_5838_primary_tract_closes() -> None:
           f"closure_error={result['closure_error_ft']:.2f} ft (~= the one unwalked curve arc)")
 
 
+def test_to_course_objects_rejects_malformed_schema() -> None:
+    """Confirmed real (covid 4981, Collin): without tool-input strict mode,
+    Claude can occasionally return a `courses` entry that doesn't match
+    COURSE_EXTRACTION_TOOL's own declared schema (e.g. plain strings instead
+    of course objects) on a genuinely messy, multi-tract Exhibit A -- even
+    though the identical call succeeds on a retry. to_course_objects must
+    raise a clear ValueError, not a bare TypeError/KeyError, so
+    extract_courses_with_escalation can catch it and escalate to the next
+    tier instead of the whole anchor-resolution attempt crashing."""
+    try:
+        to_course_objects({"courses": ["not a real course object", "another string"]})
+        assert False, "expected a ValueError"
+    except ValueError as exc:
+        assert "schema" in str(exc), exc
+    print("PASS: to_course_objects -> malformed course entries raise a clear ValueError, not a bare crash")
+
+
 if __name__ == "__main__":
     test_spelled_out_bearing_units()
     test_curly_quote_minutes_marker()
@@ -164,4 +182,5 @@ if __name__ == "__main__":
     test_compound_bearing_list_without_thence_or_to()
     test_compound_bearing_excludes_monument_ties()
     test_covid_5838_primary_tract_closes()
+    test_to_course_objects_rejects_malformed_schema()
     print("\nall metes-and-bounds parser tests passed")

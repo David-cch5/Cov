@@ -14,6 +14,7 @@ import anthropic
 
 from app.config import ANTHROPIC_API_KEY, LLM_MODEL_HARD, LLM_MODEL_HARDEST
 from app.llm.usage import log_usage
+from app.queue.job_queue import run_with_job_queue
 
 TRANSCRIBE_TOOL = {
     "name": "record_transcription",
@@ -46,23 +47,26 @@ def ocr_page_image(image_path: str, model: str = LLM_MODEL_HARDEST) -> dict:
         image_b64 = base64.standard_b64encode(f.read()).decode("utf-8")
     media_type = "image/png" if image_path.lower().endswith(".png") else "image/jpeg"
 
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    response = client.messages.create(
-        model=model,
-        max_tokens=8192,
-        system=SYSTEM_PROMPT,
-        tools=[TRANSCRIBE_TOOL],
-        tool_choice={"type": "tool", "name": "record_transcription"},
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": image_b64}},
-                {"type": "text", "text": "Transcribe this page verbatim."},
-            ],
-        }],
-    )
-    usage = log_usage(f"vision_ocr page={image_path}", response)
-    for block in response.content:
-        if block.type == "tool_use" and block.name == "record_transcription":
-            return {**block.input, "usage": usage}
-    raise RuntimeError("model did not return the expected tool call")
+    def _call() -> dict:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        response = client.messages.create(
+            model=model,
+            max_tokens=8192,
+            system=SYSTEM_PROMPT,
+            tools=[TRANSCRIBE_TOOL],
+            tool_choice={"type": "tool", "name": "record_transcription"},
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": image_b64}},
+                    {"type": "text", "text": "Transcribe this page verbatim."},
+                ],
+            }],
+        )
+        usage = log_usage(f"vision_ocr page={image_path}", response)
+        for block in response.content:
+            if block.type == "tool_use" and block.name == "record_transcription":
+                return {**block.input, "usage": usage}
+        raise RuntimeError("model did not return the expected tool call")
+
+    return run_with_job_queue(_call, job_type="llm_vision_ocr", payload={"model": model, "image_path": image_path})

@@ -17,6 +17,7 @@ import anthropic
 from app.config import ANTHROPIC_API_KEY, LLM_MODEL_DEFAULT, LLM_MODEL_HARD
 from app.llm.usage import log_usage
 from app.parsing.legal_description.metes_bounds import Course, extract_courses, walk_traverse
+from app.queue.job_queue import run_with_job_queue
 
 COURSE_EXTRACTION_TOOL = {
     "name": "record_courses",
@@ -66,30 +67,50 @@ ambiguous, give your best reading and set uncertain=true rather than silently pi
 
 
 def extract_courses_llm(text_segment: str, model: str = LLM_MODEL_DEFAULT) -> dict:
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    response = client.messages.create(
-        model=model,
-        max_tokens=8192,
-        system=SYSTEM_PROMPT,
-        tools=[COURSE_EXTRACTION_TOOL],
-        tool_choice={"type": "tool", "name": "record_courses"},
-        messages=[{"role": "user", "content": text_segment}],
-    )
-    usage = log_usage(f"metes_bounds_llm model={model}", response)
-    for block in response.content:
-        if block.type == "tool_use" and block.name == "record_courses":
-            return {**block.input, "usage": usage}
-    raise RuntimeError("model did not return the expected tool call")
+    # Confirmed real, not hypothetical: a transient DNS/connection blip killed an
+    # entire resolve_metes_and_bounds_anchor attempt outright on covid 4981 -- this
+    # was the one Claude API call site in the metes-and-bounds path with no retry
+    # at all (every other live network call in this project gets one via
+    # run_with_job_queue; this one was missed when it was first written).
+    def _call() -> dict:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        response = client.messages.create(
+            model=model,
+            max_tokens=8192,
+            system=SYSTEM_PROMPT,
+            tools=[COURSE_EXTRACTION_TOOL],
+            tool_choice={"type": "tool", "name": "record_courses"},
+            messages=[{"role": "user", "content": text_segment}],
+        )
+        usage = log_usage("metes_bounds_llm", response)
+        for block in response.content:
+            if block.type == "tool_use" and block.name == "record_courses":
+                return {**block.input, "usage": usage}
+        raise RuntimeError("model did not return the expected tool call")
+
+    return run_with_job_queue(_call, job_type="llm_extract_courses", payload={"model": model})
 
 
 def to_course_objects(result: dict) -> list[Course]:
-    return [
-        Course(
-            ns=c["ns"], degrees=c["degrees"], minutes=c["minutes"], seconds=c["seconds"],
-            ew=c["ew"], distance_ft=c["distance_feet"],
-        )
-        for c in result["courses"]
-    ]
+    """Raises ValueError (never a bare TypeError/KeyError) if the model's own
+    tool-call input doesn't actually match COURSE_EXTRACTION_TOOL's schema --
+    confirmed real, not hypothetical: without tool-input strict-mode, Claude
+    can occasionally return a malformed `courses` entry on a genuinely messy,
+    multi-tract input (covid 4981, a 3-tract document in one Exhibit A) even
+    though the SAME call succeeds on a retry. extract_courses_with_escalation
+    catches this and treats it the same as "this tier's result looks
+    incomplete" -- escalate to the next tier -- rather than letting a raw
+    IndexError/TypeError crash the whole anchor-resolution attempt."""
+    try:
+        return [
+            Course(
+                ns=c["ns"], degrees=c["degrees"], minutes=c["minutes"], seconds=c["seconds"],
+                ew=c["ew"], distance_ft=c["distance_feet"],
+            )
+            for c in result["courses"]
+        ]
+    except (TypeError, KeyError) as exc:
+        raise ValueError(f"model's own tool-call input didn't match the expected course schema: {exc}") from exc
 
 
 # Below this, a course count roughly this much lower than the raw text's own
@@ -138,8 +159,12 @@ def extract_courses_with_escalation(text_segment: str) -> tuple[list[Course], di
         return regex_courses, {"tier": "regex", "courses_found": len(regex_courses), "usage": zero_usage}
 
     sonnet_result = extract_courses_llm(text_segment, model=LLM_MODEL_DEFAULT)
-    sonnet_courses = to_course_objects(sonnet_result)
-    if not _looks_incomplete(text_segment, sonnet_courses):
+    try:
+        sonnet_courses = to_course_objects(sonnet_result)
+        sonnet_malformed = None
+    except ValueError as exc:
+        sonnet_courses, sonnet_malformed = [], str(exc)
+    if sonnet_malformed is None and not _looks_incomplete(text_segment, sonnet_courses):
         return sonnet_courses, {
             "tier": "llm_sonnet", "courses_found": len(sonnet_courses),
             "extraction_confidence": sonnet_result.get("confidence"), "extraction_notes": sonnet_result.get("notes"),
@@ -147,13 +172,27 @@ def extract_courses_with_escalation(text_segment: str) -> tuple[list[Course], di
         }
 
     opus_result = extract_courses_llm(text_segment, model=LLM_MODEL_HARD)
-    opus_courses = to_course_objects(opus_result)
-    tier = "llm_opus" if not _looks_incomplete(text_segment, opus_courses) else "llm_opus_still_incomplete"
+    try:
+        opus_courses = to_course_objects(opus_result)
+        opus_malformed = None
+    except ValueError as exc:
+        opus_courses, opus_malformed = [], str(exc)
+    if opus_malformed is not None:
+        tier = "llm_opus_malformed"
+    elif not _looks_incomplete(text_segment, opus_courses):
+        tier = "llm_opus"
+    else:
+        tier = "llm_opus_still_incomplete"
     combined_usage = {
         key: sonnet_result["usage"][key] + opus_result["usage"][key] for key in zero_usage
     }
+    notes = opus_result.get("notes")
+    if sonnet_malformed:
+        notes = f"{notes}; sonnet tier malformed: {sonnet_malformed}" if notes else f"sonnet tier malformed: {sonnet_malformed}"
+    if opus_malformed:
+        notes = f"{notes}; opus tier malformed: {opus_malformed}" if notes else f"opus tier malformed: {opus_malformed}"
     return opus_courses, {
         "tier": tier, "courses_found": len(opus_courses),
-        "extraction_confidence": opus_result.get("confidence"), "extraction_notes": opus_result.get("notes"),
+        "extraction_confidence": opus_result.get("confidence"), "extraction_notes": notes,
         "usage": combined_usage,
     }

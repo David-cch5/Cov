@@ -183,6 +183,12 @@ def ingest_one(session, c) -> None:
                 )
         return
 
+    if c.review_reason:
+        # A non-blocking note from candidate discovery (e.g. no template match) --
+        # surfaced here so it's visible in run output, but deliberately NOT folded
+        # into the DB review_reason/status logic below, which is reserved for
+        # actual problems found during or after this extraction attempt itself.
+        print(f"  note: {c.review_reason}")
     fields = extract_fields(c.text, c.template_version_id)
     print(f"  extracted: declarant={fields.get('declarant_name')!r} "
           f"fee%={fields.get('fee_percent')} confidence={fields.get('confidence')}")

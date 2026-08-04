@@ -139,24 +139,49 @@ def iter_candidates(session, covids: list[str]):
         template_version_id = map_row["version_id"] if map_row else None
         template_confidence = map_row.get("confidence") if map_row else None
 
+        # Hard blockers: nothing downstream can responsibly run without these,
+        # regardless of what an LLM extraction attempt might report.
         reasons = []
         if doc_text is None:
             reasons.append("no cached OCR text found")
         if county_fips is None:
             reasons.append(f"county not resolved ({state_name}/{county_name})")
-        if template_version_id is None:
-            reasons.append("template not identified")
-        elif not template_version_id.startswith("V"):
-            reasons.append(f"template {template_version_id} is a review/unreadable-cluster bucket, not a real template")
         if vocab_score is None and doc_text is not None:
             reasons.append("no OCR vocab score computed -- quality unknown, not assumed good")
         elif vocab_score is not None and vocab_score < 0.85:
             reasons.append(f"low OCR vocab score ({vocab_score})")
+
+        # A template-clustering miss (no match, or landed in the clustering pass's
+        # own "review"/"unreadable" catch-all buckets, e.g. "U27") is deliberately
+        # NOT a hard blocker by itself -- confirmed real, not hypothetical (covid
+        # 4981, Collin): clustered into U27 ("unreadable" per covenant_template's
+        # own status), yet this document's actual cached text is ordinary, legible
+        # Declaration-of-Covenant boilerplate with a 0.9203 vocab_score -- the
+        # cluster label reflects the ORIGINAL clustering pass's own judgment (made
+        # once, on whatever text/heuristic it had then), not this document's
+        # current, separately-and-directly-measured OCR quality. extract_fields
+        # already has a documented fallback for exactly this ("template not yet
+        # identified -- extract from the raw text directly") and reports its own
+        # confidence -- refusing to even attempt that real, confidence-gated read
+        # is strictly less informative than making it. Recorded as a note either
+        # way, never silently dropped, but it no longer forces needs_review by
+        # itself the way an actual OCR/county blocker still does.
+        template_note = None
+        if template_version_id is None:
+            template_note = "template not identified -- extracting directly from raw text"
+        elif not template_version_id.startswith("V"):
+            template_note = (
+                f"template {template_version_id} is a clustering-pass review/unreadable bucket, not "
+                "a confirmed real template -- extracting directly from raw text rather than trusting "
+                "its boilerplate hint"
+            )
+
+        all_notes = reasons + ([template_note] if template_note else [])
 
         yield CovenantCandidate(
             covid=int(covid), relpath=relpath, state_name=state_name, county_name=county_name,
             county_fips=county_fips, template_version_id=template_version_id,
             template_confidence=template_confidence, text=doc_text, pages=pages,
             ocr=ocr_flag, vocab_score=vocab_score,
-            needs_review=bool(reasons), review_reason="; ".join(reasons) if reasons else None,
+            needs_review=bool(reasons), review_reason="; ".join(all_notes) if all_notes else None,
         )

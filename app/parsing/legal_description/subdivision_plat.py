@@ -9,6 +9,7 @@ import anthropic
 
 from app.config import ANTHROPIC_API_KEY, LLM_MODEL_DEFAULT
 from app.llm.usage import log_usage
+from app.queue.job_queue import run_with_job_queue
 
 SUBDIVISION_TOOL = {
     "name": "record_subdivision_reference",
@@ -33,22 +34,25 @@ subdivision name or a lot number is unclear, use null / omit it rather than gues
 
 
 def parse_subdivision_reference(legal_description_raw: str) -> dict:
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    response = client.messages.create(
-        model=LLM_MODEL_DEFAULT,
-        max_tokens=2048,
-        system=SYSTEM_PROMPT,
-        tools=[SUBDIVISION_TOOL],
-        tool_choice={"type": "tool", "name": "record_subdivision_reference"},
-        messages=[{"role": "user", "content": legal_description_raw}],
-    )
-    # Deliberately NOT attached to the returned dict, unlike this project's
-    # other LLM call sites -- classifier.py json.dumps()'s this function's
-    # return value verbatim into covenant.legal_description_parsed (a JSONB
-    # column); a "usage" key would leak logging metadata into stored title
-    # data. Logged here (print only) instead.
-    log_usage("subdivision_plat", response)
-    for block in response.content:
-        if block.type == "tool_use" and block.name == "record_subdivision_reference":
-            return block.input
-    raise RuntimeError("model did not return the expected tool call")
+    def _call() -> dict:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        response = client.messages.create(
+            model=LLM_MODEL_DEFAULT,
+            max_tokens=2048,
+            system=SYSTEM_PROMPT,
+            tools=[SUBDIVISION_TOOL],
+            tool_choice={"type": "tool", "name": "record_subdivision_reference"},
+            messages=[{"role": "user", "content": legal_description_raw}],
+        )
+        # Deliberately NOT attached to the returned dict, unlike this project's
+        # other LLM call sites -- classifier.py json.dumps()'s this function's
+        # return value verbatim into covenant.legal_description_parsed (a JSONB
+        # column); a "usage" key would leak logging metadata into stored title
+        # data. Logged here (print only) instead.
+        log_usage("subdivision_plat", response)
+        for block in response.content:
+            if block.type == "tool_use" and block.name == "record_subdivision_reference":
+                return block.input
+        raise RuntimeError("model did not return the expected tool call")
+
+    return run_with_job_queue(_call, job_type="llm_subdivision_reference")
