@@ -77,8 +77,13 @@ def extract_courses_llm(text_segment: str, model: str = LLM_MODEL_DEFAULT) -> di
         response = client.messages.create(
             model=model,
             max_tokens=8192,
-            system=SYSTEM_PROMPT,
-            tools=[COURSE_EXTRACTION_TOOL],
+            # This system prompt + tool schema is identical on every call at a
+            # given model tier -- called at least once per metes-and-bounds
+            # covenant (often twice, Sonnet then Opus, per
+            # extract_courses_with_escalation), so it's cached rather than
+            # resent in full each time.
+            system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
+            tools=[{**COURSE_EXTRACTION_TOOL, "cache_control": {"type": "ephemeral"}}],
             tool_choice={"type": "tool", "name": "record_courses"},
             messages=[{"role": "user", "content": text_segment}],
         )

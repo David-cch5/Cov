@@ -39,8 +39,12 @@ def parse_subdivision_reference(legal_description_raw: str) -> dict:
         response = client.messages.create(
             model=LLM_MODEL_DEFAULT,
             max_tokens=2048,
-            system=SYSTEM_PROMPT,
-            tools=[SUBDIVISION_TOOL],
+            # This system prompt + tool schema is identical on every call --
+            # called once per subdivision_plat covenant, often many in a batch
+            # ingestion/resolution run -- so it's cached rather than resent in
+            # full each time.
+            system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
+            tools=[{**SUBDIVISION_TOOL, "cache_control": {"type": "ephemeral"}}],
             tool_choice={"type": "tool", "name": "record_subdivision_reference"},
             messages=[{"role": "user", "content": legal_description_raw}],
         )

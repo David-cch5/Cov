@@ -52,8 +52,13 @@ def ocr_page_image(image_path: str, model: str = LLM_MODEL_HARDEST) -> dict:
         response = client.messages.create(
             model=model,
             max_tokens=8192,
-            system=SYSTEM_PROMPT,
-            tools=[TRANSCRIBE_TOOL],
+            # Cached: this system prompt + tool schema is identical on every
+            # page of a multi-page escalation (escalate_to_vision_ocr calls
+            # this once per page, same document) and across documents in the
+            # same batch run -- only the page image itself (never cached,
+            # correctly -- unique content every call) differs.
+            system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
+            tools=[{**TRANSCRIBE_TOOL, "cache_control": {"type": "ephemeral"}}],
             tool_choice={"type": "tool", "name": "record_transcription"},
             messages=[{
                 "role": "user",
