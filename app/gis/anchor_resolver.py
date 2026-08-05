@@ -35,6 +35,7 @@ from app.gis.state_plane_anchor import EPSG_BY_TX_ZONE, traverse_to_geojson_stat
 from app.llm.anchor_agent import escalate_anchor_to_llm
 from app.parsing.legal_description.metes_bounds import extract_point_of_beginning, walk_traverse
 from app.parsing.legal_description.metes_bounds_llm import extract_courses_with_escalation
+from app.queue.job_queue import JobFailed
 
 # Only the counties this project has actually confirmed a real Texas State
 # Plane zone for (covid 3194/Montgomery used Central per
@@ -66,6 +67,12 @@ def _try_stated_coordinate(county_fips: str, legal_description_raw: str, courses
         return None
     m = _STATE_PLANE_COORD_RE.search(legal_description_raw or "")
     if not m:
+        return None
+    if not courses:
+        # Reachable now that course extraction failing hard (see
+        # resolve_metes_and_bounds_anchor's own try/except around
+        # extract_courses_with_escalation) no longer aborts the whole
+        # function -- nothing to walk without any courses.
         return None
     origin_x = float(m.group(1).replace(",", ""))
     origin_y = float(m.group(2).replace(",", ""))
@@ -259,7 +266,24 @@ def resolve_metes_and_bounds_anchor(session, covid: int, tract_no: int = 1) -> d
     county_fips = row.county_fips
     legal_description_raw = _get_deed_text(session, covid, row.legal_description_raw)
 
-    courses, extraction_diag = extract_courses_with_escalation(legal_description_raw)
+    try:
+        courses, extraction_diag = extract_courses_with_escalation(legal_description_raw)
+    except JobFailed as e:
+        # Confirmed real, not hypothetical: two live runs (covid 3346 tract 2,
+        # covid 4780 tract 1) crashed HERE with a raw traceback from an
+        # exhausted-retries API failure, before Tier 0's own free/deterministic
+        # techniques -- which need no LLM call at all -- ever got a chance to
+        # run. run_with_job_queue already wrote a durable job_queue row for
+        # this; the fix is to not let that turn into an uncaught crash of the
+        # whole covenant's resolution attempt. Tier 1 (the agentic search)
+        # doesn't depend on this pre-extracted course list either -- it reads
+        # the deed text directly and walks its own courses via walk_courses --
+        # so this can still proceed to both tiers, only skipping the one Tier
+        # 0 technique (_try_stated_coordinate) that needs one.
+        print(f"  [anchor_resolver] covid={covid} tract={tract_no} course extraction failed hard "
+              f"(job_id={e.job_id}): {e.original_exception} -- proceeding without pre-extracted courses")
+        courses, extraction_diag = [], {"tier": "extraction_failed_hard", "error": str(e.original_exception)}
+
     # Tracked from here, not just around the Opus/Fable anchor tiers below:
     # extract_courses_with_escalation can itself escalate to Sonnet/Opus to
     # read the courses, a real cost incurred even when Tier 0's deterministic
@@ -272,7 +296,7 @@ def resolve_metes_and_bounds_anchor(session, covid: int, tract_no: int = 1) -> d
     for key in llm_usage_totals:
         llm_usage_totals[key] += (extraction_diag.get("usage") or {}).get(key, 0)
 
-    if not courses:
+    if not courses and extraction_diag.get("tier") != "extraction_failed_hard":
         raise RuntimeError(
             f"covid {covid}: no metes-and-bounds courses extracted from the deed's own text, even "
             f"after LLM-escalated extraction (diagnostics: {extraction_diag})"
@@ -298,7 +322,21 @@ def resolve_metes_and_bounds_anchor(session, covid: int, tract_no: int = 1) -> d
     # figure, since cache-read/write are billed at different per-model rates
     # this function has no business guessing at.
     for model in (LLM_MODEL_HARD, LLM_MODEL_HARDEST):
-        llm_result = escalate_anchor_to_llm(covid, tract_no, model)
+        try:
+            llm_result = escalate_anchor_to_llm(covid, tract_no, model)
+        except JobFailed as e:
+            # Confirmed real on covid 3346 tract 1: a genuinely capped/looping
+            # agentic run raises JobFailed (see anchor_agent.py's own "capped"
+            # branch) rather than returning a plain "could not anchor" result
+            # -- and this loop, uncaught, let that crash the entire function
+            # instead of falling through to the next tier or the approximate-
+            # placement safety net below, contradicting this function's own
+            # "never raises" docstring above. run_with_job_queue already wrote
+            # a durable job_queue row for this; treat it exactly like a tier
+            # that ran and honestly reported it couldn't anchor.
+            print(f"  [anchor_resolver] covid={covid} tract={tract_no} model={model} tier failed hard "
+                  f"(job_id={e.job_id}): {e.original_exception}")
+            continue
         for key in llm_usage_totals:
             llm_usage_totals[key] += (llm_result.get("usage") or {}).get(key, 0)
         if llm_result.get("anchor_geojson") and best_llm_geojson is None:
@@ -329,23 +367,33 @@ def resolve_metes_and_bounds_anchor(session, covid: int, tract_no: int = 1) -> d
     print(f"  [anchor_resolver] covid={covid} tract={tract_no} total llm_usage={llm_usage_totals}")
 
     if anchor_lat is None:
+        # Confirmed real on covid 3346: without stripping a PRIOR exhausted
+        # note first (the way _attempt_and_verify's own note-replacement
+        # already does above), a repeated run appends a fresh copy every
+        # time rather than replacing it -- review_reason there had this same
+        # note duplicated three times over from three separate runs.
+        existing = session.execute(
+            text("SELECT review_reason FROM covenant WHERE covid = :covid"), {"covid": covid},
+        ).scalar() or ""
+        stale_note_re = re.compile(
+            r";?\s*ANCHOR ESCALATION EXHAUSTED \(automated\)[^;]*cache-read\.", re.IGNORECASE,
+        )
+        cleaned = stale_note_re.sub("", existing).strip("; ").strip()
+        new_note = (
+            "ANCHOR ESCALATION EXHAUSTED (automated): deterministic techniques, Opus 5, and "
+            "Fable 5 all failed to produce even a rough candidate position for this tract's "
+            "metes-and-bounds description -- needs a human to locate a real tie point. "
+            f"Tokens burned across both attempts: {llm_usage_totals['input_tokens']} in / "
+            f"{llm_usage_totals['output_tokens']} out / "
+            f"{llm_usage_totals['cache_creation_input_tokens']} cache-write / "
+            f"{llm_usage_totals['cache_read_input_tokens']} cache-read."
+        )
         session.execute(
             text("""
-                UPDATE covenant SET status = 'needs_review', review_reason =
-                    CASE WHEN review_reason IS NULL OR review_reason = '' THEN :note
-                         ELSE review_reason || '; ' || :note END,
-                    updated_at = now()
+                UPDATE covenant SET status = 'needs_review', review_reason = :reason, updated_at = now()
                 WHERE covid = :covid
             """),
-            {"covid": covid, "note": (
-                "ANCHOR ESCALATION EXHAUSTED (automated): deterministic techniques, Opus 5, and "
-                "Fable 5 all failed to produce even a rough candidate position for this tract's "
-                "metes-and-bounds description -- needs a human to locate a real tie point. "
-                f"Tokens burned across both attempts: {llm_usage_totals['input_tokens']} in / "
-                f"{llm_usage_totals['output_tokens']} out / "
-                f"{llm_usage_totals['cache_creation_input_tokens']} cache-write / "
-                f"{llm_usage_totals['cache_read_input_tokens']} cache-read."
-            )},
+            {"covid": covid, "reason": f"{cleaned}; {new_note}" if cleaned else new_note},
         )
         return {"tier": "exhausted", "committed": False, "llm_usage": llm_usage_totals}
 
