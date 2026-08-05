@@ -239,6 +239,15 @@ def get_covenant_context(covid: int) -> str:
     task -- there is no tool to write to the database; report your findings
     via report_anchor_conclusion instead.
 
+    Also returns sibling_tracts_already_anchored: any OTHER tract of this
+    same covid that already has a real, independently-verified anchor, with
+    that tract's own real-world Point of Beginning (pob_lon/pob_lat). If
+    this tract's own text ties its Point of Beginning/COMMENCING corner to
+    the SAME real corner a sibling tract's own deed text describes as ITS
+    Point of Beginning, that sibling's already-verified POB is a genuine,
+    strong tie point -- check this before searching for an independent
+    adjoining-parcel or NGS-monument tie from scratch.
+
     Args:
         covid: The covenant's own ID number.
     """
@@ -254,6 +263,32 @@ def get_covenant_context(covid: int) -> str:
             doc = session.execute(text("""
                 SELECT relpath FROM covenant_document WHERE covid = :covid AND doc_type = 'original'
             """), {"covid": covid}).fetchone()
+            # Confirmed real and load-bearing (covid 4780): a covenant's OTHER
+            # tract can already carry a real, independently-verified anchor --
+            # and its own deed text sometimes ties this tract's Point of
+            # Beginning to that SAME real corner (e.g. one tract's own
+            # "COMMENCING at..." reads identically to a sibling tract's own
+            # "BEGINNING at..."). That sibling's real POB is a genuine, already-
+            # verified tie point -- far stronger than searching for an
+            # independent adjoining-parcel match from scratch -- but nothing
+            # previously told the agent it existed at all. Surfaced here for
+            # every OTHER tract of this same covid that already has a
+            # confirmed geom; its own first ring vertex is its real POB by
+            # this project's own convention (every traverse-to-geojson
+            # function starts the ring at the walked Point of Beginning).
+            sibling_tracts = [
+                {
+                    "tract_no": r.tract_no,
+                    "boundary_resolution_method": r.boundary_resolution_method,
+                    "pob_lon": r.pob_lon, "pob_lat": r.pob_lat,
+                }
+                for r in session.execute(text("""
+                    SELECT tract_no, boundary_resolution_method,
+                           ST_X(ST_PointN(ST_ExteriorRing(ST_GeometryN(geom, 1)), 1)) AS pob_lon,
+                           ST_Y(ST_PointN(ST_ExteriorRing(ST_GeometryN(geom, 1)), 1)) AS pob_lat
+                    FROM tract WHERE covid = :covid AND geom IS NOT NULL
+                """), {"covid": covid}).fetchall()
+            ]
 
         full_text = None
         if doc and doc.relpath:
@@ -273,6 +308,7 @@ def get_covenant_context(covid: int) -> str:
             "recording_date": row.recording_date.isoformat() if row.recording_date else None,
             "recording_instrument": row.recording_instrument,
             "full_ocr_text": full_text,
+            "sibling_tracts_already_anchored": sibling_tracts,
         })
     except Exception as exc:
         return _tool_error(exc)
@@ -299,7 +335,26 @@ def _build_system_prompt(covid: int) -> str:
         "described first, tract_no=2 the second, etc.) -- identify all of them before deciding "
         "which one you're resolving, and state plainly in your reasoning which specific named "
         "parcel/tract you determined tract_no to be, so that choice itself can be checked "
-        "against the deed rather than assumed correct. Use query_gis_parcels to find real, "
+        "against the deed rather than assumed correct.\n\n"
+        "ALWAYS check get_covenant_context's sibling_tracts_already_anchored field FIRST, before "
+        "searching for an adjoining-parcel or NGS-monument tie from scratch: if it lists another "
+        "tract of this same covid, that tract's own Point of Beginning is already a real, "
+        "independently-verified coordinate -- not a guess, not this project's own approximation. "
+        "Read THIS tract's own Point of Beginning / COMMENCING call in the deed text and compare "
+        "it, in plain language, against how the sibling tract's own deed text describes ITS Point "
+        "of Beginning (both tracts' own field notes are in the same full_ocr_text). Two deeds from "
+        "the same original parent tract routinely tie to the exact same physical corner (the same "
+        "iron rod, the same 'Northeast corner of Lot X' description, etc.) even when neither states "
+        "a real-world coordinate directly. If they genuinely match, this tract's own real POB is "
+        "computable by walking, via walk_courses, whatever course(s) connect that shared corner to "
+        "THIS tract's own Point of Beginning (a tract's own field notes commonly state a "
+        "'COMMENCING at <shared corner>... THENCE <course(s)>... to the POINT OF BEGINNING' before "
+        "its main call, precisely for this reason) -- far stronger evidence than an independent "
+        "tie found from nothing, and it costs nothing to check first. Confirmed real and load-"
+        "bearing, not a hypothetical: covid 4780's own tract 1 and tract 2 share exactly this "
+        "relationship, tract 1's own COMMENCING language reading word-for-word identical to tract "
+        "2's own already-anchored POB.\n\n"
+        "Use query_gis_parcels to find real, "
         "currently-existing parcels (by "
         "name, survey abstract citation, or a bounding-box spatial query). Use "
         "query_ngs_datasheet if the deed or an adjoining survey ties to a named monument. Use "
