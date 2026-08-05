@@ -58,8 +58,8 @@ def resolve_subdivision_plat_tract(session, covid: int, tract_no: int = 1) -> di
         raise RuntimeError(f"covid {covid} not found")
 
     county_fips = row.county_fips
-    parsed = row.legal_description_parsed
-    if parsed is None:
+    tract_refs = row.legal_description_parsed
+    if tract_refs is None:
         # Confirmed real, previously-undetected gap: parse_subdivision_reference()
         # existed and was correct in isolation but had no caller anywhere in the
         # pipeline, so legal_description_parsed was never populated by anything --
@@ -69,12 +69,27 @@ def resolve_subdivision_plat_tract(session, covid: int, tract_no: int = 1) -> di
         # requiring a separate ingestion-time step.
         if not row.legal_description_raw:
             raise RuntimeError(f"covid {covid} has no legal_description_raw to parse a subdivision reference from")
-        parsed = parse_subdivision_reference(row.legal_description_raw)
+        tract_refs = parse_subdivision_reference(row.legal_description_raw)
         session.execute(
             text("UPDATE covenant SET legal_description_parsed = (:parsed)::jsonb, updated_at = now() "
                  "WHERE covid = :covid"),
-            {"covid": covid, "parsed": json.dumps(parsed)},
+            {"covid": covid, "parsed": json.dumps(tract_refs)},
         )
+    # tract_refs is a LIST -- one entry per distinct tract this covenant's legal
+    # description describes, in document order -- never a single reference shared
+    # across every tract_no. Confirmed real and necessary, not defensive-programming
+    # theater: covid 4123 describes two tracts under two different subdivisions;
+    # a single shared reference silently reused tract 2's own lots when tract 1 was
+    # (re-)resolved, corrupting its classification with the wrong parcels. Out-of-
+    # range is a hard error, never a silent fall-back to a different tract's entry.
+    if tract_no > len(tract_refs) or tract_no < 1:
+        raise RuntimeError(
+            f"covid {covid}: tract_no={tract_no} requested but only {len(tract_refs)} distinct tract "
+            f"reference(s) were parsed from this covenant's legal description -- never reusing a "
+            f"different tract's own subdivision/lot reference"
+        )
+    parsed = tract_refs[tract_no - 1]
+
     adapter = COUNTY_ADAPTERS.get(county_fips)
     if adapter is None:
         raise RuntimeError(f"no GIS adapter registered for county_fips={county_fips}")
@@ -133,16 +148,24 @@ def resolve_subdivision_plat_tract(session, covid: int, tract_no: int = 1) -> di
         )
         apns.append(p["apn"])
 
-    # SUM(acreage) is the county's own attribute where populated; some
-    # counties (e.g. Harris, for smaller/commercial parcels) leave it NULL
-    # even though the parcel has real geometry, so fall back to computing
-    # acreage from the unioned geometry itself rather than leaving a real,
-    # geometrically-resolved tract with no acreage to reconcile against.
+    # acreage is the county's own attribute where populated; some counties
+    # (e.g. Harris, for smaller/commercial parcels) leave it NULL even though
+    # the parcel has real geometry, so fall back to computing that PARCEL's
+    # own acreage from its geometry rather than leaving it uncounted.
+    #
+    # The COALESCE must be applied per-row (COALESCE(acreage, ST_Area(geom...)))
+    # then summed -- NOT COALESCE(SUM(acreage), ...) as this used to read. SQL's
+    # SUM() silently skips NULL rows rather than returning NULL for the whole
+    # aggregate; it only returns NULL if EVERY row is NULL. A tract with, say,
+    # 90 parcels carrying real acreage and 10 with NULL acreage never triggered
+    # the outer COALESCE's fallback at all -- SUM(acreage) still returned a real
+    # number (just the 90's total), silently missing the other 10 parcels'
+    # acreage entirely rather than falling back to their own geometry.
     session.execute(
         text("""
             INSERT INTO tract (covid, tract_no, geom, classified_acreage, boundary_resolution_method, source_id, updated_at)
             SELECT :covid, :tract_no, ST_Multi(ST_Union(geom)),
-                   COALESCE(SUM(acreage), ST_Area(ST_Union(geom)::geography) / 4046.8564224),
+                   SUM(COALESCE(acreage, ST_Area(geom::geography) / 4046.8564224)),
                    'current_parcel_match', :source_id, now()
             FROM parcel WHERE county_fips = :county_fips AND apn = ANY(:apns)
             ON CONFLICT (covid, tract_no) DO UPDATE SET

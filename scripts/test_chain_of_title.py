@@ -31,6 +31,7 @@ from app.title.chain import (
     _classify_pre_effective_date,
     _classify_recorder_portal_link,
     _mark_superseded_transfers,
+    _matches_anchor,
     _names_match,
     _normalize_doc_type,
     _row_lots,
@@ -166,6 +167,62 @@ def test_anchor_lot_is_unreliable_and_subdivisions_match() -> None:
     assert _subdivisions_match("N/A", "GLENEAGLES") is True
     print("PASS: _anchor_lot_is_unreliable / _subdivisions_match -> "
           "ET AL detected, subdivision used as the fallback correlator")
+
+
+def test_matches_anchor_rejects_unrelated_row_with_no_derivable_lots() -> None:
+    """Confirmed real gap (task #78): the old condition only fell back to
+    subdivision-matching when the ANCHOR's own lots were unavailable --
+    never when it was the CANDIDATE ROW that had no derivable lot data (no
+    LOT column, no HIGH/LOW LOT, and a free-text LEGAL DESCRIPTION not in
+    one of the specific shapes _enrich_row_from_legal_description already
+    parses). That row skipped the lot check (nothing to compare) AND the
+    subdivision check (only reached when the anchor itself lacked lots),
+    passing through completely unfiltered regardless of which real
+    subdivision it actually belonged to -- the same class of false-positive
+    already fixed once for Montgomery's HIGH/LOW LOT shape and once for
+    Collin's free-text shape (see _row_lots / _enrich_row_from_legal_
+    description), just reopened for any OTHER county's own differently-
+    shaped index."""
+    anchor_lots = {"7"}
+    anchor_block = "A"
+    anchor_subdivision = "COUNTRY MEADOWS SQUARE"
+
+    # No LOT/HIGH-LOT-LOW-LOT column, and free text this project has no
+    # dedicated parser for at all -- exactly the "genuinely no lot data"
+    # shape that slipped through before this fix.
+    unrelated_row = {"SUBDIVISION": None, "BLOCK": None,
+                      "LEGAL DESCRIPTION": "Lot 4, Prosper Town Center, Sec 2"}
+    assert _row_lots(unrelated_row) == set()
+    assert _matches_anchor(anchor_lots, anchor_block, anchor_subdivision, unrelated_row) is False, (
+        "a row with no derivable lots and no way to confirm it shares the anchor's own "
+        "subdivision must be rejected, not silently accepted"
+    )
+
+    # The exact same shape (no derivable lots), but genuinely the anchor's own
+    # subdivision recited some other way -- still correctly accepted, since the
+    # fallback is a real correlator, not a blanket rejection.
+    same_subdivision_row = {"SUBDIVISION": "COUNTRY MEADOWS SQUARE", "BLOCK": None}
+    assert _matches_anchor(anchor_lots, anchor_block, anchor_subdivision, same_subdivision_row) is True
+
+    # No structured SUBDIVISION column at all (the actual "LEGAL-DESCRIPTION-
+    # only county" shape task #78 names) -- correlated instead straight off the
+    # row's own raw LEGAL DESCRIPTION text, never requiring a dedicated per-
+    # county parser the way Collin's own enrichment does.
+    raw_text_match_row = {"SUBDIVISION": None, "BLOCK": None,
+                           "LEGAL DESCRIPTION": "Lot 9, Country Meadows Square, a subdivision in Douglas County"}
+    assert _matches_anchor(anchor_lots, anchor_block, anchor_subdivision, raw_text_match_row) is True, (
+        "a row with no structured SUBDIVISION column, but whose own raw legal-description "
+        "text names the anchor's real subdivision, must still be accepted"
+    )
+
+    # Unchanged from before this fix: when BOTH sides have real, non-overlapping
+    # lots, the lot check alone still rejects -- this fix only changes the
+    # missing-row-lots path, not the case lot data was already usable for.
+    other_lot_row = {"SUBDIVISION": "COUNTRY MEADOWS SQUARE", "LOT": "9", "BLOCK": None}
+    assert _matches_anchor(anchor_lots, anchor_block, anchor_subdivision, other_lot_row) is False
+    print("PASS: _matches_anchor -> a candidate row with no derivable lot data and no "
+          "confirmable subdivision match is rejected instead of passing through unfiltered, "
+          "while a genuine same-subdivision match (still with no lot data) is correctly kept")
 
 
 def test_walk_hop1_candidates_relaxed_fallback() -> None:
@@ -676,6 +733,7 @@ if __name__ == "__main__":
     test_row_lots_high_low_lot_range()
     test_normalize_doc_type_vendors_lien()
     test_anchor_lot_is_unreliable_and_subdivisions_match()
+    test_matches_anchor_rejects_unrelated_row_with_no_derivable_lots()
     test_walk_hop1_candidates_relaxed_fallback()
     test_doc_type_vocabulary_no_overlap()
     test_classify_recorder_portal_link_foreclosure()

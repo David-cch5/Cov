@@ -296,12 +296,74 @@ def _subdivisions_match(subdivision_a: str | None, subdivision_b: str | None) ->
     trusted (see _anchor_lot_is_unreliable) -- keyword-subset comparison,
     not a literal phrase match, since spelling varies even within this
     vendor's own data (e.g. "CRECENT COVE" vs "CRESCENT COVE", confirmed
-    real on covid 4780's own recorder index)."""
-    a = set((subdivision_a or "").upper().split())
-    b = set((subdivision_b or "").upper().split())
-    if not a or a == {"N/A"} or not b or b == {"N/A"}:
+    real on covid 4780's own recorder index). Tokenizes on word boundaries,
+    not a plain whitespace split -- necessary once this is also used against
+    raw prose (see _row_subdivision_text's own LEGAL DESCRIPTION fallback,
+    task #78), where a real match's own trailing comma/period would
+    otherwise make e.g. "SQUARE" and "SQUARE," compare as different tokens."""
+    raw_a = (subdivision_a or "").strip().upper()
+    raw_b = (subdivision_b or "").strip().upper()
+    if not raw_a or raw_a == "N/A" or not raw_b or raw_b == "N/A":
         return True  # can't compare -- don't let a missing field reject a real match
+    a = set(re.findall(r"[A-Z0-9]+", raw_a))
+    b = set(re.findall(r"[A-Z0-9]+", raw_b))
     return a <= b or b <= a
+
+
+def _row_subdivision_text(row: dict) -> str | None:
+    """The best available text to correlate a row's subdivision against the
+    anchor's: the structured SUBDIVISION column when present (including
+    Collin's own free-text-derived one -- see publicsearch.py's
+    _enrich_row_from_legal_description), or the row's own raw LEGAL
+    DESCRIPTION text as a last resort for a county whose free-text format
+    isn't one of the specific shapes that enrichment already knows how to
+    parse into a clean SUBDIVISION value. Confirmed real gap (task #78):
+    without this fallback, a row from such a county had NEITHER a derivable
+    lot NOR a derivable SUBDIVISION value, so _subdivisions_match's own
+    "can't compare, don't reject" rule let it through regardless of which
+    real subdivision it actually belonged to. Keyword-subset matching
+    against the raw text is the same tolerance _subdivisions_match already
+    applies to a clean SUBDIVISION value -- a real, if coarser, correlator,
+    not a guess."""
+    return row.get("SUBDIVISION") or row.get("LEGAL DESCRIPTION")
+
+
+def _matches_anchor(
+    anchor_lots: set[str], anchor_block: str | None, anchor_subdivision: str | None, row: dict,
+) -> bool:
+    """A candidate recorder-index row is treated as belonging to the same
+    tract as the covenant's own anchor entry when its lots/subdivision/block
+    correlate with the anchor's -- extracted to a standalone function (was a
+    closure inside walk_chain_of_title) so this logic can be tested directly,
+    not just through a full live chain walk."""
+    row_lots = _row_lots(row)
+    if anchor_lots and row_lots:
+        if not (anchor_lots & row_lots):
+            return False
+    else:
+        # Lot-based matching is unavailable on AT LEAST ONE side -- either
+        # the anchor's own lots were discarded as unreliable, or (confirmed
+        # real gap, task #78) THIS row has no derivable lot data at all,
+        # which happens for any county whose recorder index has no
+        # LOT/HIGH-LOT-LOW-LOT columns and whose free-text LEGAL DESCRIPTION
+        # isn't in one of the specific shapes _enrich_row_from_legal_
+        # description already knows how to parse (that fix was Collin-
+        # specific text; a differently-formatted county's legal description
+        # falls straight through it, same as if no enrichment existed at
+        # all). The bug this closes: the old condition here only fell back
+        # to subdivision-matching when the ANCHOR lacked lots -- never when
+        # it was the CANDIDATE ROW that lacked them -- so a row whose anchor
+        # DOES have real lots but which has no derivable lots of its own
+        # skipped both the lot check (nothing to compare) and the
+        # subdivision check (only reached when anchor_lots was empty),
+        # passing through completely unfiltered regardless of which real
+        # subdivision it actually belonged to -- the exact "both sides
+        # missing, don't reject" hole already fixed once for Montgomery's
+        # HIGH/LOW LOT shape and once for Collin's free-text shape, just
+        # reopened for any OTHER county's own differently-shaped index.
+        if not _subdivisions_match(anchor_subdivision, _row_subdivision_text(row)):
+            return False
+    return _blocks_match(anchor_block, row.get("BLOCK"))
 
 
 _DIRECTIONAL_PREFIXES = {"N", "S", "E", "W", "NE", "NW", "SE", "SW"}
@@ -443,9 +505,18 @@ def walk_chain_of_title(session, covid: int, tract_no: int = 1, max_parcels: int
     if covenant is None:
         raise RuntimeError(f"covid {covid} not found")
 
+    # DISTINCT, not a plain join: parcel_covenant carries one row per (apn,
+    # run_seq), and a tract can accumulate several run_seq batches over its
+    # life (each re-classification/monitor run inserts a fresh one, by design
+    # -- monitor_run is an audit trail, not a cache; see app/gis/plat_tracking.py
+    # and app/gis/monitor.py, which already apply this same DISTINCT for the
+    # identical reason). Confirmed real here too, not hypothetical: covid
+    # 3595's tract 1 was reclassified a second time, and this query -- alone
+    # among parcel_covenant's readers -- had no DISTINCT, so it silently
+    # walked its 6 real parcels twice (parcel_count=12) rather than once each.
     parcels = session.execute(
         text("""
-            SELECT p.county_fips, p.apn, p.owner_name_raw, p.situs_address
+            SELECT DISTINCT p.county_fips, p.apn, p.owner_name_raw, p.situs_address
             FROM parcel_covenant pc JOIN parcel p ON p.county_fips = pc.county_fips AND p.apn = pc.apn
             WHERE pc.covid = :covid AND pc.tract_no = :tract_no
             ORDER BY p.apn
@@ -875,17 +946,6 @@ def _walk_via_recorder_portal(session, covid: int, covenant, parcel, registry,
     anchor_block = anchor.get("BLOCK")
     anchor_subdivision = anchor.get("SUBDIVISION")
 
-    def _matches_anchor(row: dict) -> bool:
-        row_lots = _row_lots(row)
-        if anchor_lots and row_lots and not (anchor_lots & row_lots):
-            return False
-        if not anchor_lots and not _subdivisions_match(anchor_subdivision, row.get("SUBDIVISION")):
-            # lot-based matching is unavailable (either genuinely no lot data, or
-            # discarded as unreliable) -- fall back to subdivision as a coarser but
-            # still-real correlator, rather than letting every row through unfiltered.
-            return False
-        return _blocks_match(anchor_block, row.get("BLOCK"))
-
     candidate_pool: dict[str, dict] = {}
     situs = parcel.situs_address
     seed_queries = [covenant.declarant_raw]
@@ -895,7 +955,7 @@ def _walk_via_recorder_portal(session, covid: int, covenant, parcel, registry,
     for q in seed_queries:
         for row in _search(q):
             doc_num = row.get("DOC NUMBER")
-            if doc_num and _matches_anchor(row):
+            if doc_num and _matches_anchor(anchor_lots, anchor_block, anchor_subdivision, row):
                 candidate_pool[doc_num] = row
     anchor_doc_num = anchor.get("DOC NUMBER")
     if anchor_doc_num:
@@ -984,7 +1044,7 @@ def _walk_via_recorder_portal(session, covid: int, covenant, parcel, registry,
 
         for row in _search(current_holder):
             d = row.get("DOC NUMBER")
-            if d and _matches_anchor(row):
+            if d and _matches_anchor(anchor_lots, anchor_block, anchor_subdivision, row):
                 candidate_pool.setdefault(d, row)
 
     chain.extend(_unrecognized_doc_type_flags(candidate_pool, consumed, covenant))

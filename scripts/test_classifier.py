@@ -26,7 +26,7 @@ from sqlalchemy import text
 
 from app.db.session import SessionLocal, get_session
 from app.config import DB_SCHEMA
-from app.gis.classifier import classify_metes_and_bounds_tract
+from app.gis.classifier import classify_metes_and_bounds_tract, resolve_subdivision_plat_tract
 
 
 def test_classify_wrong_boundary_method_raises() -> None:
@@ -43,6 +43,121 @@ def test_classify_wrong_boundary_method_raises() -> None:
             assert "current_parcel_match" in str(e), e
     print("PASS: classify_metes_and_bounds_tract -> refuses to run against a "
           "current_parcel_match tract")
+
+
+def test_resolve_subdivision_plat_tract_per_tract_reference() -> None:
+    """Confirmed real bug: legal_description_parsed used to hold a single
+    subdivision/lot reference for the WHOLE covenant, applied identically
+    regardless of tract_no. Covid 4123's own legal description describes two
+    genuinely different tracts under different subdivisions (Lots 5-8 of
+    "Country Meadows Square" for tract 1; Lot 2 of the same base name -- a
+    different platted phase in the county's own records -- for tract 2). With
+    a single shared reference, resolving tract 1 silently reused tract 2's
+    own lots (or vice versa) whichever happened to be cached, corrupting
+    classification. legal_description_parsed is now a LIST, one entry per
+    tract_no (1-indexed against document order), and resolving one tract_no
+    can never reach into a different tract's own entry.
+
+    This checks the already-committed, already-corrected real classification
+    directly from the DB (no live network call needed for the test itself,
+    matching this file's own convention) -- tract 1 and tract 2 have
+    genuinely different parcel counts/acreages, proving each was resolved
+    against its OWN tract-specific reference, not a shared one."""
+    with get_session() as session:
+        parsed = session.execute(
+            text("SELECT legal_description_parsed FROM covenant WHERE covid = 4123")
+        ).scalar()
+        assert isinstance(parsed, list) and len(parsed) == 2, parsed
+        assert parsed[0]["lots"] == ["5", "6", "7", "8"], parsed[0]
+        assert parsed[1]["lots"] == ["2"], parsed[1]
+
+        rows = session.execute(
+            text("SELECT tract_no, classified_acreage FROM tract WHERE covid = 4123 ORDER BY tract_no")
+        ).fetchall()
+        acreages = {r.tract_no: float(r.classified_acreage) for r in rows}
+        assert abs(acreages[1] - 6.457) < 0.01, acreages  # 4 real parcels (lots 5/6/7/8)
+        assert abs(acreages[2] - 1.261) < 0.01, acreages  # 1 real parcel (lot 2)
+
+        # A tract_no beyond how many distinct references were actually parsed
+        # must fail loudly, never silently fall back to a different tract's
+        # own entry -- this path never reaches the network (fails before any
+        # adapter call), so it needs no live GIS dependency to test.
+        try:
+            resolve_subdivision_plat_tract(session, covid=4123, tract_no=3)
+            raise AssertionError("expected RuntimeError for an out-of-range tract_no")
+        except RuntimeError as e:
+            assert "only 2 distinct tract reference" in str(e), e
+    print("PASS: resolve_subdivision_plat_tract -> each tract_no resolves against its OWN "
+          "parsed subdivision/lot reference (covid 4123: 6.457 ac / 4 parcels for tract 1, "
+          "1.261 ac / 1 parcel for tract 2), and an out-of-range tract_no fails loudly "
+          "rather than reusing a different tract's reference")
+
+
+def test_resolve_subdivision_plat_tract_acreage_handles_null_rows() -> None:
+    """Confirmed real bug (task #82): the acreage aggregation inside
+    resolve_subdivision_plat_tract used to read
+    COALESCE(SUM(acreage), <geometry fallback>) -- but SQL's SUM() silently
+    skips NULL rows rather than making the whole aggregate NULL, so it only
+    falls back to geometry when EVERY matched parcel has NULL acreage. A
+    tract with a MIX of populated and NULL acreage (e.g. Harris County, for
+    smaller/commercial parcels) silently undercounted: the NULL rows' real
+    area was dropped entirely rather than computed from their own geometry.
+    The fix moves the COALESCE inside the SUM so each row's own fallback
+    applies individually, regardless of how many other rows are populated.
+
+    Exercises the exact aggregation query directly against two synthetic
+    parcel rows (no live GIS call, no covenant/tract dependency needed) --
+    one with a real acreage value, one with acreage=NULL and only geometry --
+    and confirms the fixed query's total includes both, while the old buggy
+    form provably would not have."""
+    # parcel.county_fips has a real FK to the county table, so this must be a
+    # real county_fips (Montgomery, already used throughout this project's own
+    # synthetic tests) -- the fake APNs below are what keep this from ever
+    # colliding with real parcel data.
+    test_county = "48339"
+    apn_a, apn_b = "TEST-ACREAGE-A", "TEST-ACREAGE-B"
+    geom_a = "POLYGON((-95.50 30.30, -95.4999 30.30, -95.4999 30.3001, -95.50 30.3001, -95.50 30.30))"
+    geom_b = "POLYGON((-95.51 30.30, -95.5099 30.30, -95.5099 30.3001, -95.51 30.3001, -95.51 30.30))"
+    with get_session() as session:
+        # Scoped to these exact fake APNs, never the whole county -- test_county
+        # is a REAL county_fips carrying real Montgomery parcel data.
+        session.execute(
+            text("DELETE FROM parcel WHERE county_fips = :cf AND apn = ANY(:apns)"),
+            {"cf": test_county, "apns": [apn_a, apn_b]},
+        )
+        session.execute(text("""
+            INSERT INTO parcel (county_fips, apn, geom, acreage) VALUES
+            (:cf, :apn_a, ST_SetSRID(ST_GeomFromText(:geom_a), 4326), 100.0),
+            (:cf, :apn_b, ST_SetSRID(ST_GeomFromText(:geom_b), 4326), NULL)
+        """), {"cf": test_county, "apn_a": apn_a, "geom_a": geom_a, "apn_b": apn_b, "geom_b": geom_b})
+
+        expected_b_acres = session.execute(text("""
+            SELECT ST_Area(geom::geography) / 4046.8564224 FROM parcel WHERE county_fips = :cf AND apn = :apn
+        """), {"cf": test_county, "apn": apn_b}).scalar()
+        assert expected_b_acres and expected_b_acres > 0, expected_b_acres
+
+        # The OLD buggy form: SUM() silently skips the NULL row, so the outer
+        # COALESCE's fallback never triggers even though one row IS null.
+        buggy_total = session.execute(text("""
+            SELECT COALESCE(SUM(acreage), ST_Area(ST_Union(geom)::geography) / 4046.8564224)
+            FROM parcel WHERE county_fips = :cf AND apn = ANY(:apns)
+        """), {"cf": test_county, "apns": [apn_a, apn_b]}).scalar()
+        assert abs(float(buggy_total) - 100.0) < 1e-6, buggy_total  # silently drops apn_b entirely
+
+        # The FIXED form, exactly as resolve_subdivision_plat_tract now runs it.
+        fixed_total = session.execute(text("""
+            SELECT SUM(COALESCE(acreage, ST_Area(geom::geography) / 4046.8564224))
+            FROM parcel WHERE county_fips = :cf AND apn = ANY(:apns)
+        """), {"cf": test_county, "apns": [apn_a, apn_b]}).scalar()
+        assert abs(float(fixed_total) - (100.0 + expected_b_acres)) < 1e-6, (fixed_total, expected_b_acres)
+
+        session.execute(
+            text("DELETE FROM parcel WHERE county_fips = :cf AND apn = ANY(:apns)"),
+            {"cf": test_county, "apns": [apn_a, apn_b]},
+        )
+    print("PASS: resolve_subdivision_plat_tract's acreage SQL -> a mix of populated/NULL "
+          "acreage parcels sums correctly (the NULL row falls back to its OWN geometry), "
+          "confirmed against the old buggy form which silently dropped it entirely")
 
 
 def test_classify_live_montgomery_3194_tract1() -> None:
@@ -286,6 +401,8 @@ def test_exclude_non_tract_parcels_covid_4440() -> None:
 
 if __name__ == "__main__":
     test_classify_wrong_boundary_method_raises()
+    test_resolve_subdivision_plat_tract_per_tract_reference()
+    test_resolve_subdivision_plat_tract_acreage_handles_null_rows()
     test_classify_live_montgomery_3194_tract1()
     test_persisted_montgomery_3194_real_classification()
     test_persisted_montgomery_8245_real_classification()
