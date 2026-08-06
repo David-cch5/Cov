@@ -84,24 +84,54 @@ def traverse_to_geojson(vertices_ft: list[tuple[float, float]], anchor_lat: floa
 def resolve_metes_bounds_approximate(
     session, covid: int, course_text: str, anchor_lat: float, anchor_lon: float,
     anchor_notes: str, tract_no: int = 1, confidence: float = 0.15,
-    method: str = "geocoded_point_of_beginning",
+    method: str = "geocoded_point_of_beginning", precomputed_geojson: dict | None = None,
 ) -> dict:
     """Extract courses via LLM, walk the traverse, place it at the given anchor,
     and persist as tract.approximate_geom -- geom stays NULL and the covenant is
     flagged needs_review, since this is a shape validation + rough placement,
-    never a confirmed boundary."""
-    extraction = extract_courses_llm(course_text)
-    courses = to_course_objects(extraction)
-    traverse = walk_traverse(courses)
-    geojson = traverse_to_geojson(traverse["vertices"], anchor_lat, anchor_lon)
+    never a confirmed boundary.
 
-    closure_ratio = traverse["closure_ratio"]
-    closure_display = f"1:{round(1 / closure_ratio)}" if closure_ratio else "n/a (zero perimeter)"
-    notes = (
-        f"Shape validated via LLM-assisted course extraction + deterministic COGO traverse: "
-        f"{len(courses)} courses, closure ratio {closure_display}, computed area "
-        f"{traverse['area_acres']:.2f} acres. NOT anchored to a surveyed position -- {anchor_notes}"
-    )
+    Pass `precomputed_geojson` (e.g. an LLM anchor-agent's own reported
+    anchor_geojson) to use that shape directly instead of re-extracting courses
+    from `course_text` here. Confirmed necessary, not an optimization: this
+    function's own course_text parameter is typically the covenant's FULL raw
+    text (see anchor_resolver.py's own fallback caller) with no concept of
+    which tract it's placing -- for a multi-tract covenant (covid 3346) that
+    re-extracted ALL tracts' courses combined into one nonsense shape, even
+    though the LLM agent tier that ran immediately before this had already
+    correctly identified and walked the SPECIFIC tract's own courses (it reads
+    full_ocr_text directly and reasons about which THENCE calls belong to
+    which tract) -- this discarded that correct, tract-specific work for
+    nothing every time neither tier's own result cleared the auto-commit bar."""
+    if precomputed_geojson is not None:
+        geojson = precomputed_geojson
+        area_acres = session.execute(
+            text("SELECT ST_Area(ST_SetSRID(ST_GeomFromGeoJSON(:g), 4326)::geography) / 4046.8564224"),
+            {"g": json.dumps(geojson)},
+        ).scalar()
+        notes = (
+            f"Shape is the LLM anchor-agent's own reported geometry (computed area "
+            f"{area_acres:.2f} acres if available) -- reused as-is rather than re-derived from "
+            f"the covenant's full raw text, which has no concept of which tract this is. "
+            f"NOT anchored to a surveyed position -- {anchor_notes}"
+        )
+        extraction: dict = {}
+        courses: list = []
+        closure_ratio = None
+    else:
+        extraction = extract_courses_llm(course_text)
+        courses = to_course_objects(extraction)
+        traverse = walk_traverse(courses)
+        geojson = traverse_to_geojson(traverse["vertices"], anchor_lat, anchor_lon)
+
+        closure_ratio = traverse["closure_ratio"]
+        closure_display = f"1:{round(1 / closure_ratio)}" if closure_ratio else "n/a (zero perimeter)"
+        area_acres = traverse["area_acres"]
+        notes = (
+            f"Shape validated via LLM-assisted course extraction + deterministic COGO traverse: "
+            f"{len(courses)} courses, closure ratio {closure_display}, computed area "
+            f"{area_acres:.2f} acres. NOT anchored to a surveyed position -- {anchor_notes}"
+        )
 
     session.execute(
         text("""
@@ -133,7 +163,7 @@ def resolve_metes_bounds_approximate(
     return {
         "courses_extracted": len(courses),
         "closure_ratio": closure_ratio,
-        "area_acres": traverse["area_acres"],
+        "area_acres": area_acres,
         "extraction_confidence": extraction.get("confidence"),
         "extraction_notes": extraction.get("notes"),
         "usage": extraction.get("usage"),

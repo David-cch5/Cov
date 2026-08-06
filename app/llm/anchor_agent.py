@@ -480,6 +480,26 @@ def escalate_anchor_to_llm(covid: int, tract_no: int, model: str) -> dict:
                 usage_totals["output_tokens"] += usage.output_tokens or 0
                 usage_totals["cache_creation_input_tokens"] += usage.cache_creation_input_tokens or 0
                 usage_totals["cache_read_input_tokens"] += usage.cache_read_input_tokens or 0
+            # Confirmed real, not hypothetical: a run stopped mid-flight (covid
+            # 3346 tract 2, killed after 15m39s of total silence -- the final
+            # summary print below only ever fires once a whole tier's loop
+            # exits, one way or another) left genuinely nothing recoverable --
+            # not even how many turns it had gotten through. Printed every turn
+            # so stdout/whatever's tailing it always reflects the running
+            # total up to the last completed turn, not just the final one.
+            tool_calls_this_turn = [
+                block.name for block in getattr(message, "content", []) or []
+                if getattr(block, "type", None) == "tool_use"
+            ]
+            print(
+                f"    [anchor_agent] covid={covid} tract={tract_no} model={model} "
+                f"turn={iterations} elapsed={time.monotonic() - start:.0f}s "
+                f"calling={tool_calls_this_turn or '(concluding)'} "
+                f"running_totals: in={usage_totals['input_tokens']} out={usage_totals['output_tokens']} "
+                f"cache_write={usage_totals['cache_creation_input_tokens']} "
+                f"cache_read={usage_totals['cache_read_input_tokens']}",
+                flush=True,
+            )
             if result_holder:
                 break
             elapsed = time.monotonic() - start
@@ -492,7 +512,8 @@ def escalate_anchor_to_llm(covid: int, tract_no: int, model: str) -> dict:
             f"iterations={iterations} elapsed={time.monotonic() - start:.0f}s "
             f"tokens_in={usage_totals['input_tokens']} tokens_out={usage_totals['output_tokens']} "
             f"cache_write={usage_totals['cache_creation_input_tokens']} "
-            f"cache_read={usage_totals['cache_read_input_tokens']}"
+            f"cache_read={usage_totals['cache_read_input_tokens']}",
+            flush=True,
         )
 
         if result_holder:

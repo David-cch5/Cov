@@ -281,7 +281,7 @@ def resolve_metes_and_bounds_anchor(session, covid: int, tract_no: int = 1) -> d
         # so this can still proceed to both tiers, only skipping the one Tier
         # 0 technique (_try_stated_coordinate) that needs one.
         print(f"  [anchor_resolver] covid={covid} tract={tract_no} course extraction failed hard "
-              f"(job_id={e.job_id}): {e.original_exception} -- proceeding without pre-extracted courses")
+              f"(job_id={e.job_id}): {e.original_exception} -- proceeding without pre-extracted courses", flush=True)
         courses, extraction_diag = [], {"tier": "extraction_failed_hard", "error": str(e.original_exception)}
 
     # Tracked from here, not just around the Opus/Fable anchor tiers below:
@@ -312,7 +312,7 @@ def resolve_metes_and_bounds_anchor(session, covid: int, tract_no: int = 1) -> d
             continue
         result = _attempt_and_verify(session, covid, tract_no, county_fips, candidate)
         if result is not None:
-            print(f"  [anchor_resolver] covid={covid} tract={tract_no} total llm_usage={llm_usage_totals}")
+            print(f"  [anchor_resolver] covid={covid} tract={tract_no} total llm_usage={llm_usage_totals}", flush=True)
             return {**result, "llm_usage": llm_usage_totals}
 
     best_llm_geojson = None  # kept for the approximate-placement fallback, even if never confident enough
@@ -335,7 +335,7 @@ def resolve_metes_and_bounds_anchor(session, covid: int, tract_no: int = 1) -> d
             # a durable job_queue row for this; treat it exactly like a tier
             # that ran and honestly reported it couldn't anchor.
             print(f"  [anchor_resolver] covid={covid} tract={tract_no} model={model} tier failed hard "
-                  f"(job_id={e.job_id}): {e.original_exception}")
+                  f"(job_id={e.job_id}): {e.original_exception}", flush=True)
             continue
         for key in llm_usage_totals:
             llm_usage_totals[key] += (llm_result.get("usage") or {}).get(key, 0)
@@ -348,23 +348,27 @@ def resolve_metes_and_bounds_anchor(session, covid: int, tract_no: int = 1) -> d
             continue  # reported confident, but failed independent verification -- try the next tier
         result = _attempt_and_verify(session, covid, tract_no, county_fips, candidate)
         if result is not None:
-            print(f"  [anchor_resolver] covid={covid} tract={tract_no} total llm_usage={llm_usage_totals}")
+            print(f"  [anchor_resolver] covid={covid} tract={tract_no} total llm_usage={llm_usage_totals}", flush=True)
             return {**result, "llm_usage": llm_usage_totals}
 
     # Nothing validated at any tier -- fall through to the existing rough-
     # placement safety net, using the best LLM-suggested position (even if
     # unconfirmed) rather than nothing at all, when one exists.
     anchor_lat = anchor_lon = None
+    best_llm_geojson_parsed = None
     if best_llm_geojson:
         try:
-            geojson = json.loads(best_llm_geojson) if isinstance(best_llm_geojson, str) else best_llm_geojson
-            pts = [pt for poly in geojson["coordinates"] for ring in poly for pt in ring]
+            best_llm_geojson_parsed = (
+                json.loads(best_llm_geojson) if isinstance(best_llm_geojson, str) else best_llm_geojson
+            )
+            pts = [pt for poly in best_llm_geojson_parsed["coordinates"] for ring in poly for pt in ring]
             anchor_lon = sum(p[0] for p in pts) / len(pts)
             anchor_lat = sum(p[1] for p in pts) / len(pts)
         except (json.JSONDecodeError, TypeError, KeyError, ZeroDivisionError):
             anchor_lat = anchor_lon = None
+            best_llm_geojson_parsed = None
 
-    print(f"  [anchor_resolver] covid={covid} tract={tract_no} total llm_usage={llm_usage_totals}")
+    print(f"  [anchor_resolver] covid={covid} tract={tract_no} total llm_usage={llm_usage_totals}", flush=True)
 
     if anchor_lat is None:
         # Confirmed real on covid 3346: without stripping a PRIOR exhausted
@@ -375,8 +379,18 @@ def resolve_metes_and_bounds_anchor(session, covid: int, tract_no: int = 1) -> d
         existing = session.execute(
             text("SELECT review_reason FROM covenant WHERE covid = :covid"), {"covid": covid},
         ).scalar() or ""
+        # Confirmed real on covid 3346: anchoring on the literal "cache-read."
+        # tail only matches a note that HAS the token-burn sentence appended --
+        # when repeated runs stack several copies of this note, only the LAST
+        # one in the whole string carries that suffix, so a non-global-enough
+        # pattern like the old one here left every earlier copy (ending in
+        # just "...tie point.") behind, uncleaned, after a repeated run.
+        # `[^;]*?` (non-greedy) lets each occurrence match up to WHICHEVER of
+        # the two valid endings comes first, so re.sub's own default global
+        # replacement correctly strips every stacked copy, not just the last.
         stale_note_re = re.compile(
-            r";?\s*ANCHOR ESCALATION EXHAUSTED \(automated\)[^;]*cache-read\.", re.IGNORECASE,
+            r";?\s*ANCHOR ESCALATION EXHAUSTED \(automated\)[^;]*?(?:tie point\.|cache-read\.)",
+            re.IGNORECASE,
         )
         cleaned = stale_note_re.sub("", existing).strip("; ").strip()
         new_note = (
@@ -405,7 +419,27 @@ def resolve_metes_and_bounds_anchor(session, covid: int, tract_no: int = 1) -> d
             "position suggested by an LLM escalation tier that did not clear the auto-commit "
             "confidence bar or failed independent verification -- unconfirmed, needs human review"
         ),
-        method="llm_suggested_unconfirmed",
+        # Confirmed real on covid 3346 tract 2: "llm_suggested_unconfirmed" was
+        # never a real value -- tract.tract_approximate_geom_method_check only
+        # allows 'geocoded_point_of_beginning' / 'matched_parcel_corner' /
+        # 'other' (checked via pg_get_constraintdef, not guessed). This code
+        # path had apparently never actually been exercised successfully
+        # before now (every prior attempt against 3346/4780/4781 died earlier
+        # in the pipeline). The real detail (which tier, confidence, why it
+        # didn't validate) is already in anchor_notes/approximate_geom_notes;
+        # 'other' is the honest fit from the schema's actual vocabulary --
+        # this is neither a free-text geocode nor a matched-parcel-corner tie.
+        method="other",
+        # Confirmed real on covid 3346 tract 2: without this, the shape gets
+        # re-derived from course_text (the covenant's FULL raw text, spanning
+        # every tract) via a second, separate, non-tract-aware extraction call
+        # -- discarding whatever tract-specific shape the LLM tier itself may
+        # have already correctly worked out (it reads full_ocr_text directly
+        # and reasons about which THENCE calls belong to which tract; the
+        # regex/LLM course extraction above and this fallback's own internal
+        # one have no such awareness). Reusing the tier's own reported anchor_
+        # geojson directly is strictly more likely to be right, and free.
+        precomputed_geojson=best_llm_geojson_parsed,
     )
     return {"tier": "geocode_approximate", "committed": False, "approx_result": approx_result,
             "llm_usage": llm_usage_totals}
