@@ -71,16 +71,20 @@ def test_reconcile_tract_no_stated_acreage_is_reconciled() -> None:
 
 
 def test_reconcile_tract_not_eligible_before_parcel_census() -> None:
-    """covid 3346's tract is only geocode-approximate (approximate_geom, not a
+    """covid 3346 tract 2 is only geocode-approximate (approximate_geom, not a
     confirmed tract.geom -- boundary_resolution_method is NULL) -- there's no
     real boundary to reconcile against at all yet, distinct from (and a step
     earlier than) a metes-and-bounds tract that has a confirmed boundary but
-    no parcel census yet."""
+    no parcel census yet. (Tract 1 of this same covid was this test's own
+    original fixture until it got resolved via chain-of-title parcel
+    matching -- a real, expected consequence of the project moving forward,
+    not a regression; tract 2 remains genuinely unresolved and now serves
+    the same role.)"""
     with get_session() as session:
-        result = reconcile_tract(session, covid=3346, tract_no=1)
+        result = reconcile_tract(session, covid=3346, tract_no=2)
     assert result["checked"] is False, result
     assert "not yet confirmed" in result["reason"], result
-    print("PASS: reconcile_tract (covid 3346) -> a tract with only an approximate, "
+    print("PASS: reconcile_tract (covid 3346 tract 2) -> a tract with only an approximate, "
           "unconfirmed boundary is correctly reported as not yet checkable")
 
 

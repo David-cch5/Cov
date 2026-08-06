@@ -280,32 +280,54 @@ def classify_metes_and_bounds_tract(session, covid: int, tract_no: int = 1) -> d
     # genuinely invalid geometry (e.g. "Nested shells" -- self-intersecting rings), which
     # crashes ST_Intersection with a GEOS TopologyException for the WHOLE batch, not just
     # that one parcel. Never seen on the small candidate pools every prior tract had.
-    # Excluded from the real intersection test below (nothing correct can be computed
-    # against a broken polygon) but surfaced in the return value rather than silently
-    # dropped -- CLAUDE.md: never fabricate, flag for review instead.
-    invalid_geometry_apns = [
-        r.apn for r in session.execute(
-            text("""
-                SELECT apn FROM parcel
-                WHERE county_fips = :county_fips AND apn = ANY(:apns) AND NOT ST_IsValid(geom)
-            """),
-            {"county_fips": county_fips, "apns": [p["apn"] for p in candidates]},
-        ).fetchall()
+    #
+    # Confirmed real, not hypothetical (covid 4781, APN 389449): "invalid" here usually
+    # means a minor self-touching ring, not a fundamentally broken shape -- ST_MakeValid
+    # repaired this one to within 0.03 ac of its own recorded acreage (2.409 vs 2.408),
+    # and the repaired shape turned out to be 99.9% inside the tract -- a real interior
+    # parcel that sat in "needs manual review" limbo for no reason. Blanket-excluding
+    # every invalid geometry threw away a real, cheaply-recoverable answer. Repair is
+    # only trusted when the repaired area is close to the parcel's OWN recorded acreage
+    # (same 5% tolerance this project already uses for LLM-derived anchors) -- a repair
+    # that changes the area wildly means ST_MakeValid guessed at fixing something more
+    # broken than a simple self-touch, and that parcel still gets excluded/flagged.
+    _MAKEVALID_MAX_ACREAGE_DEVIATION = 0.05
+    invalid_geometry_rows = session.execute(
+        text("""
+            SELECT apn, acreage,
+                   ST_IsValid(ST_MakeValid(geom)) AS repair_valid,
+                   ST_Area(ST_MakeValid(geom)::geography) / 4046.8564224 AS repaired_acres
+            FROM parcel
+            WHERE county_fips = :county_fips AND apn = ANY(:apns) AND NOT ST_IsValid(geom)
+        """),
+        {"county_fips": county_fips, "apns": [p["apn"] for p in candidates]},
+    ).fetchall()
+    repairable_apns = [
+        r.apn for r in invalid_geometry_rows
+        if r.repair_valid and r.acreage and r.repaired_acres
+        and abs(r.repaired_acres - float(r.acreage)) / float(r.acreage) <= _MAKEVALID_MAX_ACREAGE_DEVIATION
     ]
+    invalid_geometry_apns = [r.apn for r in invalid_geometry_rows if r.apn not in repairable_apns]
 
     matched = session.execute(
         text("""
+            WITH usable_parcels AS (
+                SELECT apn, CASE WHEN ST_IsValid(geom) THEN geom ELSE ST_MakeValid(geom) END AS geom
+                FROM parcel
+                WHERE county_fips = :county_fips AND apn = ANY(:apns)
+                  AND (ST_IsValid(geom) OR apn = ANY(:repairable_apns))
+            )
             SELECT p.apn,
                    ST_Contains(t.geom, p.geom) AS is_interior,
                    ST_Area(ST_Intersection(t.geom, p.geom)::geography)
-                       / NULLIF(ST_Area(p.geom::geography), 0) AS overlap_fraction
-            FROM parcel p, tract t
-            WHERE p.county_fips = :county_fips AND p.apn = ANY(:apns)
-              AND t.covid = :covid AND t.tract_no = :tract_no
-              AND ST_IsValid(p.geom)
+                       / NULLIF(ST_Area(p.geom::geography), 0) AS overlap_fraction,
+                   p.apn = ANY(:repairable_apns) AS was_repaired
+            FROM usable_parcels p, tract t
+            WHERE t.covid = :covid AND t.tract_no = :tract_no
               AND ST_Intersects(t.geom, p.geom)
         """),
-        {"county_fips": county_fips, "apns": [p["apn"] for p in candidates], "covid": covid, "tract_no": tract_no},
+        {"county_fips": county_fips, "apns": [p["apn"] for p in candidates], "covid": covid, "tract_no": tract_no,
+         "repairable_apns": repairable_apns},
     ).fetchall()
     if not matched:
         raise RuntimeError(
@@ -346,6 +368,13 @@ def classify_metes_and_bounds_tract(session, covid: int, tract_no: int = 1) -> d
                 "rationale": (
                     f"parcel geometry {'fully within' if m.is_interior else 'partially overlaps'} the covenant's "
                     f"own metes-and-bounds tract polygon (real spatial intersection, not a name/lot match)"
+                    + (
+                        f"; the county's own GIS geometry for this parcel was invalid (self-touching ring) and "
+                        f"repaired via ST_MakeValid -- repaired area verified within "
+                        f"{_MAKEVALID_MAX_ACREAGE_DEVIATION:.0%} of the parcel's own recorded acreage before "
+                        f"being trusted"
+                        if m.was_repaired else ""
+                    )
                 ),
             },
         )
@@ -355,10 +384,16 @@ def classify_metes_and_bounds_tract(session, covid: int, tract_no: int = 1) -> d
     # reused for both residual_geom and classified_acreage, rather than a naive sum of each
     # matched parcel's own acreage (which would over-count a 'boundary' parcel's area lying
     # outside the tract).
+    #
+    # Same on-the-fly ST_MakeValid as the matched query above, not upsert_parcel's own
+    # ON CONFLICT DO UPDATE -- that always overwrites parcel.geom with EXCLUDED.geom on
+    # every sync, so persisting a repair there would just get silently wiped the next
+    # time this parcel's county GIS data gets re-synced, reintroducing the exact bug this
+    # was meant to fix.
     session.execute(
         text("""
             WITH matched_union AS (
-                SELECT ST_Union(p.geom) AS geom
+                SELECT ST_Union(CASE WHEN ST_IsValid(p.geom) THEN p.geom ELSE ST_MakeValid(p.geom) END) AS geom
                 FROM parcel p
                 JOIN parcel_covenant pc ON pc.county_fips = p.county_fips AND pc.apn = p.apn
                 WHERE pc.covid = :covid AND pc.tract_no = :tract_no AND pc.run_seq = :run_seq
@@ -399,6 +434,7 @@ def classify_metes_and_bounds_tract(session, covid: int, tract_no: int = 1) -> d
         "boundary": sum(1 for m in matched if not m.is_interior),
         "run_seq": run_seq,
         "invalid_geometry_apns": invalid_geometry_apns,
+        "repaired_geometry_apns": repairable_apns,
     }
 
 
