@@ -39,6 +39,8 @@ from app.gis.state_plane_anchor import FT_PER_DEG_LAT, apply_similarity_complex,
 from app.ingestion.walk import TEXTCACHE
 from app.parsing.legal_description.metes_bounds import Course, walk_traverse
 from app.queue.job_queue import run_with_job_queue
+from app.recorder.adapters.publicsearch import search_by_name
+from app.recorder.session import recorder_context
 
 NGS_BOUNDS_URL = "https://geodesy.noaa.gov/api/nde/bounds"
 NGS_DATASHEET_URL = "https://geodesy.noaa.gov/cgi-bin/ds_mark.prl"
@@ -64,6 +66,12 @@ MAX_WALL_CLOCK_SECONDS = 90 * 60
 # bulk listing, so it's capped hard regardless of what's asked for.
 _MAX_PARCELS_PER_QUERY = 50
 _MAX_PARCELS_WITH_GEOMETRY = 5
+
+# A recorder-portal name search can return 50+ rows for a common surname;
+# capped for the same reason query_gis_parcels is -- the agent narrows with a
+# more specific name (e.g. adding a middle initial or the declarant's full
+# name) rather than this tool ever dumping an unbounded result set.
+_MAX_DEED_HISTORY_ROWS = 40
 
 
 def _tool_error(exc: Exception) -> str:
@@ -314,6 +322,81 @@ def get_covenant_context(covid: int) -> str:
         return _tool_error(exc)
 
 
+@beta_tool
+def query_deed_history(county_fips: str, name: str) -> str:
+    """Search this county's own real recorder-portal records for every deed/
+    transfer naming the given party (as grantor OR grantee), newest-first as
+    the portal itself orders them.
+
+    This is the tool that actually bridges a decades-old deed's own named
+    parties to today's current ownership -- query_gis_parcels only ever sees
+    CURRENT ownership attributes, which is structurally useless once a large
+    historical tract has been subdivided and resold to hundreds of unrelated
+    buyers (their current owner names have zero textual resemblance to
+    "Ginnings" or "Wolski" or whoever the original deed names). Confirmed
+    real, not hypothetical: covid 3346 tract 1 (a 9-deed, 585-ac assemblage)
+    and covid 8534 tract 1 (an 85.74-ac tract whose surrounding land became a
+    large residential subdivision) both burned many query_gis_parcels turns
+    with no path to success before this tool existed -- both were only
+    actually resolved by searching real recorded transfers for the
+    covenant's own declarant name and finding what it led to.
+
+    Search the covenant's own declarant_raw first (from get_covenant_context),
+    then any other grantor/grantee named in the deed's own adjoiner recitals
+    (e.g. "a called 20.113 acre tract described in deed to X") -- a later
+    transfer FROM one of these names, especially into a subdivision-style
+    legal description (a plat name + lot/block, rather than another raw
+    acreage figure), is strong evidence of what the land actually became.
+
+    Args:
+        county_fips: 5-digit county FIPS code.
+        name: A party name to search (e.g. "Wolski", "Ginnings C A", a
+            covenant's own declarant name). Partial/last-name-only searches
+            work -- the portal itself does a substring match; a common
+            surname alone can return unrelated people, so prefer including a
+            first name/initial when the deed provides one.
+    """
+    try:
+        row = session_execute_recorder_registry(county_fips)
+        if row is None:
+            return json.dumps({"error": f"no recorder-portal registry entry for county_fips={county_fips!r}"})
+        if row["status"] != "active":
+            return json.dumps({
+                "error": f"recorder portal for county_fips={county_fips!r} is not active "
+                         f"(status={row['status']!r}) -- not usable yet"
+            })
+        adapter = (row["quirks"] or {}).get("adapter")
+        if adapter != "app.recorder.adapters.publicsearch":
+            return json.dumps({
+                "error": f"county_fips={county_fips!r} uses a different recorder-portal adapter "
+                         f"({adapter!r}) not wired into this tool"
+            })
+        with recorder_context() as context:
+            rows = search_by_name(context, row["base_url"], name)
+        return json.dumps({
+            "rows": rows[:_MAX_DEED_HISTORY_ROWS],
+            "total_matched": len(rows),
+            "note": (
+                f"showing the first {_MAX_DEED_HISTORY_ROWS} of {len(rows)} matches -- narrow the name "
+                f"(add a first name/initial) if the one you need wasn't included"
+            ) if len(rows) > _MAX_DEED_HISTORY_ROWS else None,
+        })
+    except Exception as exc:
+        return _tool_error(exc)
+
+
+def session_execute_recorder_registry(county_fips: str) -> dict | None:
+    """Thin lookup, not exposed as its own tool -- query_deed_history's only
+    caller. A dict, not an ORM row, so it stays usable after the session that
+    fetched it closes."""
+    with get_session() as session:
+        row = session.execute(
+            text("SELECT base_url, status, quirks FROM county_recorder_registry WHERE county_fips = :county_fips"),
+            {"county_fips": county_fips},
+        ).fetchone()
+        return None if row is None else {"base_url": row.base_url, "status": row.status, "quirks": row.quirks}
+
+
 def _build_system_prompt(covid: int) -> str:
     return (
         f"You are resolving the Point-of-Beginning anchor for a metes-and-bounds covenant "
@@ -354,6 +437,28 @@ def _build_system_prompt(covid: int) -> str:
         "bearing, not a hypothetical: covid 4780's own tract 1 and tract 2 share exactly this "
         "relationship, tract 1's own COMMENCING language reading word-for-word identical to tract "
         "2's own already-anchored POB.\n\n"
+        "If query_gis_parcels searches by name/subdivision/abstract aren't finding the deed's own "
+        "named parties, STOP repeating variations of that same search and use query_deed_history "
+        "instead -- this is not a fallback of last resort, it is very often the actual answer. "
+        "query_gis_parcels only ever sees CURRENT ownership; a tract's original declarant or a "
+        "named adjoiner (e.g. 'a called 20.113 acre tract described in deed to X') from an older "
+        "deed routinely has zero textual resemblance to today's current owners once the land has "
+        "been subdivided and resold -- hundreds of individual homeowners will never match a search "
+        "for the original grantor's name, no matter how many ways you phrase the query. "
+        "query_deed_history searches REAL recorded transfers instead, which is what actually "
+        "bridges that gap: search the covenant's own declarant name first, then any other grantor "
+        "named in the deed's own adjoiner recitals. A later transfer FROM one of these names INTO "
+        "a subdivision-style legal description (a plat name + lot/block, rather than another raw "
+        "acreage figure) is strong evidence of what the land actually became -- keep tracing "
+        "forward (search the grantee name next) if the first hit isn't conclusive. Once you've "
+        "found a real current subdivision or successor owner this way, cross-check it against the "
+        "deed's own stated acreage (via query_gis_parcels + walk_courses/solve_anchor_similarity) "
+        "before trusting it, same as any other tie. Confirmed real and load-bearing, not "
+        "hypothetical: covid 3346 tract 1 (a 585-ac, 9-deed assemblage) and covid 8534 tract 1 (an "
+        "85.74-ac tract whose surrounding land became a large residential subdivision) both burned "
+        "many query_gis_parcels turns with no path to success before this tool existed -- both "
+        "were only actually resolved by searching the declarant's own name through real recorded "
+        "transfers.\n\n"
         "Use query_gis_parcels to find real, "
         "currently-existing parcels (by "
         "name, survey abstract citation, or a bounding-box spatial query). Use "
@@ -437,7 +542,7 @@ def escalate_anchor_to_llm(covid: int, tract_no: int, model: str) -> dict:
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     tools = [
         query_gis_parcels, query_ngs_datasheet, solve_anchor_similarity,
-        walk_courses, get_covenant_context, report_anchor_conclusion,
+        walk_courses, get_covenant_context, query_deed_history, report_anchor_conclusion,
     ]
 
     def _call() -> dict:

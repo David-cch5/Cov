@@ -9,6 +9,12 @@ strong, already-verified tie was never checked. get_covenant_context now
 reports every other tract of the same covid that already carries a real
 anchor, plus that tract's own real-world Point of Beginning.
 
+Also tests query_deed_history -- confirmed real and load-bearing on covid
+3346 tract 1 and covid 8534 tract 1, both of which burned many
+query_gis_parcels turns with no path to success (their deed's own named
+declarant has zero textual resemblance to current ownership once the land
+was subdivided and resold) before this tool existed.
+
 Usage: python3 scripts/test_anchor_agent.py
 """
 import json
@@ -19,7 +25,7 @@ sys.path.insert(0, ".")
 from sqlalchemy import text
 
 from app.db.session import get_session
-from app.llm.anchor_agent import get_covenant_context
+from app.llm.anchor_agent import get_covenant_context, query_deed_history
 
 # A ~1-acre square near Montgomery County, TX -- real, valid geometry; only
 # its first ring vertex (the POB, by this project's own traverse-to-geojson
@@ -83,6 +89,45 @@ def test_get_covenant_context_reports_anchored_siblings() -> None:
           "real Point of Beginning, not just this tract's own (previously unanchored) state")
 
 
+def test_query_deed_history_live_denton_wolski() -> None:
+    """covid 8534's own declarant, real transfers found on Denton's own
+    recorder portal (denton.tx.publicsearch.us) -- confirmed live this
+    session, including the 2021 lien release naming him directly."""
+    result = json.loads(query_deed_history.func(county_fips="48121", name="Wolski Edward F"))
+    assert "rows" in result and result["rows"], result
+    grantors = {r["GRANTOR"] for r in result["rows"]}
+    assert any("WOLSKI" in g for g in grantors), result
+    print(f"PASS: query_deed_history (live, Denton, 'Wolski Edward F') -> {len(result['rows'])} rows, "
+          f"{result['total_matched']} total matched")
+
+
+def test_query_deed_history_unknown_county() -> None:
+    result = json.loads(query_deed_history.func(county_fips="99999", name="Smith"))
+    assert "error" in result and "no recorder-portal registry entry" in result["error"], result
+    print("PASS: query_deed_history -> unknown county_fips correctly returns an error, not a guess")
+
+
+def test_query_deed_history_inactive_county() -> None:
+    """County FIPS 48479 (Kofile/CountyFusion, status='needs_review') --
+    correctly refused rather than attempting an unverified adapter."""
+    result = json.loads(query_deed_history.func(county_fips="48479", name="Smith"))
+    assert "error" in result and "not active" in result["error"], result
+    print("PASS: query_deed_history -> a registered-but-not-yet-verified county is correctly refused")
+
+
+def test_query_deed_history_unwired_adapter() -> None:
+    """County FIPS 48139 (Ellis, active status) uses the Acclaim adapter, not
+    publicsearch -- this tool is only wired to publicsearch so far, and must
+    say so rather than silently trying the wrong adapter."""
+    result = json.loads(query_deed_history.func(county_fips="48139", name="Smith"))
+    assert "error" in result and "different recorder-portal adapter" in result["error"], result
+    print("PASS: query_deed_history -> a county on a different (non-publicsearch) adapter is correctly refused")
+
+
 if __name__ == "__main__":
     test_get_covenant_context_reports_anchored_siblings()
+    test_query_deed_history_live_denton_wolski()
+    test_query_deed_history_unknown_county()
+    test_query_deed_history_inactive_county()
+    test_query_deed_history_unwired_adapter()
     print("\nall anchor_agent smoke tests passed")
