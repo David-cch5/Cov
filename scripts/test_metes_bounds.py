@@ -6,11 +6,19 @@ change can't silently re-break either case.
 
 Usage: python3 scripts/test_metes_bounds.py
 """
+import re
 import sys
 
 sys.path.insert(0, ".")
 
-from app.parsing.legal_description.metes_bounds import extract_courses, walk_traverse
+from app.db.session import get_session
+from app.ingestion.walk import get_deed_text
+from app.parsing.legal_description.metes_bounds import (
+    Course,
+    extract_courses,
+    repair_quadrant_by_closure,
+    walk_traverse,
+)
 from app.parsing.legal_description.metes_bounds_llm import to_course_objects
 
 
@@ -87,12 +95,20 @@ def test_compound_bearing_excludes_monument_ties() -> None:
 
 
 def test_covid_5838_primary_tract_closes() -> None:
-    """End-to-end regression: all 15 real courses in covid 5838's primary
-    318.779-acre tract (Nueces), combining every fix above, close to within a
-    fraction of a percent of the stated acreage -- confirmed the remaining
-    ~32 ft closure error is attributable to one small (31.95 ft arc) curve
-    segment deliberately left unwalked (no chord bearing recited in the deed,
-    and not independently derivable without guessing)."""
+    """End-to-end regression: covid 5838's primary 318.779-acre tract (Nueces),
+    combining every fix in this file, now closes essentially exactly.
+
+    An earlier version of this test asserted 15 courses and a ~32 ft closure,
+    on the reasoning that the deed's one bearingless curve call was "not
+    independently derivable without guessing". That was wrong, and the closure
+    error was the proof: 31.95 ft, exactly the arc's own length to 0.004 ft.
+    The curve is non-tangential, so the previous course says nothing about it --
+    but the deed recites the RADIUS BEARING at the point of curvature, which
+    fixes the tangent, and the chord is that tangent rotated half the central
+    angle toward the side the curve turns. Walking it takes closure from
+    1:674 to better than 1:1,000,000 and the area to within 0.001 ac of the
+    deed's own stated figure.
+    """
     text = (
         'BEGINNING at a 3/4 inch iron bolt found for the northwest corner of an 8.720 acre tract;\n'
         'THENCE South 55° 14\' 00" East, along the common boundary of said 8.720 acre tract '
@@ -143,19 +159,56 @@ def test_covid_5838_primary_tract_closes() -> None:
         '318.779 acres of land, more or less'
     )
     courses = extract_courses(text)
-    assert len(courses) == 15, (len(courses), courses)
+    assert len(courses) == 16, (len(courses), courses)
+
+    curves = [c for c in courses if c.is_curve]
+    assert len(curves) == 1, curves
+    c = curves[0]
+    # derived, not recited: tangent perpendicular to the North 31\u00b046'05" East
+    # radius, rotated +delta/2 because the curve turns right
+    assert (c.ns, c.ew) == ("North", "West"), c
+    assert abs(c.degrees + c.minutes / 60 + c.seconds / 3600 - 57.7526) < 0.01, c
+    assert abs(c.distance_ft - 31.953) < 0.01, c        # chord = 2R sin(delta/2)
+    assert c.curve_direction == "right" and c.radius_ft == 1909.86, c
+    # traversal order, not appended at the end: the curve sits between the course
+    # that ends at the point of curvature and the one that starts at the point of
+    # tangency, even though its parameters are recited in the FORMER's sentence
+    i = courses.index(c)
+    assert i == 13, i
+    assert (courses[i - 1].ns, courses[i - 1].degrees) == ("South", 36.0), courses[i - 1]
+    assert (courses[i + 1].ns, courses[i + 1].degrees) == ("North", 57.0), courses[i + 1]
 
     result = walk_traverse(courses)
     stated_acreage = 318.779
     area_diff_pct = abs(result["area_acres"] - stated_acreage) / stated_acreage
-    assert area_diff_pct < 0.005, (result["area_acres"], stated_acreage, area_diff_pct)
-    # the one deliberately-unwalked curve segment (arc length 31.95 ft, no
-    # recited chord bearing) should account for essentially all of the
-    # remaining closure error -- confirms no OTHER course was mis-parsed.
-    assert abs(result["closure_error_ft"] - 31.95) < 1.0, result["closure_error_ft"]
-    print(f"PASS: covid 5838 primary tract -> {len(courses)} courses, "
-          f"area={result['area_acres']:.2f} ac (stated {stated_acreage}), "
-          f"closure_error={result['closure_error_ft']:.2f} ft (~= the one unwalked curve arc)")
+    assert area_diff_pct < 0.0001, (result["area_acres"], stated_acreage, area_diff_pct)
+    assert result["closure_error_ft"] < 0.1, result["closure_error_ft"]
+    assert result["closure_ratio"] < 1e-6, result["closure_ratio"]
+    print(f"PASS: covid 5838 primary tract -> {len(courses)} courses incl. the derived curve chord, "
+          f"area={result['area_acres']:.3f} ac (stated {stated_acreage}), "
+          f"closure {result['closure_error_ft']:.3f} ft (1:{round(1 / result['closure_ratio']):,})")
+
+
+def test_non_tangential_curve_direction_must_be_stated() -> None:
+    """The general direction ("in a northwesterly direction") is what picks
+    between the radius's two perpendiculars. A curve whose stated direction
+    matches NEITHER is a deed that contradicts itself -- the course is dropped
+    so it surfaces as a bad closure, rather than a bearing being invented."""
+    base = (
+        'THENCE South 36\u00b0 13\' 31" West, a distance of 719.14 feet to a point for '
+        'the point of curvature of a non-tangential circular curve to the right having a '
+        'central angle of 00\u00b057\'31"", a radius of 1909.86 feet, and an arc length of '
+        '31.95 feet from which the radius bears North 31\u00b046\'05" East, a distance of '
+        '1909.86 feet, for a corner of this tract;\n'
+        'THENCE in a {direction} direction, an arc distance of 31.95 feet to a point;'
+    )
+    ok = extract_courses(base.format(direction="northwesterly"))
+    assert len([c for c in ok if c.is_curve]) == 1, ok
+    # both perpendiculars of a N31\u00b046'E radius run NW or SE -- never NE
+    bad = extract_courses(base.format(direction="northeasterly"))
+    assert not [c for c in bad if c.is_curve], bad
+    print("PASS: a non-tangential curve whose stated direction matches neither perpendicular "
+          "of its own radius bearing is dropped, not guessed at")
 
 
 def test_to_course_objects_rejects_malformed_schema() -> None:
@@ -175,6 +228,107 @@ def test_to_course_objects_rejects_malformed_schema() -> None:
     print("PASS: to_course_objects -> malformed course entries raise a clear ValueError, not a bare crash")
 
 
+def _covid_5838_excepted_segments() -> list[tuple[str, float]]:
+    """Segment covid 5838's SAVE AND EXCEPT block on each tract's own
+    "containing N acres" terminator rather than on its header. There are SIX
+    excepted tracts, not five: the 3.282 acre tract's header is missing from the
+    OCR entirely and the deed's own numbering skips 6, so any header-driven split
+    silently loses land. The acreage terminator is present on every one."""
+    with get_session() as session:
+        text = " ".join((get_deed_text(session, 5838) or "").split())
+    start = text.find("SAVE AND EXCEPT THE FOLLOWING")
+    assert start != -1, "SAVE AND EXCEPT block not found"
+    segments, prev = [], start
+    for m in re.finditer(r"containing\s+([\d.,]+)\s+acres", text[start:]):
+        end = start + m.end()
+        segments.append((text[prev:end], float(m.group(1).replace(",", ""))))
+        prev = end
+    return segments
+
+
+def test_covid_5838_save_and_except_tracts_all_close() -> None:
+    """All six SAVE AND EXCEPT tracts must parse and close, because they are
+    subtracted from the encumbered land -- an unparsed carve-out silently
+    over-states what the covenant covers.
+
+    Each of the six exposed a distinct OCR defect that had been dropping courses
+    outright: `central \u00abgle of` for "central angle of"; `a dius of` for "a
+    radius of"; a doubled seconds mark (`33\u00b022'23"'`); "feet" reduced to
+    `\u201cet`; a dollar sign for the 5 in `$6\u00b037'37"`; and, in TRACT 7, a
+    quadrant letter that is simply wrong in the deed.
+
+    Tolerances differ by tract for one principled reason: curves are walked as
+    CHORDS, so a curve-heavy tract's area is legitimately short by the circular
+    segments between each arc and its chord. On the 3.282 acre tract that is
+    0.0971 ac (curve right, bulging out) minus 0.0033 ac (curve left, bulging
+    in) = 0.0938 ac against an observed 0.0940 -- fully explained, so the
+    closure error, not the area, is what proves these correct."""
+    total_stated = total_walked = 0.0
+    for segment, stated in _covid_5838_excepted_segments():
+        courses, _ = repair_quadrant_by_closure(extract_courses(segment))
+        assert courses, f"{stated} ac tract parsed to zero courses"
+        result = walk_traverse(courses)
+        assert result["closure_error_ft"] < 1.0, (stated, result["closure_error_ft"])
+        assert abs(result["area_acres"] - stated) / stated < 0.035, (stated, result["area_acres"])
+        total_stated += stated
+        total_walked += result["area_acres"]
+    assert len(_covid_5838_excepted_segments()) == 6, "expected six excepted tracts"
+    assert abs(total_stated - 15.350) < 0.001, total_stated
+    assert abs(total_walked - total_stated) < 0.14, (total_walked, total_stated)
+    print(f"PASS: covid 5838 -> all 6 SAVE AND EXCEPT tracts close; "
+          f"{total_walked:.3f} ac walked vs {total_stated:.3f} ac stated")
+
+
+def test_quadrant_repair_fixes_covid_5838_tract_7() -> None:
+    """covid 5838's 0.554 acre TRACT 7 parses cleanly and its area comes out
+    right, but the traverse misses its own Point of Beginning by 811.64 feet:
+    the closing call reads "North 56\u00b037'37\" East ... 485.94 feet to the
+    Point of Beginning", which runs back OUT along Beach Access Road No. 1
+    instead of returning down it. The three preceding courses independently
+    demand 485.92 ft on azimuth 303.39\u00b0; N56\u00b037'37"W is azimuth
+    303.373\u00b0. Distance and angle were transcribed correctly -- only the
+    quadrant letter is wrong."""
+    segment = next(seg for seg, ac in _covid_5838_excepted_segments() if ac == 0.554)
+    courses = extract_courses(segment)
+    assert walk_traverse(courses)["closure_error_ft"] > 800
+
+    repaired, repair = repair_quadrant_by_closure(courses)
+    assert repair is not None, "the quadrant error was not recovered"
+    assert repair["course_index"] == 3, repair
+    assert repair["field"] == "ew" and repair["from"] == "East" and repair["to"] == "West", repair
+    assert abs(repair["distance_ft"] - 485.94) < 0.01, repair
+    assert walk_traverse(repaired)["closure_error_ft"] < 0.1, repair
+    print(f"PASS: quadrant repair -> {repair['bearing_before']} read as {repair['bearing_after']}, "
+          f"closure {repair['closure_before_ft']:.2f} -> {repair['closure_after_ft']:.2f} ft")
+
+
+def test_quadrant_repair_leaves_a_sound_traverse_alone() -> None:
+    """The repair must never fire on a traverse that already closes -- otherwise
+    it would be free to 'improve' correct data. covid 5838's 1.582 acre excepted
+    tract closes to 0.00 ft and must come back as the very same list object."""
+    segment = next(seg for seg, ac in _covid_5838_excepted_segments() if ac == 1.582)
+    courses = extract_courses(segment)
+    before = walk_traverse(courses)
+    assert before["closure_error_ft"] < 0.1, before
+    repaired, repair = repair_quadrant_by_closure(courses)
+    assert repair is None, repair
+    assert repaired is courses
+    assert walk_traverse(repaired)["closure_error_ft"] == before["closure_error_ft"]
+    print("PASS: a traverse that already closes is returned untouched by the quadrant repair")
+
+
+def test_quadrant_repair_refuses_an_ambiguous_case() -> None:
+    """A repair is only a correction when the closure identifies it uniquely. A
+    two-course stub is open no matter which letter is flipped, so nothing may be
+    changed -- the bad closure has to survive as the signal it is meant to be."""
+    stub = [Course(ns="North", degrees=45, minutes=0, seconds=0, ew="East", distance_ft=100.0),
+            Course(ns="North", degrees=45, minutes=0, seconds=0, ew="East", distance_ft=250.0)]
+    repaired, repair = repair_quadrant_by_closure(stub)
+    assert repair is None, repair
+    assert repaired is stub
+    print("PASS: an ambiguous traverse is left untouched rather than guessed at")
+
+
 if __name__ == "__main__":
     test_spelled_out_bearing_units()
     test_curly_quote_minutes_marker()
@@ -182,5 +336,10 @@ if __name__ == "__main__":
     test_compound_bearing_list_without_thence_or_to()
     test_compound_bearing_excludes_monument_ties()
     test_covid_5838_primary_tract_closes()
+    test_non_tangential_curve_direction_must_be_stated()
     test_to_course_objects_rejects_malformed_schema()
+    test_covid_5838_save_and_except_tracts_all_close()
+    test_quadrant_repair_fixes_covid_5838_tract_7()
+    test_quadrant_repair_leaves_a_sound_traverse_alone()
+    test_quadrant_repair_refuses_an_ambiguous_case()
     print("\nall metes-and-bounds parser tests passed")

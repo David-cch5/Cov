@@ -34,6 +34,27 @@ Practical order for a new covenant: full text → named features (roads, plat co
 monuments) → deterministic anchoring against those → only then LLM escalation. Escalating first
 is both slower and far more expensive.
 
+**Read the legal description from the DOCUMENT ITSELF, not a summary — and fix it when it's
+wrong.** `covenant.legal_description_raw` is an ingestion-time summary and routinely omits the
+field notes (covid 4781's literally contains the placeholder "[metes and bounds courses follow]").
+Use `app/ingestion/walk.py`'s `get_deed_text`, and when the parse looks thin, go back to the
+document and correct the parser rather than working around it. Nearly every hard problem in this
+project has turned out to be a bad reading of the legal description, not a hard GIS problem:
+- **covid 5838**: a 17.2-acre "missing land" residual and a 14.9-acre acreage shortfall were both
+  reading failures, not survey or GIS errors. The tract's own traverse reproduces the deed's stated
+  318.779 ac to 0.001 ac once every call is read — including one curve the deed states with **no
+  bearing at all** ("THENCE in a northwesterly direction, an arc distance of 31.95 feet"), whose
+  direction is recoverable from the radius bearing recited in the *previous* sentence.
+- **covid 4780**: "TRACT Ii" is OCR for TRACT III, not tract II — a third encumbered tract whose
+  land was being double-counted into tract 1.
+- **covid 8534**: the POB names a street intersection outright, after ~$45–50 of LLM escalation
+  failed to find it.
+
+Corollary: **the closure error tells you what you failed to read.** A traverse that closes at
+1:674 instead of 1:800,000 is not "a rough survey" — on covid 5838 the 31.95 ft closure error was
+exactly the length of the one course the parser had dropped. Chase the discrepancy to its cause
+before accepting or approximating anything.
+
 ## Non-negotiables
 - **Accuracy over completeness.** Every covenant passes a reconciliation check before it is
   considered done: classified acreage must reconcile with the covenant's stated acreage, and
