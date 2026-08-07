@@ -310,6 +310,61 @@ def classify_metes_and_bounds_tract(session, covid: int, tract_no: int = 1) -> d
         if r.repair_valid and r.acreage and r.repaired_acres
         and abs(r.repaired_acres - float(r.acreage)) / float(r.acreage) <= _MAKEVALID_MAX_ACREAGE_DEVIATION
     ]
+
+    # FALLBACK when the county records no acreage to verify against. Confirmed
+    # real and costly (covid 5838, Nueces): the acreage gate above can never
+    # pass for a parcel whose acreage is NULL or 0.000, so five genuine parcels
+    # -- Palmilla Beach PUD private streets and common areas, exactly the kind
+    # of parcel a county leaves unvalued, which is WHY acreage is null -- were
+    # excluded on every single run. They accounted for 11.41 of that tract's
+    # 17.22-acre unexplained residual, i.e. two thirds of a gap that looked
+    # like missing land and was actually this gate failing closed.
+    #
+    # The obvious alternative -- compare the repaired area to the raw
+    # geometry's own area -- was tried and REJECTED: "Nested shells" (every
+    # case seen in this project) double-counts area by construction, so the
+    # raw figure is meaningless and reads a 38-68% "loss" on a correct repair.
+    #
+    # What actually verifies the repair is whether it fits the surrounding
+    # parcel fabric: a repair that invented or misplaced area would overlap
+    # neighbouring parcels, because real parcels do not overlap each other. On
+    # covid 5838 the five genuine repairs collided with 0.0% of any neighbour
+    # while the two that genuinely belong elsewhere were untouched by this
+    # (they simply don't intersect the tract, and are dropped later by the
+    # normal spatial test). A parcel WITH usable acreage that fails the
+    # acreage check is never rescued here -- a stated 10 acres repairing to 30
+    # is a real discrepancy, and the county's own figure stays authoritative.
+    _MAKEVALID_MAX_FABRIC_OVERLAP = 0.02
+    unverifiable = [
+        r.apn for r in invalid_geometry_rows
+        if r.repair_valid and r.apn not in repairable_apns and not (r.acreage and float(r.acreage) > 0)
+    ]
+    fabric_ok = []
+    if unverifiable:
+        fabric_ok = [
+            r.apn for r in session.execute(
+                text("""
+                    WITH repaired AS (
+                        SELECT apn, ST_MakeValid(geom) AS geom FROM parcel
+                        WHERE county_fips = :county_fips AND apn = ANY(:unverifiable)
+                    ), neighbours AS (
+                        SELECT apn, CASE WHEN ST_IsValid(geom) THEN geom ELSE ST_MakeValid(geom) END AS geom
+                        FROM parcel WHERE county_fips = :county_fips AND apn = ANY(:apns)
+                    )
+                    SELECT r.apn
+                    FROM repaired r LEFT JOIN neighbours n
+                      ON n.apn <> r.apn AND ST_Intersects(r.geom, n.geom)
+                    GROUP BY r.apn, r.geom
+                    HAVING ST_Area(r.geom::geography) > 0
+                       AND COALESCE(SUM(ST_Area(ST_Intersection(r.geom, n.geom)::geography)), 0)
+                           / ST_Area(r.geom::geography) <= :max_overlap
+                """),
+                {"county_fips": county_fips, "unverifiable": unverifiable,
+                 "apns": [p["apn"] for p in candidates], "max_overlap": _MAKEVALID_MAX_FABRIC_OVERLAP},
+            )
+        ]
+        repairable_apns = repairable_apns + fabric_ok
+
     invalid_geometry_apns = [r.apn for r in invalid_geometry_rows if r.apn not in repairable_apns]
 
     matched = session.execute(
@@ -389,10 +444,18 @@ def classify_metes_and_bounds_tract(session, covid: int, tract_no: int = 1) -> d
                     f"parcel geometry {'fully within' if m.is_interior else 'partially overlaps'} the covenant's "
                     f"own metes-and-bounds tract polygon (real spatial intersection, not a name/lot match)"
                     + (
-                        f"; the county's own GIS geometry for this parcel was invalid (self-touching ring) and "
-                        f"repaired via ST_MakeValid -- repaired area verified within "
-                        f"{_MAKEVALID_MAX_ACREAGE_DEVIATION:.0%} of the parcel's own recorded acreage before "
-                        f"being trusted"
+                        (
+                            f"; the county's own GIS geometry for this parcel was invalid (self-touching "
+                            f"ring) and repaired via ST_MakeValid -- the county records no usable acreage "
+                            f"for it, so the repair was verified instead by confirming it overlaps no other "
+                            f"parcel by more than {_MAKEVALID_MAX_FABRIC_OVERLAP:.0%} of its own area (real "
+                            f"parcels do not overlap, so a repair that invented area would collide)"
+                            if m.apn in fabric_ok else
+                            f"; the county's own GIS geometry for this parcel was invalid (self-touching "
+                            f"ring) and repaired via ST_MakeValid -- repaired area verified within "
+                            f"{_MAKEVALID_MAX_ACREAGE_DEVIATION:.0%} of the parcel's own recorded acreage "
+                            f"before being trusted"
+                        )
                         if m.was_repaired else ""
                     )
                 ),

@@ -451,6 +451,43 @@ def test_detect_sliver_subdivision_clusters_covid_8534() -> None:
           "corroborated; Hercules West, geometry-only) as possible_non_tract_subdivisions")
 
 
+def test_makevalid_fabric_fallback_covid_5838() -> None:
+    """Confirmed real and costly: the ST_MakeValid gate only trusted a repair
+    whose area landed within 5% of parcel.acreage, and Nueces records that as
+    NULL/0.000 for Palmilla Beach's private streets and common areas -- exactly
+    the parcels a county leaves unvalued. Those five were therefore dropped on
+    every run, and accounted for 11.41 of covid 5838 tract 1's 17.22-acre
+    unexplained residual: two thirds of a gap that looked like missing land and
+    was actually the gate failing closed.
+
+    The fallback verifies by FABRIC FIT instead -- real parcels do not overlap,
+    so a repair that invented area would collide with a neighbour. Comparing
+    against the raw geometry's own area was tried and rejected: "Nested shells"
+    double-counts by construction, reading a 38-68% "loss" on a correct repair.
+
+    Both halves are pinned here: the five are admitted, and the acreage gate
+    still governs wherever acreage IS usable (covid 4440, whose six invalid
+    parcels all carry acreage matching their repair to within 0.01% and are
+    admitted on that basis, never reaching the fallback)."""
+    session = SessionLocal()
+    try:
+        session.execute(text(f"SET search_path TO {DB_SCHEMA}, public"))
+        r = classify_metes_and_bounds_tract(session, covid=5838, tract_no=1)
+        repaired = set(r["repaired_geometry_apns"])
+        assert {"572724", "604014", "604811", "610981", "620185"} <= repaired, repaired
+        assert not r["invalid_geometry_apns"], r["invalid_geometry_apns"]
+        row = session.execute(text("""
+            SELECT ST_Area(residual_geom::geography)/4046.8564224 AS resid
+            FROM tract WHERE covid=5838 AND tract_no=1
+        """)).fetchone()
+        assert 5.5 < float(row.resid) < 6.1, float(row.resid)   # 5.811, was 17.217
+    finally:
+        session.rollback()
+        session.close()
+    print("PASS: ST_MakeValid fabric-fit fallback -> covid 5838's 5 unvalued Palmilla Beach parcels "
+          "are admitted, dropping the residual from 17.217 to ~5.81 ac")
+
+
 def test_exclusion_is_durable_across_reclassification() -> None:
     """Migration 0034. Before it, exclude_non_tract_parcels only DELETED
     parcel_covenant rows, and both classify_metes_and_bounds_tract and
@@ -559,6 +596,7 @@ if __name__ == "__main__":
     test_persisted_montgomery_4440_real_classification()
     test_exclude_non_tract_parcels_covid_4440()
     test_detect_sliver_subdivision_clusters_covid_8534()
+    test_makevalid_fabric_fallback_covid_5838()
     test_exclusion_is_durable_across_reclassification()
     test_detect_negligible_overlap_parcels()
     test_negligible_overlap_live_covid_8245()
