@@ -98,6 +98,14 @@ def test_monitor_detects_a_real_but_untracked_parcel() -> None:
         """), {"apn": victim.apn})
 
         result = monitor_tract_for_new_plats(session, covid=8245, tract_no=1, run_type="manual")
+        # EXACTLY one. This briefly read 4: monitor rebuilds the census from
+        # geometry, so alongside the victim it also re-added the three sub-10 m2
+        # artifacts scripts/fix_covid8245_negligible_overlap.py had removed --
+        # every exclusion this project ever made was one monitoring run away
+        # from being silently undone (covid 4440's 22 and covid 8534's 40 too).
+        # parcel_covenant_exclusion (migration 0034) makes a reviewed exclusion
+        # durable, so the count is a meaningful assertion again rather than a
+        # tally of resurrections.
         assert result["new_parcels_found"] == 1, result
 
         still_tracked = session.execute(text("""

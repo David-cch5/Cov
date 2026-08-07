@@ -321,14 +321,24 @@ def classify_metes_and_bounds_tract(session, covid: int, tract_no: int = 1) -> d
                 WHERE county_fips = :county_fips AND apn = ANY(:apns)
                   AND (ST_IsValid(geom) OR apn = ANY(:repairable_apns))
             )
-            SELECT p.apn, p.recited_legal_description,
-                   ST_Contains(t.geom, p.geom) AS is_interior,
-                   ST_Area(ST_Intersection(t.geom, p.geom)::geography)
-                       / NULLIF(ST_Area(p.geom::geography), 0) AS overlap_fraction,
-                   p.apn = ANY(:repairable_apns) AS was_repaired
-            FROM usable_parcels p, tract t
-            WHERE t.covid = :covid AND t.tract_no = :tract_no
-              AND ST_Intersects(t.geom, p.geom)
+            SELECT apn, recited_legal_description, is_interior, was_repaired, overlap_m2,
+                   overlap_m2 / NULLIF(parcel_m2, 0) AS overlap_fraction
+            FROM (
+                SELECT p.apn, p.recited_legal_description,
+                       ST_Contains(t.geom, p.geom) AS is_interior,
+                       p.apn = ANY(:repairable_apns) AS was_repaired,
+                       -- the real overlap AREA, kept alongside the fraction: a
+                       -- fraction alone can't tell a genuine narrow clip off a
+                       -- huge parcel (small fraction, acres of real encumbered
+                       -- land) from a digitization touch worth square
+                       -- centimetres. Computed once here and reused for the
+                       -- fraction, so this costs nothing extra.
+                       ST_Area(ST_Intersection(t.geom, p.geom)::geography) AS overlap_m2,
+                       ST_Area(p.geom::geography) AS parcel_m2
+                FROM usable_parcels p, tract t
+                WHERE t.covid = :covid AND t.tract_no = :tract_no
+                  AND ST_Intersects(t.geom, p.geom)
+            ) x
         """),
         {"county_fips": county_fips, "apns": [p["apn"] for p in candidates], "covid": covid, "tract_no": tract_no,
          "repairable_apns": repairable_apns},
@@ -339,6 +349,12 @@ def classify_metes_and_bounds_tract(session, covid: int, tract_no: int = 1) -> d
             f"actually intersect the tract's own polygon -- check the tract's geometry (may be mis-anchored) "
             f"before assuming the area is truly empty"
         )
+
+    # Parcels a human already ruled out stay out, however the geometry reads --
+    # otherwise this rebuild silently resurrects them (migration 0034).
+    already_excluded = excluded_apns(session, covid, tract_no)
+    if already_excluded:
+        matched = [m for m in matched if m.apn not in already_excluded]
 
     run_seq = session.execute(
         text("SELECT COALESCE(MAX(run_seq), 0) + 1 AS n FROM monitor_run WHERE covid = :covid"),
@@ -457,6 +473,21 @@ def classify_metes_and_bounds_tract(session, covid: int, tract_no: int = 1) -> d
             ),
         )
 
+    negligible = _detect_negligible_overlap_parcels(matched)
+    if negligible:
+        detail = ", ".join(f"{n['apn']} ({n['overlap_m2']:.2f} m2)" for n in negligible)
+        _write_covenant_note(
+            session, covid, "NEGLIGIBLE OVERLAP", (
+                f"NEGLIGIBLE OVERLAP (automated): {len(negligible)} boundary parcel(s) intersect this "
+                f"tract by less than {_MIN_OVERLAP_AREA_M2:.0f} m2 -- a digitization artifact where two "
+                f"independently-surveyed boundaries cross by a hair, not encumbered land. Unlike a "
+                f"low-overlap FRACTION (which can still be acres on a large parcel), an absolute area "
+                f"this small cannot represent a real property interest. Each is currently recorded as "
+                f"encumbered and would carry fee liability, so confirm and remove via "
+                f"exclude_non_tract_parcels(): {detail}"
+            ),
+        )
+
     return {
         "candidates_in_bbox": len(candidates),
         "matched_parcels": len(matched),
@@ -466,6 +497,7 @@ def classify_metes_and_bounds_tract(session, covid: int, tract_no: int = 1) -> d
         "invalid_geometry_apns": invalid_geometry_apns,
         "repaired_geometry_apns": repairable_apns,
         "possible_non_tract_subdivisions": sliver_groups,
+        "negligible_overlap_parcels": negligible,
     }
 
 
@@ -504,6 +536,25 @@ _MIN_GROUP_KEY_CHARS = 6
 # from Sherman Crossing's own genuinely-platted-from-this-tract parcels (87.0%-97.3%).
 _SLIVER_OVERLAP_MAX_FRACTION = 0.5
 
+# A parcel whose real intersection with the tract is smaller than this is a
+# digitization artifact -- two boundaries drawn from different surveys crossing
+# by a hair -- not encumbered land. 10 m2 is ~108 sq ft; no real property
+# interest is conveyed in a strip that size, so the threshold is deliberately
+# absolute rather than a fraction. The distinction matters: a 2% clip off a
+# 100-acre parcel is a small FRACTION but ~3,200 m2 of genuinely encumbered
+# land and must be kept, while a suburban lot touching the boundary by 0.05 m2
+# cannot be encumbered anything.
+#
+# Confirmed real and consequential (survey across all metes-and-bounds tracts,
+# 2026-08-06): 52 parcels across 9 tracts fall below this. covid 8245 was the
+# starkest -- 3 of its 6 matched parcels overlapped by 0.01-0.06 m2 (square
+# centimetres), all private homeowners recorded as subject to a 1% transfer-fee
+# covenant, two of them already carrying recorded non-exempt transfers from the
+# chain walk. The subdivision-cluster check above structurally cannot catch
+# these: a parcel with no recited_legal_description gets no group key at all,
+# and one genuinely-straddling member exempts a whole subdivision.
+_MIN_OVERLAP_AREA_M2 = 10.0
+
 
 def _sliver_group_key(recited_legal_description: str | None) -> str | None:
     if not recited_legal_description:
@@ -513,6 +564,53 @@ def _sliver_group_key(recited_legal_description: str | None) -> str | None:
     if len(stripped) >= _MIN_GROUP_KEY_CHARS:
         key = stripped
     return key or None
+
+
+def excluded_apns(session, covid: int, tract_no: int) -> set[str]:
+    """APNs a human has reviewed and ruled OUT of this tract's encumbered land
+    (migration 0034). Both classify_metes_and_bounds_tract and
+    monitor_tract_for_new_plats must consult this before writing
+    parcel_covenant, or they rebuild the census from geometry and silently
+    resurrect every exclusion -- reproduced on covid 8245."""
+    return {
+        r.apn for r in session.execute(
+            text("SELECT apn FROM parcel_covenant_exclusion WHERE covid = :covid AND tract_no = :tract_no"),
+            {"covid": covid, "tract_no": tract_no},
+        )
+    }
+
+
+def restore_excluded_parcels(session, covid: int, tract_no: int, apns: list[str], reason: str) -> dict:
+    """The explicit un-exclude path: drop the exclusion record so the next
+    classification run can legitimately re-add these parcels.
+
+    Before migration 0034 there was no such path, because none was needed --
+    re-running classification restored a parcel automatically, which is exactly
+    the bug that made exclusions worthless. Restoring is now a deliberate,
+    recorded act (covid 4440 really needed it: 6 of 28 parcels were excluded in
+    error and restored after deed-history verification confirmed they trace back
+    to the tract's own original grantor).
+
+    Does not re-insert parcel_covenant rows itself -- run
+    classify_metes_and_bounds_tract afterwards, so the parcels come back through
+    the same real spatial test as everything else rather than being asserted."""
+    row = session.execute(text("SELECT county_fips FROM covenant WHERE covid = :covid"), {"covid": covid}).fetchone()
+    if row is None:
+        raise RuntimeError(f"covid {covid} not found")
+
+    removed = session.execute(
+        text("""
+            DELETE FROM parcel_covenant_exclusion
+            WHERE covid = :covid AND tract_no = :tract_no AND county_fips = :county_fips AND apn = ANY(:apns)
+        """),
+        {"covid": covid, "tract_no": tract_no, "county_fips": row.county_fips, "apns": apns},
+    ).rowcount
+    _write_covenant_note(
+        session, covid, f"EXCLUSION REVERSED (automated, tract {tract_no})",
+        f"EXCLUSION REVERSED (automated, tract {tract_no}): {reason} ({', '.join(apns)}). "
+        f"Re-run classify_metes_and_bounds_tract to bring them back through the real spatial test.",
+    )
+    return {"restored_count": removed}
 
 
 def _write_covenant_note(session, covid: int, tag: str, note: str, status: str | None = "needs_review") -> None:
@@ -569,6 +667,26 @@ def _deed_role_for(subdivision: str, deed_adjoiners: list[dict]) -> str | None:
                 return "derivation"
             role = "adjoining"
     return role
+
+
+def _detect_negligible_overlap_parcels(matched) -> list[dict]:
+    """Boundary parcels whose real intersection with the tract is below
+    _MIN_OVERLAP_AREA_M2 -- see that constant. Per-parcel and independent of
+    any subdivision grouping, which is the point: these are exactly the cases
+    the cluster check cannot reach.
+
+    Interior parcels are never considered -- fully contained means encumbered,
+    however small the parcel. A review flag, not an exclusion: removing a
+    parcel from the encumbered census stays a human decision through
+    exclude_non_tract_parcels, same as every other correction in this module."""
+    flagged = [
+        {"apn": m.apn, "overlap_m2": float(m.overlap_m2 or 0),
+         "overlap_fraction": float(m.overlap_fraction or 0),
+         "legal": m.recited_legal_description}
+        for m in matched
+        if not m.is_interior and m.overlap_m2 is not None and m.overlap_m2 < _MIN_OVERLAP_AREA_M2
+    ]
+    return sorted(flagged, key=lambda d: d["overlap_m2"])
 
 
 def _detect_sliver_subdivision_clusters(matched, deed_adjoiners: list[dict] | None = None) -> list[dict]:
@@ -668,6 +786,23 @@ def exclude_non_tract_parcels(session, covid: int, tract_no: int, apns: list[str
     if row is None:
         raise RuntimeError(f"covid {covid} not found")
     county_fips = row.county_fips
+
+    # Record the judgment FIRST, in a table that survives re-classification.
+    # Deleting the parcel_covenant rows alone is not enough: that census is
+    # rebuilt from geometry by both classify_metes_and_bounds_tract and
+    # monitor_tract_for_new_plats, so before migration 0034 every exclusion was
+    # one scheduled monitor run away from being silently undone (reproduced on
+    # covid 8245 -- see that migration's own docstring).
+    for apn in apns:
+        session.execute(
+            text("""
+                INSERT INTO parcel_covenant_exclusion (county_fips, apn, covid, tract_no, reason)
+                VALUES (:county_fips, :apn, :covid, :tract_no, :reason)
+                ON CONFLICT (county_fips, apn, covid, tract_no)
+                DO UPDATE SET reason = EXCLUDED.reason, excluded_at = now()
+            """),
+            {"county_fips": county_fips, "apn": apn, "covid": covid, "tract_no": tract_no, "reason": reason},
+        )
 
     deleted = session.execute(
         text("""

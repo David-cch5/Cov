@@ -602,16 +602,25 @@ def test_walk_chain_montgomery_8245() -> None:
     token, so declarant_sale still auto-classifies the first hop on both
     real parcels below).
 
-    6 matched parcels total, only 2 of which are the tract's real dominant
-    geometry (41116 at 99.1% overlap, 451910 at 94.4% -- see
-    scripts/test_classifier.py); the other 4 are negligible sliver
-    artifacts (<3% overlap, some exactly 0%) from the spatial join, walked
-    anyway since chain.py walks every row in parcel_covenant regardless of
-    overlap fraction -- two of those slivers happen to have their own real,
-    unrelated MCAD deed history (they're real neighboring parcels, just not
-    part of this covenant's actual encumbered acreage), and two have none
-    at all (chain stays empty, current_holder falls back to the covenant's
-    own declarant).
+    3 matched parcels, down from 6: an earlier version of this test asserted
+    all 6 and documented the other three as "negligible sliver artifacts
+    (<3% overlap, some exactly 0%) ... walked anyway since chain.py walks
+    every row in parcel_covenant regardless of overlap fraction". That was
+    an accurate description of the behaviour and the wrong conclusion --
+    those three (129590/129591/129592, Oak Ridge North 05 lots 527/528/529)
+    intersect this tract by 0.01-0.06 SQUARE METRES, and two of them had
+    accumulated real, non-exempt transfers that were staged to become fee
+    liabilities against homeowners whose land this covenant doesn't
+    encumber. classify_metes_and_bounds_tract now flags any sub-10 m2
+    overlap (_MIN_OVERLAP_AREA_M2) and they were removed via
+    scripts/fix_covid8245_negligible_overlap.py, which also superseded
+    their transfers.
+
+    What remains is the tract's real geometry: 41116 (99.1% overlap) and
+    451910 (94.4%), plus 363641 -- a genuine partial clip at only 2.8% but
+    ~431 m2 of real area, deliberately kept, and the reason the threshold is
+    an absolute area rather than a fraction. 363641 has no MCAD deed history
+    of its own, so its chain stays empty and falls back to the declarant.
 
     41116's own most recent deed (2026-03-27, to HENDAYA CAPITAL LLC) is
     real and correctly captured, but parcel.owner_name_raw (from MCAD's
@@ -624,14 +633,16 @@ def test_walk_chain_montgomery_8245() -> None:
 
         assert outer["walked"], outer
         assert outer["method"] == "mcad_deed_history", outer
-        assert outer["parcel_count"] == 6, outer
-
+        assert outer["parcel_count"] == 3, outer
         parcels = outer["parcels"]
-        for apn in ("451910", "129590", "129591"):
-            assert parcels[apn]["chain"], (apn, parcels[apn])
-            assert not parcels[apn]["ambiguous"], (apn, parcels[apn])
-            assert parcels[apn]["holder_matches_current_owner"] is True, (apn, parcels[apn])
-            assert parcels[apn]["gap_note"] is None, (apn, parcels[apn])
+        # the square-centimetre artifacts must be gone from the census entirely
+        for apn in ("129590", "129591", "129592"):
+            assert apn not in parcels, (apn, sorted(parcels))
+
+        assert parcels["451910"]["chain"], parcels["451910"]
+        assert not parcels["451910"]["ambiguous"], parcels["451910"]
+        assert parcels["451910"]["holder_matches_current_owner"] is True, parcels["451910"]
+        assert parcels["451910"]["gap_note"] is None, parcels["451910"]
 
         # 41116: a real chain, but MCAD's own ownership-roll feed lags its deed-recording
         # feed (see docstring) -- correctly flagged, not silently trusted.
@@ -645,13 +656,12 @@ def test_walk_chain_montgomery_8245() -> None:
         # 451910: fully resolved, first hop is the same declarant_sale from ANANTA PARTNERS.
         assert parcels["451910"]["chain"][0]["exemption_category"] == "declarant_sale", parcels["451910"]
 
-        # 129592/363641: no MCAD deed history of their own at all (real sliver artifacts,
-        # not part of this covenant's actual tract) -- empty chain, declarant fallback,
-        # correctly flagged as a mismatch rather than silently assumed resolved.
-        for apn in ("129592", "363641"):
-            assert not parcels[apn]["chain"], (apn, parcels[apn])
-            assert parcels[apn]["holder_matches_current_owner"] is False, (apn, parcels[apn])
-            assert parcels[apn]["gap_note"] is not None, (apn, parcels[apn])
+        # 363641: a genuine 2.8%/~431 m2 clip that is kept, but with no MCAD deed history
+        # of its own -- empty chain, declarant fallback, correctly flagged as a mismatch
+        # rather than silently assumed resolved.
+        assert not parcels["363641"]["chain"], parcels["363641"]
+        assert parcels["363641"]["holder_matches_current_owner"] is False, parcels["363641"]
+        assert parcels["363641"]["gap_note"] is not None, parcels["363641"]
 
         covenant = session.execute(
             text("SELECT status, review_reason FROM covenant WHERE covid = 8245"),
@@ -660,9 +670,9 @@ def test_walk_chain_montgomery_8245() -> None:
         assert "CHAIN-OF-TITLE GAP" in covenant.review_reason, covenant
 
     print(f"PASS: chain-of-title walk (Montgomery covid 8245, via {outer['method']}) -> "
-          f"6 parcels, both of the tract's real dominant parcels reach a resolved chain "
-          f"(one fully matching its current owner, one correctly flagged for a real "
-          f"ownership-roll lag)")
+          f"3 parcels (the 3 square-centimetre artifacts correctly gone from the census), "
+          f"both dominant parcels reach a resolved chain (one fully matching its current "
+          f"owner, one correctly flagged for a real ownership-roll lag)")
 
 
 def test_walk_chain_douglas_co_4123() -> None:

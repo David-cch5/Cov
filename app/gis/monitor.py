@@ -37,13 +37,13 @@ tract's bbox:
    (it is no longer a current lot), independent of whether its lineage was
    confidently resolved.
 """
-import re
 from datetime import date
 
 from sqlalchemy import text
 
 from app.db.repository import insert_source, upsert_parcel
-from app.gis.classifier import COUNTY_ADAPTERS
+from app.db.review_notes import merge_tagged_note
+from app.gis.classifier import COUNTY_ADAPTERS, excluded_apns
 from app.queue.job_queue import run_with_job_queue
 
 _VALID_RUN_TYPES = ("scheduled", "manual")
@@ -57,10 +57,12 @@ def _flag_for_review(session, covid: int, note: str) -> None:
     existing = session.execute(
         text("SELECT status, review_reason FROM covenant WHERE covid = :covid"), {"covid": covid},
     ).fetchone()
-    reason = existing.review_reason or ""
-    reason = re.sub(r";?\s*MONITOR-STAGE \(automated[^)]*\):.*$", "", reason).strip("; ").strip()
-    tagged = f"MONITOR-STAGE (automated, {date.today().isoformat()}): {note}"
-    reason = f"{reason}; {tagged}" if reason else tagged
+    # Was a greedy `.*$` -- deleted every note appended after this one. See
+    # app/db/review_notes.py for the full account of that bug class.
+    reason = merge_tagged_note(
+        existing.review_reason, "MONITOR-STAGE",
+        f"MONITOR-STAGE (automated, {date.today().isoformat()}): {note}",
+    )
     status = existing.status if existing.status in ("title_in_progress", "done") else "needs_review"
     session.execute(
         text("UPDATE covenant SET status = :status, review_reason = :reason, updated_at = now() WHERE covid = :covid"),
@@ -251,19 +253,35 @@ def monitor_tract_for_new_plats(session, covid: int, tract_no: int = 1, run_type
                 f"needs human review",
             )
 
+    # ST_MakeValid, matching classify_metes_and_bounds_tract: without it this
+    # query dies outright on a county's own invalid geometry -- confirmed real,
+    # monitoring covid 4440 raised "GEOS Error: TopologyException: Ring edge
+    # missing" and aborted the whole run. The repair was added to the classifier
+    # but not here, so periodic monitoring of that covenant simply crashed.
     matched = session.execute(
         text("""
+            WITH usable_parcels AS (
+                SELECT apn, CASE WHEN ST_IsValid(geom) THEN geom ELSE ST_MakeValid(geom) END AS geom
+                FROM parcel
+                WHERE county_fips = :county_fips AND apn = ANY(:apns)
+            )
             SELECT p.apn,
                    ST_Contains(t.geom, p.geom) AS is_interior,
                    ST_Area(ST_Intersection(t.geom, p.geom)::geography)
                        / NULLIF(ST_Area(p.geom::geography), 0) AS overlap_fraction
-            FROM parcel p, tract t
-            WHERE p.county_fips = :county_fips AND p.apn = ANY(:apns)
-              AND t.covid = :covid AND t.tract_no = :tract_no
-              AND ST_Intersects(t.geom, p.geom)
+            FROM usable_parcels p, tract t
+            WHERE t.covid = :covid AND t.tract_no = :tract_no
+              AND ST_IsValid(p.geom) AND ST_Intersects(t.geom, p.geom)
         """),
         {"county_fips": county_fips, "apns": [p["apn"] for p in new_candidates], "covid": covid, "tract_no": tract_no},
     ).fetchall() if new_candidates else []
+
+    # A parcel a human already ruled out of this tract is not a "new plat" --
+    # without this, every monitoring run resurrects every exclusion (migration
+    # 0034; reproduced on covid 8245, where one run brought back all three).
+    already_excluded = excluded_apns(session, covid, tract_no)
+    if already_excluded:
+        matched = [m for m in matched if m.apn not in already_excluded]
 
     # Only a parcel that's genuinely relevant to THIS tract (passed the true spatial test
     # above) AND was already on file before this re-check (e.g. matched to a different,

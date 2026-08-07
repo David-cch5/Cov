@@ -19,6 +19,7 @@ table for free.
 Usage: python3 scripts/test_classifier.py
 """
 import sys
+from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
@@ -414,6 +415,12 @@ def test_detect_sliver_subdivision_clusters_covid_8534() -> None:
     session = SessionLocal()
     try:
         session.execute(text(f"SET search_path TO {DB_SCHEMA}, public"))
+        # These 40 are now durably excluded (migration 0034), so classification
+        # correctly filters them out before the flag ever sees them -- which is
+        # the point of that table, but would leave this test asserting nothing.
+        # Drop the exclusions inside this rolled-back transaction to reproduce
+        # the pre-review state and confirm the DETECTION still fires.
+        session.execute(text("DELETE FROM parcel_covenant_exclusion WHERE covid = 8534 AND tract_no = 1"))
         result = classify_metes_and_bounds_tract(session, covid=8534, tract_no=1)
     finally:
         session.rollback()
@@ -437,6 +444,104 @@ def test_detect_sliver_subdivision_clusters_covid_8534() -> None:
           "corroborated; Hercules West, geometry-only) as possible_non_tract_subdivisions")
 
 
+def test_exclusion_is_durable_across_reclassification() -> None:
+    """Migration 0034. Before it, exclude_non_tract_parcels only DELETED
+    parcel_covenant rows, and both classify_metes_and_bounds_tract and
+    monitor_tract_for_new_plats rebuild that census from geometry -- so the
+    next run silently put every excluded parcel back. Reproduced on covid
+    8245: one monitoring pass resurrected all three square-centimetre
+    artifacts. That matters because parcel_covenant is what marks land as
+    encumbered, so a resurrected parcel is an owner put back on the hook for
+    a 1% fee.
+
+    Rolled back, so the real covid 8245 exclusions are left as they are."""
+    from app.gis.classifier import excluded_apns, restore_excluded_parcels
+
+    session = SessionLocal()
+    try:
+        session.execute(text(f"SET search_path TO {DB_SCHEMA}, public"))
+        artifacts = {"129590", "129591", "129592"}
+        assert artifacts <= excluded_apns(session, 8245, 1), excluded_apns(session, 8245, 1)
+
+        result = classify_metes_and_bounds_tract(session, covid=8245, tract_no=1)
+        assert result["matched_parcels"] == 3, result
+        back = {r.apn for r in session.execute(text(
+            "SELECT apn FROM parcel_covenant WHERE covid=8245 AND tract_no=1 AND apn = ANY(:a)"
+        ), {"a": sorted(artifacts)})}
+        assert not back, f"re-classification resurrected excluded parcels: {back}"
+
+        # ...and the deliberate un-exclude path really lets one back in.
+        restore_excluded_parcels(session, covid=8245, tract_no=1, apns=["129590"],
+                                 reason="test: confirming the reverse path works")
+        assert "129590" not in excluded_apns(session, 8245, 1)
+        assert {"129591", "129592"} <= excluded_apns(session, 8245, 1)
+        after = classify_metes_and_bounds_tract(session, covid=8245, tract_no=1)
+        assert after["matched_parcels"] == 4, after
+    finally:
+        session.rollback()
+        session.close()
+    print("PASS: parcel_covenant_exclusion -> a reviewed exclusion survives re-classification "
+          "(covid 8245 stays at 3 parcels, not 6), and restore_excluded_parcels genuinely "
+          "reverses one")
+
+
+def test_detect_negligible_overlap_parcels() -> None:
+    """A parcel's overlap FRACTION alone cannot separate a real narrow clip
+    from a digitization touch -- a 2% clip off a 100-acre parcel is ~3,200 m2
+    of genuinely encumbered land, while a suburban lot crossing the boundary by
+    0.05 m2 is noise. Only the absolute area distinguishes them, so that is
+    what this check uses. Interior parcels are never flagged, however small."""
+    from app.gis.classifier import _MIN_OVERLAP_AREA_M2, _detect_negligible_overlap_parcels
+
+    matched = [
+        # real narrow clip off a large parcel: tiny fraction, but acres of land
+        SimpleNamespace(apn="BIG", recited_legal_description="A0008 CORNER JOHN, TR 3G",
+                        is_interior=False, overlap_fraction=0.02, overlap_m2=3200.0),
+        # digitization touches
+        SimpleNamespace(apn="TOUCH1", recited_legal_description="OAK RIDGE NORTH 05, LOT 529",
+                        is_interior=False, overlap_fraction=0.000006, overlap_m2=0.0104),
+        SimpleNamespace(apn="TOUCH2", recited_legal_description=None,
+                        is_interior=False, overlap_fraction=0.00004, overlap_m2=0.0639),
+        # a genuinely tiny parcel fully inside the tract -- encumbered, never flagged
+        SimpleNamespace(apn="TINY_INSIDE", recited_legal_description="X ADDN, LOT 1",
+                        is_interior=True, overlap_fraction=1.0, overlap_m2=5.0),
+    ]
+    got = {n["apn"] for n in _detect_negligible_overlap_parcels(matched)}
+    assert got == {"TOUCH1", "TOUCH2"}, got
+    # sorted smallest-first, so the most clear-cut artifact reads first
+    assert _detect_negligible_overlap_parcels(matched)[0]["apn"] == "TOUCH1"
+    assert _MIN_OVERLAP_AREA_M2 == 10.0
+    print("PASS: _detect_negligible_overlap_parcels -> flags sub-10 m2 boundary touches (including "
+          "one with no legal description, which the subdivision-cluster check cannot group), keeps a "
+          "small-fraction/large-area real clip, and never flags an interior parcel")
+
+
+def test_negligible_overlap_live_covid_8245() -> None:
+    """covid 8245 tract 1, the case that motivated this check: 3 of its 6
+    matched parcels intersect by 0.01-0.06 m2 -- square centimetres. All are
+    private homeowners who were recorded as subject to a 1% transfer-fee
+    covenant. The subdivision-cluster check could not reach them."""
+    session = SessionLocal()
+    try:
+        session.execute(text(f"SET search_path TO {DB_SCHEMA}, public"))
+        # Same reason as the sliver-cluster test above: these three are now
+        # durably excluded, so classification filters them before the flag sees
+        # them. Drop the exclusions inside this rolled-back transaction to
+        # reproduce the pre-review state and confirm DETECTION still works --
+        # test_exclusion_is_durable_across_reclassification covers the other
+        # half (that they stay out once reviewed).
+        session.execute(text("DELETE FROM parcel_covenant_exclusion WHERE covid = 8245 AND tract_no = 1"))
+        result = classify_metes_and_bounds_tract(session, covid=8245, tract_no=1)
+    finally:
+        session.rollback()
+        session.close()
+    neg = {n["apn"]: n["overlap_m2"] for n in result["negligible_overlap_parcels"]}
+    assert set(neg) == {"129590", "129591", "129592"}, neg
+    assert all(v < 0.1 for v in neg.values()), neg
+    print(f"PASS: classify_metes_and_bounds_tract (live, covid 8245 tract 1) -> flags all 3 "
+          f"square-centimetre touches as negligible_overlap_parcels ({neg})")
+
+
 if __name__ == "__main__":
     test_classify_wrong_boundary_method_raises()
     test_resolve_subdivision_plat_tract_per_tract_reference()
@@ -447,4 +552,7 @@ if __name__ == "__main__":
     test_persisted_montgomery_4440_real_classification()
     test_exclude_non_tract_parcels_covid_4440()
     test_detect_sliver_subdivision_clusters_covid_8534()
+    test_exclusion_is_durable_across_reclassification()
+    test_detect_negligible_overlap_parcels()
+    test_negligible_overlap_live_covid_8245()
     print("\nall classifier smoke tests passed")
