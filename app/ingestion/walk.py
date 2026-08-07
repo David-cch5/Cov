@@ -185,3 +185,32 @@ def iter_candidates(session, covids: list[str]):
             ocr=ocr_flag, vocab_score=vocab_score,
             needs_review=bool(reasons), review_reason="; ".join(all_notes) if all_notes else None,
         )
+
+
+def get_deed_text(session, covid: int, legal_description_raw: str | None = None) -> str:
+    """The full OCR'd text of a covenant's own recorded document, preferred over
+    covenant.legal_description_raw wherever the deed's actual field notes matter
+    -- confirmed real and necessary on covid 4781, whose legal_description_raw is
+    an ingestion-time SUMMARY literally containing the placeholder "[metes and
+    bounds courses follow]" instead of the deed's own real courses (which do
+    exist, complete, in the full textcache text). Falls back to
+    legal_description_raw only when no cached document text is available.
+
+    Lives here rather than in either caller because both app/gis/anchor_resolver.py
+    (course extraction) and app/gis/classifier.py (adjoining-subdivision
+    detection) need it, and anchor_resolver already imports classifier -- putting
+    it in either one would be a circular import. This module already owns
+    TEXTCACHE and imports nothing from app.gis.
+    """
+    doc = session.execute(
+        text("SELECT relpath FROM covenant_document WHERE covid = :covid AND doc_type = 'original'"),
+        {"covid": covid},
+    ).fetchone()
+    if doc and doc.relpath:
+        cache_path = os.path.join(TEXTCACHE, f"{covid}_{os.path.basename(doc.relpath)}.json")
+        if os.path.exists(cache_path):
+            with open(cache_path) as f:
+                full_text = json.load(f).get("text")
+            if full_text:
+                return full_text
+    return legal_description_raw or ""

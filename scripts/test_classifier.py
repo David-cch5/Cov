@@ -399,6 +399,44 @@ def test_exclude_non_tract_parcels_covid_4440() -> None:
           "a confirmed MUD-tied director-lot cluster correctly kept throughout")
 
 
+def test_detect_sliver_subdivision_clusters_covid_8534() -> None:
+    """Confirmed real (covid 8534 tract 1, Denton County, 2026-08-06): 40
+    boundary-classified parcels from two subdivisions the deed never
+    describes as part of this tract (Forman Williamsburg Square -- the
+    deed's own Exhibit A names it only as adjoining, tying the NW corner
+    to its south line -- and Hercules West Addition, never named at all)
+    showed a uniformly low overlap_fraction (10.9%-26.4% and 6.2%-48.9%),
+    cleanly separated from Sherman Crossing's own genuinely-platted-from-
+    this-tract parcels (87.0%-97.3%). classify_metes_and_bounds_tract must
+    surface both clusters as possible_non_tract_subdivisions -- a review
+    flag, not a silent auto-exclusion (that judgment call stays with
+    exclude_non_tract_parcels)."""
+    session = SessionLocal()
+    try:
+        session.execute(text(f"SET search_path TO {DB_SCHEMA}, public"))
+        result = classify_metes_and_bounds_tract(session, covid=8534, tract_no=1)
+    finally:
+        session.rollback()
+        session.close()
+    groups = {g["subdivision"]: g for g in result["possible_non_tract_subdivisions"]}
+    # Keys carry a trailing generic descriptor stripped ("HERCULES WEST ADDITION"
+    # -> "HERCULES WEST"), so one real subdivision the CAD spells both ways
+    # groups once -- see _GENERIC_DESCRIPTOR_RE.
+    assert "FORMAN WILLIAMSBURG SQUARE" in groups, result["possible_non_tract_subdivisions"]
+    assert len(groups["FORMAN WILLIAMSBURG SQUARE"]["apns"]) == 15, groups["FORMAN WILLIAMSBURG SQUARE"]
+    assert "HERCULES WEST" in groups, result["possible_non_tract_subdivisions"]
+    assert len(groups["HERCULES WEST"]["apns"]) == 25, groups["HERCULES WEST"]
+    for g in groups.values():
+        assert g["max_overlap"] < 0.5, g
+    # The deed names Forman Williamsburg Square and not Hercules West, so only
+    # the first gets textual corroboration.
+    assert groups["FORMAN WILLIAMSBURG SQUARE"]["evidence"] == "deed_names_as_adjoining", groups
+    assert groups["HERCULES WEST"]["evidence"] == "geometry_only", groups
+    print("PASS: classify_metes_and_bounds_tract (live, covid 8534 tract 1) -> flags both "
+          "real sliver-overlap subdivision clusters (Forman Williamsburg Square, deed-"
+          "corroborated; Hercules West, geometry-only) as possible_non_tract_subdivisions")
+
+
 if __name__ == "__main__":
     test_classify_wrong_boundary_method_raises()
     test_resolve_subdivision_plat_tract_per_tract_reference()
@@ -408,4 +446,5 @@ if __name__ == "__main__":
     test_persisted_montgomery_8245_real_classification()
     test_persisted_montgomery_4440_real_classification()
     test_exclude_non_tract_parcels_covid_4440()
+    test_detect_sliver_subdivision_clusters_covid_8534()
     print("\nall classifier smoke tests passed")

@@ -15,6 +15,25 @@ lineage intact, and monitor remaining raw acreage for new plats.
   written go-ahead. The full run is gated on the measured deed fetch/read cost and recorder
   per-document fees from the probe.
 
+## READ THE FULL LEGAL TEXT FIRST (default, not a fallback)
+Before any GIS trial-and-error, name-based parcel search, or LLM escalation on a new covenant,
+read the deed's **entire** legal description — Exhibit A included — end to end. It routinely
+states the answer outright, and skipping it has been the single most expensive recurring mistake
+in this project:
+- **covid 8534**: two LLM escalations (~$45–50) and two recorder-portal chain-of-title searches
+  all failed to anchor the tract. The POB call named the answer plainly — "on the Westerly
+  right-of-way line of F.M Highway 428 (Sherman Drive) and in or near the centerline of Hercules
+  Drive" — a street intersection anyone can find. Note the deed's own internal inconsistency
+  there ("Hercules Drive" once, "Hercules Lane" everywhere after): expect typos and treat a
+  near-miss name as the same feature until GIS proves otherwise.
+- The same text also names the **adjoining** subdivisions that must NOT be counted as encumbered
+  land (see `app/parsing/legal_description/adjoiners.py`, now automated) — and, critically,
+  the ones the tract was platted INTO, which must be.
+
+Practical order for a new covenant: full text → named features (roads, plat corners, adjoiners,
+monuments) → deterministic anchoring against those → only then LLM escalation. Escalating first
+is both slower and far more expensive.
+
 ## Non-negotiables
 - **Accuracy over completeness.** Every covenant passes a reconciliation check before it is
   considered done: classified acreage must reconcile with the covenant's stated acreage, and
@@ -25,6 +44,15 @@ lineage intact, and monitor remaining raw acreage for new plats.
   metes-and-bounds — georeferenced POB + COGO traverse, tied to authoritative plat/parcel
   geometry — NEVER a bounding-box approximation. If the POB can't be georeferenced with
   confidence, send it to human review rather than approximating.
+- **Always test the boundary parcels — never report a raw match count.** A spatial hit is not
+  proof of encumbrance. Every parcel classified `boundary` (not fully interior) must be checked
+  against the deed's own text before it counts: a neighbouring subdivision's platted lots clip
+  the tract polygon at ordinary digitization tolerance and will silently inflate the parcel
+  count. `classify_metes_and_bounds_tract` now auto-flags the signature (a whole subdivision
+  whose members are ALL low-overlap) as `possible_non_tract_subdivisions`, with the deed's own
+  text as corroboration or veto — but the exclusion itself stays a human call via
+  `exclude_non_tract_parcels`. Confirmed real on covid 8534 tract 1: 254 matched parcels were
+  actually 214, with 40 belonging to two subdivisions the deed never conveys.
 - **Never fabricate title data.** Low-confidence OCR or a broken grantor→grantee link goes to
   the human-review queue, never a guessed value.
 - **Provenance on every datum:** source, retrieval timestamp, read-vs-estimated flag, confidence.

@@ -21,15 +21,15 @@ recomputation and a real live-parcel dry run, never the model's own
 self-reported confidence number alone).
 """
 import json
-import os
 import re
 
 from sqlalchemy import text
 
 from app.config import LLM_MODEL_HARD, LLM_MODEL_HARDEST
 from app.db.repository import insert_source
+from app.db.review_notes import merge_tagged_note
 from app.gis.classifier import COUNTY_ADAPTERS, classify_metes_and_bounds_tract
-from app.ingestion.walk import TEXTCACHE
+from app.ingestion.walk import get_deed_text
 from app.gis.geocode_anchor import resolve_metes_bounds_approximate
 from app.gis.state_plane_anchor import EPSG_BY_TX_ZONE, traverse_to_geojson_state_plane
 from app.llm.anchor_agent import escalate_anchor_to_llm
@@ -228,25 +228,11 @@ def _attempt_and_verify(session, covid: int, tract_no: int, county_fips: str, ca
 
 
 def _get_deed_text(session, covid: int, legal_description_raw: str | None) -> str:
-    """Prefer the full OCR'd document text over covenant.legal_description_raw
-    for course extraction -- confirmed real and necessary on covid 4781:
-    legal_description_raw there is an ingestion-time SUMMARY that literally
-    contains the placeholder text "[metes and bounds courses follow]" instead
-    of the deed's own real field notes (which do exist, complete, with 8 real
-    THENCE calls including a curve, in the full textcache text). Falls back
-    to legal_description_raw only when no cached document text is available."""
-    doc = session.execute(
-        text("SELECT relpath FROM covenant_document WHERE covid = :covid AND doc_type = 'original'"),
-        {"covid": covid},
-    ).fetchone()
-    if doc and doc.relpath:
-        cache_path = os.path.join(TEXTCACHE, f"{covid}_{os.path.basename(doc.relpath)}.json")
-        if os.path.exists(cache_path):
-            with open(cache_path) as f:
-                full_text = json.load(f).get("text")
-            if full_text:
-                return full_text
-    return legal_description_raw or ""
+    """Thin alias kept so this module's own call sites read unchanged -- the
+    implementation moved to app/ingestion/walk.py once classifier.py needed the
+    same full-document text (for adjoining-subdivision detection) and couldn't
+    import it from here without a cycle."""
+    return get_deed_text(session, covid, legal_description_raw)
 
 
 def resolve_metes_and_bounds_anchor(session, covid: int, tract_no: int = 1) -> dict:
@@ -388,11 +374,10 @@ def resolve_metes_and_bounds_anchor(session, covid: int, tract_no: int = 1) -> d
         # `[^;]*?` (non-greedy) lets each occurrence match up to WHICHEVER of
         # the two valid endings comes first, so re.sub's own default global
         # replacement correctly strips every stacked copy, not just the last.
-        stale_note_re = re.compile(
-            r";?\s*ANCHOR ESCALATION EXHAUSTED \(automated\)[^;]*?(?:tie point\.|cache-read\.)",
-            re.IGNORECASE,
-        )
-        cleaned = stale_note_re.sub("", existing).strip("; ").strip()
+        # merge_tagged_note replaces this note however its body happens to end,
+        # so the old two-alternative ending pattern (and its stacking bug) is
+        # no longer load-bearing.
+        cleaned = merge_tagged_note(existing, "ANCHOR ESCALATION EXHAUSTED")
         new_note = (
             "ANCHOR ESCALATION EXHAUSTED (automated): deterministic techniques, Opus 5, and "
             "Fable 5 all failed to produce even a rough candidate position for this tract's "

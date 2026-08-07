@@ -93,6 +93,7 @@ from datetime import date, datetime, timezone
 from sqlalchemy import text
 
 from app.db.repository import insert_source, upsert_contact, upsert_transfer
+from app.db.review_notes import merge_tagged_note
 from app.queue.job_queue import run_with_job_queue
 from app.recorder.adapters import publicsearch
 from app.recorder.session import recorder_context
@@ -643,10 +644,6 @@ def _update_covenant_gap_notes(session, covid: int, results: dict) -> None:
     existing = session.execute(
         text("SELECT status, review_reason FROM covenant WHERE covid = :covid"), {"covid": covid},
     ).fetchone()
-    reason = existing.review_reason or ""
-    # matches to end-of-string, not the next ";" -- a gap note's own text can
-    # itself contain a semicolon, and this note is always appended last.
-    reason = re.sub(r";?\s*CHAIN-OF-TITLE GAP \(automated[^)]*\):.*$", "", reason).strip("; ").strip()
     details = [f"{apn}: {note}" for apn, note in gapped.items()]
     for apn, ambiguous in unresolved.items():
         doc_types = sorted({
@@ -656,9 +653,13 @@ def _update_covenant_gap_notes(session, covid: int, results: dict) -> None:
             f"{apn}: no confirmed Transfer of Title found -- {len(ambiguous)} ambiguous candidate "
             f"document(s) ({', '.join(doc_types) if doc_types else 'unclassified'}) need manual review"
         )
-    if details:
-        note = f"CHAIN-OF-TITLE GAP (automated, {date.today().isoformat()}): " + "; ".join(details)
-        reason = f"{reason}; {note}" if reason else note
+    # The old hand-rolled strip here matched to end-of-string on the assumption
+    # that "this note is always appended last" -- no longer true, and destructive:
+    # covid 4780 really carries GEOMETRY DATA QUALITY, ANCHOR RESOLVED (manual)
+    # and RECONCILIATION-STAGE after this note, and a re-walk deleted all three.
+    # " | " between details for the same reason review_notes.py documents.
+    note = (f"CHAIN-OF-TITLE GAP (automated, {date.today().isoformat()}): " + " | ".join(details)) if details else None
+    reason = merge_tagged_note(existing.review_reason, "CHAIN-OF-TITLE GAP", note)
 
     _DO_NOT_REGRESS = {"title_in_progress", "done"}
     status = existing.status if existing.status in _DO_NOT_REGRESS else (

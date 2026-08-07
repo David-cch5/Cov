@@ -15,6 +15,7 @@ from sqlalchemy import text
 
 sys.path.insert(0, ".")
 
+from app.db.review_notes import merge_tagged_note
 from app.db.session import get_session
 from app.ingestion.ocr_escalation import (
     MAX_PAGES_WITHOUT_APPROVAL, VOCAB_SCORE_THRESHOLD, escalate_to_vision_ocr,
@@ -44,12 +45,11 @@ def _merge_ingestion_note(existing_reason: str | None, ingestion_note: str | Non
     touches other stages' notes" pattern as app/title/chain.py's
     _update_covenant_gap_notes: only ingestion's own tagged section gets
     replaced here, whatever else is in review_reason is left untouched."""
-    reason = existing_reason or ""
-    reason = re.sub(r";?\s*INGESTION-STAGE \(automated[^)]*\):.*$", "", reason).strip("; ").strip()
-    if ingestion_note:
-        note = f"INGESTION-STAGE (automated, {date.today().isoformat()}): {ingestion_note}"
-        reason = f"{reason}; {note}" if reason else note
-    return reason
+    note = (f"INGESTION-STAGE (automated, {date.today().isoformat()}): {ingestion_note}"
+            if ingestion_note else None)
+    # Was a greedy `.*$`, which deleted every note appended after this one --
+    # see app/db/review_notes.py.
+    return merge_tagged_note(existing_reason, "INGESTION-STAGE", note)
 
 _OCR_CONFIDENCE_REASON_PREFIXES = ("no OCR vocab score computed", "low OCR vocab score")
 

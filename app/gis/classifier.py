@@ -13,10 +13,13 @@ import re
 from sqlalchemy import text
 
 from app.db.repository import insert_source, upsert_parcel
+from app.db.review_notes import merge_tagged_note
 from app.gis.adapters import (
     bexar_tx, collin_tx, dallas_tx, denton_tx, douglas_co, harris_tx, hunt_tx, kerr_tx, llano_tx,
     montgomery_tx, nueces_tx, tarrant_tx, travis_tx,
 )
+from app.ingestion.walk import get_deed_text
+from app.parsing.legal_description.adjoiners import extract_adjoining_subdivisions
 from app.parsing.legal_description.subdivision_plat import parse_subdivision_reference
 from app.queue.job_queue import run_with_job_queue
 
@@ -312,12 +315,13 @@ def classify_metes_and_bounds_tract(session, covid: int, tract_no: int = 1) -> d
     matched = session.execute(
         text("""
             WITH usable_parcels AS (
-                SELECT apn, CASE WHEN ST_IsValid(geom) THEN geom ELSE ST_MakeValid(geom) END AS geom
+                SELECT apn, recited_legal_description,
+                       CASE WHEN ST_IsValid(geom) THEN geom ELSE ST_MakeValid(geom) END AS geom
                 FROM parcel
                 WHERE county_fips = :county_fips AND apn = ANY(:apns)
                   AND (ST_IsValid(geom) OR apn = ANY(:repairable_apns))
             )
-            SELECT p.apn,
+            SELECT p.apn, p.recited_legal_description,
                    ST_Contains(t.geom, p.geom) AS is_interior,
                    ST_Area(ST_Intersection(t.geom, p.geom)::geography)
                        / NULLIF(ST_Area(p.geom::geography), 0) AS overlap_fraction,
@@ -411,20 +415,46 @@ def classify_metes_and_bounds_tract(session, covid: int, tract_no: int = 1) -> d
     )
 
     if invalid_geometry_apns:
+        _write_covenant_note(
+            session, covid, "GEOMETRY DATA QUALITY",
+            f"GEOMETRY DATA QUALITY (automated): {len(invalid_geometry_apns)} parcel(s) in this tract's "
+            f"bounding box have invalid geometry in the county's own GIS service ({', '.join(invalid_geometry_apns)}) "
+            f"-- excluded from spatial classification rather than guessed at, needs manual review to confirm "
+            f"whether any of them actually fall inside this covenant's tract",
+        )
+
+    deed_text = get_deed_text(
+        session, covid,
         session.execute(
-            text("""
-                UPDATE covenant SET status = 'needs_review', review_reason =
-                    CASE WHEN review_reason IS NULL OR review_reason = '' THEN :note
-                         ELSE review_reason || '; ' || :note END,
-                    updated_at = now()
-                WHERE covid = :covid
-            """),
-            {"covid": covid, "note": (
-                f"GEOMETRY DATA QUALITY (automated): {len(invalid_geometry_apns)} parcel(s) in this tract's "
-                f"bounding box have invalid geometry in the county's own GIS service ({', '.join(invalid_geometry_apns)}) "
-                f"-- excluded from spatial classification rather than guessed at; needs manual review to confirm "
-                f"whether any of them actually fall inside this covenant's tract"
-            )},
+            text("SELECT legal_description_raw FROM covenant WHERE covid = :covid"), {"covid": covid},
+        ).scalar(),
+    )
+    sliver_groups = _detect_sliver_subdivision_clusters(
+        matched, extract_adjoining_subdivisions(deed_text),
+    )
+    if sliver_groups:
+        # " | ", never "; " -- a semicolon followed by these upper-case
+        # subdivision names and their parenthesised detail is byte-identical to
+        # a note boundary, and split this very note in half. See
+        # app/db/review_notes.py's own note-author constraint.
+        apns_note = " | ".join(
+            f"{g['subdivision']} ({len(g['apns'])} parcels, overlap {g['min_overlap']:.0%}-{g['max_overlap']:.0%}, "
+            f"evidence={g['evidence']}: {', '.join(g['apns'])})" for g in sliver_groups
+        )
+        _write_covenant_note(
+            session, covid, "POSSIBLE NON-TRACT SUBDIVISION", (
+                f"POSSIBLE NON-TRACT SUBDIVISION (automated): {len(sliver_groups)} boundary-classified "
+                f"subdivision(s) show a uniformly low, tightly-clustered overlap fraction with no member "
+                f"above {_SLIVER_OVERLAP_MAX_FRACTION:.0%} -- the signature of a nearby/adjoining platted "
+                f"subdivision whose own recorded lot lines just barely clip this tract's polygon at normal "
+                f"survey/digitization tolerance, not genuine partial encumbrance (confirmed real on covid "
+                f"8534 tract 1: Forman Williamsburg Square, a subdivision the deed's own Exhibit A names as "
+                f"adjoining -- not part of -- this tract). evidence=deed_names_as_adjoining means the deed's "
+                f"own text independently corroborates it (geometry AND text agree); evidence=geometry_only "
+                f"means the deed never names it, so the sliver pattern is the only signal. Any subdivision "
+                f"the deed DERIVES this tract from is never listed here. Still needs a human check against "
+                f"the deed before calling exclude_non_tract_parcels(): {apns_note}"
+            ),
         )
 
     return {
@@ -435,7 +465,164 @@ def classify_metes_and_bounds_tract(session, covid: int, tract_no: int = 1) -> d
         "run_seq": run_seq,
         "invalid_geometry_apns": invalid_geometry_apns,
         "repaired_geometry_apns": repairable_apns,
+        "possible_non_tract_subdivisions": sliver_groups,
     }
+
+
+# Deliberately NOT app.gis.plat_parser.parse_plat_reference -- that function's own
+# subdivision_name is tuned for exact plat-lookup identity (Montgomery/Collin's own
+# recorder-index naming conventions) and doesn't cleanly separate a phase/block suffix
+# from every county's format (e.g. Denton's "FORMAN WILLIAMSBURG SQUARE PH II BLK A LOT
+# 22" -- confirmed via direct testing). This only needs a rough, stable grouping key for
+# the anomaly check below, not a canonical subdivision identity.
+_SUBDIVISION_SUFFIX_RE = re.compile(r"\s+(?:PHASE|PH|BLK|BLOCK|LOT|LT)\b", re.IGNORECASE)
+
+# A county writes the same real subdivision both with and without a generic
+# descriptor -- Denton CAD has "SHERMAN CROSSING ADDITION BLK A LOT 5R" and
+# "SHERMAN CROSSING PHASE 2B BLK B LOT 1" for one subdivision. Left in, those
+# become two group keys, which both risks a spurious flag on one half and, worse,
+# can drop each half below the >=2-member threshold so a genuine adjoiner is
+# never flagged at all -- a silent miss, the failure mode that costs a human the
+# manual catch.
+#
+# Exactly ONE trailing descriptor is removed, and only when enough name survives
+# it: stripping repeatedly turns "OAK ADDITION ESTATES" into a useless "OAK",
+# which both over-merges genuinely distinct subdivisions and falls below the
+# deed-matching floor (_MIN_NAME_MATCH_CHARS), silently disabling the veto.
+_GENERIC_DESCRIPTOR_RE = re.compile(
+    r"\s+(?:ADDITION|ADDN|SUBDIVISION|SUBD|ESTATES?|SEC|SECTION|UNIT)\s*$", re.IGNORECASE,
+)
+_MIN_GROUP_KEY_CHARS = 6
+
+# Confirmed real (covid 8534 tract 1, Denton County): a genuine boundary-straddling
+# parcel can land anywhere from near-0% to near-100% overlap depending on exactly where
+# the historical dividing line fell -- but a sliver-overlap ARTIFACT from a nearby,
+# unrelated subdivision's platted edge just barely clipping this tract's own polygon
+# never produces a large overlap, because the true encumbered portion is negligible.
+# Forman Williamsburg Square (15 parcels, 10.9%-26.4% overlap) and Hercules West
+# Addition (25 parcels, 6.2%-48.9% overlap) both cleanly separated below this threshold
+# from Sherman Crossing's own genuinely-platted-from-this-tract parcels (87.0%-97.3%).
+_SLIVER_OVERLAP_MAX_FRACTION = 0.5
+
+
+def _sliver_group_key(recited_legal_description: str | None) -> str | None:
+    if not recited_legal_description:
+        return None
+    key = _SUBDIVISION_SUFFIX_RE.split(recited_legal_description.strip(), maxsplit=1)[0].strip().upper()
+    stripped = _GENERIC_DESCRIPTOR_RE.sub("", key, count=1).strip()
+    if len(stripped) >= _MIN_GROUP_KEY_CHARS:
+        key = stripped
+    return key or None
+
+
+def _write_covenant_note(session, covid: int, tag: str, note: str, status: str | None = "needs_review") -> None:
+    """Strip-then-replace this stage's own tagged note (never another stage's)
+    and flag the covenant. Previously both of this module's notes were appended
+    unconditionally, so every re-classification -- which happens on each monitor
+    cycle -- stacked another identical copy in review_reason. Pass status=None
+    to leave covenant.status alone."""
+    existing = session.execute(
+        text("SELECT status, review_reason FROM covenant WHERE covid = :covid"), {"covid": covid},
+    ).fetchone()
+    merged = merge_tagged_note(existing.review_reason if existing else None, tag, note)
+    if status is None:
+        session.execute(
+            text("UPDATE covenant SET review_reason = :reason, updated_at = now() WHERE covid = :covid"),
+            {"reason": merged, "covid": covid},
+        )
+        return
+    # Never regress a covenant that has already moved past this stage.
+    new_status = existing.status if existing and existing.status in ("title_in_progress", "done") else status
+    session.execute(
+        text("UPDATE covenant SET status = :status, review_reason = :reason, updated_at = now() "
+             "WHERE covid = :covid"),
+        {"status": new_status, "reason": merged, "covid": covid},
+    )
+
+
+def _squash(name: str) -> str:
+    """Alphanumerics only, so 'GULF SIDE ESTATES SUBDIVISION' (deed) and
+    'GULFSIDE ESTATES' (the CAD's own spelling of the same real subdivision --
+    both confirmed real on covid 5838) compare equal by containment. A leading
+    'THE' is dropped for the same reason ('THE HEIGHTS AT WESTRIDGE' vs the
+    deed's own 'Heights At Westridge Phase II', covid 4981)."""
+    squashed = re.sub(r"[^A-Z0-9]", "", name.upper())
+    return squashed[3:] if squashed.startswith("THE") else squashed
+
+
+# Below this, a containment match between two squashed names is coincidence
+# rather than evidence (e.g. a 4-character name inside a long one).
+_MIN_NAME_MATCH_CHARS = 8
+
+
+def _deed_role_for(subdivision: str, deed_adjoiners: list[dict]) -> str | None:
+    """'adjoining', 'derivation', or None if the deed never names this
+    subdivision. A derivation match anywhere wins -- see adjoiners.py."""
+    key = _squash(subdivision)
+    role = None
+    for entry in deed_adjoiners:
+        other = _squash(entry["subdivision"])
+        if len(key) < _MIN_NAME_MATCH_CHARS or len(other) < _MIN_NAME_MATCH_CHARS:
+            continue
+        if key in other or other in key:
+            if entry["role"] == "derivation":
+                return "derivation"
+            role = "adjoining"
+    return role
+
+
+def _detect_sliver_subdivision_clusters(matched, deed_adjoiners: list[dict] | None = None) -> list[dict]:
+    """Groups boundary (non-interior) parcels by a rough subdivision-name key and
+    flags any group of >=2 parcels whose overlap_fraction is uniformly below
+    _SLIVER_OVERLAP_MAX_FRACTION -- see that constant's own comment. A single
+    low-overlap parcel is left alone (a lone genuine partial-lot split is plausible;
+    a whole block of them sharing one nearby subdivision's name is not) -- this is a
+    review flag, never an automatic exclusion (that judgment call stays with
+    exclude_non_tract_parcels, per its own docstring).
+
+    `deed_adjoiners` (from app/parsing/legal_description/adjoiners.py) turns the
+    purely-geometric flag into a two-signal one, and more importantly supplies a
+    VETO. Each flagged group carries an `evidence` field:
+      - 'deed_names_as_adjoining' -- the deed itself only ever ties a boundary to
+        this subdivision, never conveys it (covid 8534's Forman Williamsburg
+        Square). Geometry AND text agree: strong.
+      - 'geometry_only' -- the deed never names it at all, so the sliver pattern
+        is the only evidence (covid 8534's Hercules West Addition, platted long
+        after the covenant). Real, but weaker -- still needs the human check.
+    A group the deed DERIVES the tract from is dropped from the flag list
+    entirely rather than reported weakly: on covid 4781 the tract was itself
+    platted into Watermark Section One, and on covid 5838 the tract IS a lot in
+    Gulfside Estates -- suggesting either for exclusion would drop genuinely
+    encumbered land, the one error CLAUDE.md's accuracy-over-completeness rule
+    is most concerned with."""
+    deed_adjoiners = deed_adjoiners or []
+    groups: dict[str, list] = {}
+    for m in matched:
+        if m.is_interior:
+            continue
+        key = _sliver_group_key(m.recited_legal_description)
+        if key is None:
+            continue
+        groups.setdefault(key, []).append(m)
+
+    flagged = []
+    for key, members in groups.items():
+        if len(members) < 2:
+            continue
+        fractions = [float(m.overlap_fraction or 0) for m in members]
+        if max(fractions) >= _SLIVER_OVERLAP_MAX_FRACTION:
+            continue
+        role = _deed_role_for(key, deed_adjoiners)
+        if role == "derivation":
+            continue
+        flagged.append({
+            "subdivision": key,
+            "apns": [m.apn for m in members],
+            "min_overlap": min(fractions),
+            "max_overlap": max(fractions),
+            "evidence": "deed_names_as_adjoining" if role == "adjoining" else "geometry_only",
+        })
+    return flagged
 
 
 def exclude_non_tract_parcels(session, covid: int, tract_no: int, apns: list[str], reason: str) -> dict:
@@ -515,17 +702,11 @@ def exclude_non_tract_parcels(session, covid: int, tract_no: int, apns: list[str
             {"covid": covid, "tract_no": tract_no, "run_seq": run_seq},
         )
 
-    existing = session.execute(text("SELECT status, review_reason FROM covenant WHERE covid = :covid"), {"covid": covid}).fetchone()
+    # Fully-qualified tag, so tract 1's and tract 2's exclusion notes coexist
+    # (covid 4440 really carries both) -- a bare tag would delete the sibling
+    # tract's note when writing this one.
     tag = f"NON-TRACT PARCEL EXCLUSION (automated, tract {tract_no})"
-    prior = re.sub(rf";?\s*{re.escape(tag)}:.*?(?=;\s*[A-Z][A-Z0-9 -]*\(automated|$)", "",
-                   existing.review_reason or "", flags=re.DOTALL).strip("; ").strip()
-    note = f"{tag}: {reason} ({', '.join(apns)})"
-    new_reason = f"{prior}; {note}" if prior else note
-    status = existing.status if existing.status in ("title_in_progress", "done") else "needs_review"
-    session.execute(
-        text("UPDATE covenant SET status = :status, review_reason = :reason, updated_at = now() WHERE covid = :covid"),
-        {"status": status, "reason": new_reason, "covid": covid},
-    )
+    _write_covenant_note(session, covid, tag, f"{tag}: {reason} ({', '.join(apns)})")
 
     tract_row = session.execute(
         text("SELECT classified_acreage FROM tract WHERE covid = :covid AND tract_no = :tract_no"),

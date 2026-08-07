@@ -19,6 +19,8 @@ import sys
 
 sys.path.insert(0, ".")
 
+from sqlalchemy import text
+
 from app.db.session import get_session
 from app.gis.reconcile import RECONCILIATION_TOLERANCE_ACRES, reconcile_covenant, reconcile_tract
 
@@ -139,6 +141,59 @@ def test_reconcile_covenant_advances_status_when_fully_clean() -> None:
           "all the way to 'reconciled'")
 
 
+def test_reconcile_covenant_note_stripping_preserves_a_later_note() -> None:
+    """Confirmed real (covid 8534 tract 1, 2026-08-06): classifier.py's
+    exclude_non_tract_parcels appended its own NON-TRACT PARCEL EXCLUSION
+    note AFTER an earlier RECONCILIATION-STAGE note already in
+    review_reason. Re-running reconcile_covenant silently deleted that
+    later note entirely -- the old regex stripped its own tag with a bare
+    `.*$`, which greedily matched everything to the end of the string,
+    not just its own note's own text. Synthetic fixture (a clean
+    current_parcel_match tract, so reconcile_covenant itself adds no new
+    note) isolates the string-manipulation bug from any real classify/
+    reconcile business logic."""
+    try:
+        with get_session() as session:
+            session.execute(text("""
+                INSERT INTO covenant (covid, county_fips, status, legal_description_raw, stated_acreage, review_reason)
+                VALUES (999995, '48339', 'needs_review', 'test fixture', 10.0,
+                        'EARLIER-STAGE (automated, 2020-01-01): old unrelated note; '
+                        'RECONCILIATION-STAGE (automated, 2020-01-01): stale prior residual detail; '
+                        'NON-TRACT PARCEL EXCLUSION (automated, tract 1): must survive this run (APN1, APN2)')
+                ON CONFLICT (covid) DO UPDATE SET
+                    status = EXCLUDED.status, stated_acreage = EXCLUDED.stated_acreage,
+                    review_reason = EXCLUDED.review_reason
+            """))
+            session.execute(text("""
+                INSERT INTO tract (covid, tract_no, approximate_geom, boundary_resolution_method, classified_acreage)
+                VALUES (999995, 1, ST_SetSRID(ST_GeomFromGeoJSON(
+                    '{"type":"MultiPolygon","coordinates":[[[[-95.5,30.3],[-95.5,30.301],[-95.499,30.301],[-95.499,30.3],[-95.5,30.3]]]]}'
+                ), 4326), 'current_parcel_match', 10.0)
+                ON CONFLICT (covid, tract_no) DO UPDATE SET
+                    boundary_resolution_method = EXCLUDED.boundary_resolution_method,
+                    classified_acreage = EXCLUDED.classified_acreage
+            """))
+
+        with get_session() as session:
+            result = reconcile_covenant(session, covid=999995)
+            session.commit()
+        assert result["tract_results"][1]["status"] == "reconciled", result
+
+        with get_session() as session:
+            reason = session.execute(
+                text("SELECT review_reason FROM covenant WHERE covid = 999995")
+            ).scalar()
+        assert "EARLIER-STAGE" in reason, reason
+        assert "NON-TRACT PARCEL EXCLUSION" in reason and "must survive this run" in reason, reason
+        assert "stale prior residual detail" not in reason, reason
+    finally:
+        with get_session() as session:
+            session.execute(text("DELETE FROM tract WHERE covid = 999995"))
+            session.execute(text("DELETE FROM covenant WHERE covid = 999995"))
+    print("PASS: reconcile_covenant -> stripping its own stale RECONCILIATION-STAGE note "
+          "no longer swallows a later, unrelated note appended after it")
+
+
 def test_reconcile_covenant_never_silently_clears_an_unrelated_note() -> None:
     """covid 3297: its OWN tract reconciles cleanly, but covenant.
     review_reason still carries an unrelated, untagged historical note (the
@@ -191,6 +246,7 @@ if __name__ == "__main__":
     test_reconcile_tract_metes_and_bounds_real_residual_unaccounted()
     test_reconcile_tract_metes_and_bounds_small_residual_over_tolerance()
     test_reconcile_covenant_advances_status_when_fully_clean()
+    test_reconcile_covenant_note_stripping_preserves_a_later_note()
     test_reconcile_covenant_never_silently_clears_an_unrelated_note()
     test_reconcile_covenant_metes_and_bounds_flags_real_residual()
     test_reconcile_covenant_metes_and_bounds_small_residual_needs_review()

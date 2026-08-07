@@ -26,10 +26,11 @@ here (a residual can't represent more area than the tract itself, unlike a set o
 matched parcels that might). A metes_and_bounds_traverse tract with no parcel_covenant
 rows yet (classification not yet run) is reported not-checkable, same as before.
 """
-import re
 from datetime import date
 
 from sqlalchemy import text
+
+from app.db.review_notes import merge_tagged_note
 
 # Matched acreage rarely sums to the covenant's stated acreage EXACTLY even when every
 # real lot was found (each parcel's own recorded acreage is itself already rounded,
@@ -142,16 +143,19 @@ def reconcile_covenant(session, covid: int) -> dict:
     existing = session.execute(
         text("SELECT status, review_reason FROM covenant WHERE covid = :covid"), {"covid": covid},
     ).fetchone()
-    reason = existing.review_reason or ""
-    # same tagged-note pattern as app/title/chain.py's _update_covenant_gap_notes and
-    # scripts/ingest_probe.py's _merge_ingestion_note: only this stage's own tagged
-    # section is ever replaced, everything else in review_reason is left alone.
-    reason = re.sub(r";?\s*RECONCILIATION-STAGE \(automated[^)]*\):.*$", "", reason).strip("; ").strip()
-
+    # Only this stage's own tagged section is ever replaced; every other stage's
+    # note in review_reason is left alone. See app/db/review_notes.py for why
+    # this is one shared helper rather than a regex per stage -- a bare `.*$`
+    # here really did swallow a later NON-TRACT PARCEL EXCLUSION note on covid
+    # 8534, and an (?:automated|manual)-only boundary would have deleted covid
+    # 2497's hand-written RE-VERIFIED (2026-07-24) note.
+    note = None
     if problems:
-        detail = "; ".join(f"tract {tn}: {r['note']}" for tn, r in problems.items())
+        # " | " between tracts, not "; " -- see review_notes.py's note-author
+        # constraint (a body must not look like a note boundary).
+        detail = " | ".join(f"tract {tn}: {r['note']}" for tn, r in problems.items())
         note = f"RECONCILIATION-STAGE (automated, {date.today().isoformat()}): {detail}"
-        reason = f"{reason}; {note}" if reason else note
+    reason = merge_tagged_note(existing.review_reason, "RECONCILIATION-STAGE", note)
 
     _DO_NOT_REGRESS = {"title_in_progress", "done"}
     if problems or reason:
