@@ -92,10 +92,26 @@ before accepting or approximating anything.
 `app/gis/anchor_resolver.py`'s `resolve_metes_and_bounds_anchor` is the single entrypoint —
 never anchor a tract by hand-writing a one-off script per covenant again.
 1. Deterministic techniques first, free: a stated State Plane coordinate in the deed itself,
-   a shared corner with an already-anchored sibling tract, a tie to a named adjoining platted
-   parcel (`app/gis/state_plane_anchor.py`) — each with its own sanity check (recomputed
-   closure/area; a parcel tie's implied `length_ratio` must be within ~5% of 1.0) before ever
-   being trusted.
+   **a published NGS control-monument tie**, a shared corner with an already-anchored sibling
+   tract, a tie to a named adjoining platted parcel (`app/gis/state_plane_anchor.py`) — each
+   with its own sanity check (recomputed closure/area; a parcel tie's implied `length_ratio`
+   must be within ~5% of 1.0) before ever being trusted.
+   - **Check for an NGS tie before anything cleverer.** When a deed says "a National Geodetic
+     Survey monument stamped X bears <bearing> <distance>", the answer is published, free and
+     survey-grade: `extract_ngs_monument_ties` → `app/gis/ngs.py`'s `find_monuments` →
+     `anchor_by_ngs_monument_tie`. It needs no rotation solve, because a deed reciting ties this
+     way is working on the State Plane grid, so its bearings ARE grid azimuths.
+   - Three independent checks make it trustworthy, and all three are cheap: the zone mapping is
+     confirmed by reprojecting the monument's own lat/lon back onto its datasheet's own grid
+     coordinates (0.006 ft on covid 5838); two ties to two monuments reconstruct the
+     monument-to-monument vector with the unknown corner cancelling out, checked against
+     published truth (0.42 ft in 5,590 ft, 0.007°); and a pair that disagrees is tested for the
+     single-quadrant-letter hypothesis before being rejected.
+   - **This deed corpus reverses East/West.** covid 5838 does it twice — once in a closing
+     course, once in a KNOLL tie — each time with the distance right to a hundredth of a foot
+     and only the letter wrong. `repair_quadrant_by_closure` (courses) and
+     `cross_check_monument_ties` (ties) both recover it, and both refuse unless exactly one
+     flip resolves the discrepancy. Never accept a flip that isn't unique.
 2. None pass → escalate to an agentic LLM search (`app/llm/anchor_agent.py`, real tools: live
    GIS parcel queries, NGS survey-monument lookups, traverse walking, similarity solving) at
    **Opus 5**, budget-capped (~80 tool-call turns / 90 min per attempt).
