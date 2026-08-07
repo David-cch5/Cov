@@ -451,6 +451,43 @@ def test_detect_sliver_subdivision_clusters_covid_8534() -> None:
           "corroborated; Hercules West, geometry-only) as possible_non_tract_subdivisions")
 
 
+def test_public_property_flag() -> None:
+    """22 of this corpus' 23 covenants carve out government-owned land in their
+    own template text ("This Declaration shall not apply to Public Property"),
+    and nothing in the pipeline read that clause -- 43 government-owned parcels
+    (~374 ac) sit in the encumbered census: ISD school sites, MUDs, a city, and
+    two housing authorities.
+
+    A FLAG, never an automatic exclusion: whether a MUD or a housing authority
+    is a "governmental entity" for this clause is a legal determination.
+
+    The patterns must stay precise. An earlier "% COUNTY%" draft matched
+    "BROWNS MAVERICK COUNTY RANCH LP", a private partnership -- pinned below,
+    along with the real owners it must catch."""
+    from app.gis.classifier import _PUBLIC_OWNER_RE, _detect_public_property_parcels
+
+    for owner in ("DENTON HOUSING AUTHORITY", "SPLENDORA ISD", "BLAKETREE MUD #1",
+                  "CITY OF PORT ARANSAS", "EAST MONTGOMERY COUNTY MUD #12",
+                  "TOWN OF PROSPER TEXAS", "NUECES COUNTY WATER CONTROL"):
+        assert _PUBLIC_OWNER_RE.search(owner), owner
+    for owner in ("BROWNS MAVERICK COUNTY RANCH LP", "KM BEACH, LLC", "GOLDEN ANCHOR TEXAS INVESTMENT INC",
+                  "LAKESIDE CONROE HOMEOWNERS", "FORESTAR USA REAL ESTATE GROUP"):
+        assert not _PUBLIC_OWNER_RE.search(owner), owner
+
+    # an interior parcel IS flagged here, unlike the other two checks: a school
+    # site wholly inside the tract is exactly what the clause is about
+    matched = [
+        SimpleNamespace(apn="A", owner_name_raw="SPLENDORA ISD", is_interior=True),
+        SimpleNamespace(apn="B", owner_name_raw="KM BEACH, LLC", is_interior=False),
+        SimpleNamespace(apn="C", owner_name_raw=None, is_interior=False),
+    ]
+    got = _detect_public_property_parcels(matched)
+    assert [g["apn"] for g in got] == ["A"], got
+    assert got[0]["classification"] == "interior", got
+    print("PASS: public-property flag -> catches ISDs/MUDs/cities/housing authorities incl. interior "
+          "parcels, and does not match private owners with 'COUNTY' in the name")
+
+
 def test_makevalid_fabric_fallback_covid_5838() -> None:
     """Confirmed real and costly: the ST_MakeValid gate only trusted a repair
     whose area landed within 5% of parcel.acreage, and Nueces records that as
@@ -596,6 +633,7 @@ if __name__ == "__main__":
     test_persisted_montgomery_4440_real_classification()
     test_exclude_non_tract_parcels_covid_4440()
     test_detect_sliver_subdivision_clusters_covid_8534()
+    test_public_property_flag()
     test_makevalid_fabric_fallback_covid_5838()
     test_exclusion_is_durable_across_reclassification()
     test_detect_negligible_overlap_parcels()

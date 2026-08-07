@@ -370,16 +370,16 @@ def classify_metes_and_bounds_tract(session, covid: int, tract_no: int = 1) -> d
     matched = session.execute(
         text("""
             WITH usable_parcels AS (
-                SELECT apn, recited_legal_description,
+                SELECT apn, recited_legal_description, owner_name_raw,
                        CASE WHEN ST_IsValid(geom) THEN geom ELSE ST_MakeValid(geom) END AS geom
                 FROM parcel
                 WHERE county_fips = :county_fips AND apn = ANY(:apns)
                   AND (ST_IsValid(geom) OR apn = ANY(:repairable_apns))
             )
-            SELECT apn, recited_legal_description, is_interior, was_repaired, overlap_m2,
-                   overlap_m2 / NULLIF(parcel_m2, 0) AS overlap_fraction
+            SELECT apn, recited_legal_description, owner_name_raw, is_interior, was_repaired,
+                   overlap_m2, overlap_m2 / NULLIF(parcel_m2, 0) AS overlap_fraction
             FROM (
-                SELECT p.apn, p.recited_legal_description,
+                SELECT p.apn, p.recited_legal_description, p.owner_name_raw,
                        ST_Contains(t.geom, p.geom) AS is_interior,
                        p.apn = ANY(:repairable_apns) AS was_repaired,
                        -- the real overlap AREA, kept alongside the fraction: a
@@ -551,6 +551,25 @@ def classify_metes_and_bounds_tract(session, covid: int, tract_no: int = 1) -> d
             ),
         )
 
+    public = _detect_public_property_parcels(matched)
+    if public:
+        owners = sorted({p["owner"] for p in public})
+        detail = " | ".join(
+            f"{o} ({', '.join(p['apn'] for p in public if p['owner'] == o)})" for o in owners
+        )
+        _write_covenant_note(
+            session, covid, "POSSIBLE PUBLIC PROPERTY", (
+                f"POSSIBLE PUBLIC PROPERTY (automated): {len(public)} matched parcel(s) across "
+                f"{len(owners)} owner(s) appear to be government-owned. This covenant's own template "
+                f"carves that out -- 'SAVE AND EXCEPT any portion of the Property owned by a "
+                f"governmental entity ... This Declaration shall not apply to Public Property' -- so "
+                f"they may not be encumbered at all, and each currently carries fee liability. "
+                f"Whether a municipal utility district or a housing authority counts as a "
+                f"'governmental entity' for this clause is a legal determination, so this is only a "
+                f"flag: confirm, then remove via exclude_non_tract_parcels(). {detail}"
+            ),
+        )
+
     return {
         "candidates_in_bbox": len(candidates),
         "matched_parcels": len(matched),
@@ -561,6 +580,7 @@ def classify_metes_and_bounds_tract(session, covid: int, tract_no: int = 1) -> d
         "repaired_geometry_apns": repairable_apns,
         "possible_non_tract_subdivisions": sliver_groups,
         "negligible_overlap_parcels": negligible,
+        "possible_public_property": public,
     }
 
 
@@ -617,6 +637,40 @@ _SLIVER_OVERLAP_MAX_FRACTION = 0.5
 # these: a parcel with no recited_legal_description gets no group key at all,
 # and one genuinely-straddling member exempts a whole subdivision.
 _MIN_OVERLAP_AREA_M2 = 10.0
+
+# 22 of the 23 covenants in this corpus carve out government-owned land in their
+# own template text, verbatim:
+#
+#   "SAVE AND EXCEPT any portion of the Property owned by a governmental entity
+#    (whether state, local, city, municipality, federal, or otherwise,
+#    hereinafter "Public Property"). This Declaration shall not apply to Public
+#    Property."
+#
+# Nothing in this pipeline read that clause, so 43 government-owned parcels
+# (~374 acres) sit in the encumbered census today: Splendora and Montgomery
+# ISD school sites, Blaketree and East Montgomery County MUDs, the City of Port
+# Aransas, and the Denton and Corpus Christi housing authorities.
+#
+# Deliberately a FLAG, not an exclusion. Whether a municipal utility district or
+# a housing authority is a "governmental entity" for this clause is a legal
+# determination with real fee consequences, not something to encode from deed
+# text alone -- so this surfaces the parcels and leaves the call to a human,
+# exactly as the non-tract checks do.
+#
+# Patterns are deliberately precise rather than broad: an earlier "% COUNTY%"
+# draft matched "BROWNS MAVERICK COUNTY RANCH LP", a private partnership.
+# Validated against all 4,750 distinct owner names in the parcel table -- 19
+# match, every one genuinely governmental, no false positives.
+_PUBLIC_OWNER_RE = re.compile(
+    r"\bCITY OF\b|\bTOWN OF\b|\bVILLAGE OF\b|\bCOUNTY OF\b|,\s*CITY OF\b"
+    r"|\bI\.?S\.?D\b|\bINDEPENDENT SCHOOL DIST|\bSCHOOL DISTRICT\b"
+    r"|\bMUNICIPAL UTILITY DIST|\bM\.?U\.?D\.?\s*#?\s*\d|\bUTILITY DISTRICT\b"
+    r"|\bHOUSING AUTHORITY\b|\bSTATE OF TEXAS\b|\bUNITED STATES\b"
+    r"|\bDRAINAGE DIST|\bNAVIGATION DIST|\bWATER CONTROL|\bIMPROVEMENT DISTRICT\b"
+    r"|\bCOLLEGE DIST|\bCOMMUNITY COLLEGE\b|\bTXDOT\b|\bTEXAS DEPARTMENT OF\b"
+    r"|\bPUBLIC LIBRARY\b",
+    re.IGNORECASE,
+)
 
 
 def _sliver_group_key(recited_legal_description: str | None) -> str | None:
@@ -730,6 +784,23 @@ def _deed_role_for(subdivision: str, deed_adjoiners: list[dict]) -> str | None:
                 return "derivation"
             role = "adjoining"
     return role
+
+
+def _detect_public_property_parcels(matched) -> list[dict]:
+    """Matched parcels whose owner of record looks like a governmental entity,
+    which 22 of this corpus' 23 covenants carve out of the encumbered Property
+    by their own terms -- see _PUBLIC_OWNER_RE.
+
+    Interior parcels ARE included, unlike the other two checks: a school site or
+    MUD tract sitting wholly inside the tract is precisely the case the clause is
+    about, and it is the owner that matters here, not the geometry."""
+    flagged = [
+        {"apn": m.apn, "owner": m.owner_name_raw,
+         "classification": "interior" if m.is_interior else "boundary"}
+        for m in matched
+        if m.owner_name_raw and _PUBLIC_OWNER_RE.search(m.owner_name_raw)
+    ]
+    return sorted(flagged, key=lambda d: (d["owner"] or "", d["apn"]))
 
 
 def _detect_negligible_overlap_parcels(matched) -> list[dict]:
