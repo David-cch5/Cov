@@ -63,11 +63,14 @@ def test_persisted_plat_resolution_covid_4440() -> None:
         "HARRINGTON TRAILS": 13, "THE CANOPIES": 5, "THE PRESSWOODS": 9,
         "TIMBERS EDGE": 4, "TOWNSEND RESERVE": 2,
     }, plats_by_subdivision
-    assert assigned == 4002, assigned
+    # 4001, not 4002: apn 532316 (Townsend Reserve 01) overlapped tract 2 by
+    # 7.43 m2 and was excluded in the 2026-08-07 review of every flagged
+    # non-tract parcel (scripts/review_flagged_non_tract_parcels.py).
+    assert assigned == 4001, assigned
     assert "PLAT LOOKUP" in cov.review_reason, cov.review_reason
     assert "DUSTY TRAILS" in cov.review_reason, cov.review_reason
     print("PASS: resolve_plats_for_tract (covid 4440, both tracts) -> 5 real subdivisions, "
-          "33 real dated plat filings, 4002 parcels assigned, 2 genuinely-unfound "
+          "33 real dated plat filings, 4001 parcels assigned, 2 genuinely-unfound "
           "subdivisions correctly flagged rather than guessed")
 
 

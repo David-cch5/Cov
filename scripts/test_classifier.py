@@ -197,7 +197,8 @@ def test_persisted_montgomery_3194_real_classification() -> None:
     """The already-committed, real result of running classify_metes_and_
     bounds_tract live against covid 3194's two tracts (see reconcile.py's own
     tests for the reconciliation-level consequence): 327 parcels matched for
-    tract 1 (265 interior, 62 boundary), 856.418 ac classified against a
+    tract 1 (265 interior, 61 boundary -- 62 until one 3.07 m2 sliver was
+    excluded in the 2026-08-07 flag review), 856.418 ac classified against a
     934.58-ac tract, a 78.159-ac real geometric residual."""
     with get_session() as session:
         row = session.execute(text("""
@@ -209,11 +210,14 @@ def test_persisted_montgomery_3194_real_classification() -> None:
             WHERE covid = 3194 AND tract_no = 1 GROUP BY classification
         """)).fetchall())
     assert counts["interior"] == 265, counts
-    assert counts["boundary"] == 62, counts
+    # 61, not the original 62: apn 463635 overlapped by 3.07 m2 and was excluded
+    # in the 2026-08-07 review of every flagged non-tract parcel
+    # (scripts/review_flagged_non_tract_parcels.py).
+    assert counts["boundary"] == 61, counts
     assert abs(float(row.classified_acreage) - 856.418) < 0.01, row
     assert abs(float(row.residual_acreage) - 78.159) < 0.01, row
     print("PASS: parcel_covenant (covid 3194 tract 1) -> real, committed spatial "
-          "classification (265 interior / 62 boundary) matches the live run's own result")
+          "classification (265 interior / 61 boundary) matches the live run's own result")
 
 
 def test_persisted_montgomery_8245_real_classification() -> None:
@@ -292,7 +296,8 @@ def test_persisted_montgomery_4440_real_classification() -> None:
     Those 7 were re-excluded. Net: only 6 of the original 28 are genuinely
     restored, 22 remain excluded (17 Tract I, 5 Tract II) -- 4069 real
     parcels remain (Tract I: 2429 -- 2301 interior/128 boundary; Tract II:
-    1640 -- 1544 interior/96 boundary), still closely matching the
+    1639 -- 1544 interior/95 boundary, one 7.43 m2 sliver excluded in the
+    2026-08-07 flag review), still closely matching the
     stakeholder's own recall of an early Fable-driven pass returning "more
     than 4000 parcels" for this same covenant (BUILD_SPEC.md Sec.4). ~60.0%
     of the anchored area is now covered by any matched parcel; the rest is
@@ -322,14 +327,16 @@ def test_persisted_montgomery_4440_real_classification() -> None:
         cov = session.execute(text("SELECT review_reason FROM covenant WHERE covid = 4440")).fetchone()
 
     assert counts[1]["interior"] == 2301 and counts[1]["boundary"] == 128, counts[1]
-    assert counts[2]["interior"] == 1544 and counts[2]["boundary"] == 96, counts[2]
+    # boundary 95, not 96: apn 532316 (Townsend Reserve 01) overlapped by 7.43 m2
+    # and was excluded in the 2026-08-07 flag review.
+    assert counts[2]["interior"] == 1544 and counts[2]["boundary"] == 95, counts[2]
     assert abs(float(rows[1].classified_acreage) - 633.599) < 0.5, rows[1]
     assert abs(float(rows[2].classified_acreage) - 482.615) < 0.5, rows[2]
     assert "4069" in cov.review_reason, cov.review_reason
     for apn in ("505224", "321958", "321960", "51921", "334709", "502901"):
         assert apn in cov.review_reason, (apn, cov.review_reason)
-    print("PASS: parcel_covenant (covid 4440, both tracts) -> 4069 real parcels matched "
-          "total (2429 + 1640) after correction, 6 distinct invalid-geometry parcels "
+    print("PASS: parcel_covenant (covid 4440, both tracts) -> 4068 real parcels matched "
+          "total (2429 + 1639) after correction, 6 distinct invalid-geometry parcels "
           "correctly excluded and flagged rather than crashing classification")
 
 
