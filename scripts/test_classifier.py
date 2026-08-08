@@ -517,12 +517,22 @@ def test_makevalid_fabric_fallback_covid_5838() -> None:
             SELECT ST_Area(residual_geom::geography)/4046.8564224 AS resid
             FROM tract WHERE covid=5838 AND tract_no=1
         """)).fetchone()
-        assert 5.5 < float(row.resid) < 6.1, float(row.resid)   # 5.811, was 17.217
+        # The band moved from ~5.81 to ~9.7 ac when tract 1 was re-anchored onto
+        # its own deed traverse. That is not a regression and not a loss of
+        # coverage: the OLD tract.geom was itself a union of matched parcels, so
+        # parcels covered it almost by construction and the residual could only
+        # ever be the invalid-geometry gaps this fallback closes. The polygon is
+        # now the deed's surveyed boundary, which legitimately contains land no
+        # parcel covers -- 347 pieces, every one long and thin (the largest,
+        # 5.578 ac, has a 16,452 ft perimeter), i.e. the PUD's street network and
+        # inter-parcel gaps. What this test pins is the fallback itself: the five
+        # unvalued parcels are admitted, which is asserted directly above.
+        assert 9.2 < float(row.resid) < 10.2, float(row.resid)
     finally:
         session.rollback()
         session.close()
     print("PASS: ST_MakeValid fabric-fit fallback -> covid 5838's 5 unvalued Palmilla Beach parcels "
-          "are admitted, dropping the residual from 17.217 to ~5.81 ac")
+          "are admitted (residual ~9.7 ac against the re-anchored deed boundary, and road ROW)")
 
 
 def test_exclusion_is_durable_across_reclassification() -> None:
