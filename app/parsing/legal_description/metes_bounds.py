@@ -132,6 +132,13 @@ def _ocr_int(raw: str) -> float:
 # \u00abgle of", "delta angie of". Matching the keyword, then ANY single token,
 # then "of" tolerates every observed form: the keyword plus one word plus "of",
 # inside a curve clause, is already specific enough that nothing else matches.
+# "circular" is misspelled in the deed itself, not just by OCR -- covid 5839
+# writes "cirucular" and "ciruclar" in two different arc calls, and vision OCR
+# transcribes both faithfully because they are what the page says. cir\w{0,6}lar
+# covers the correct spelling and both transpositions without matching anything
+# else in a curve clause.
+_CIRCULAR = r"cir\w{0,6}lar"
+
 _DELTA_KEYWORD = r"(?:central|delta)\s+\S{1,12}\s+of"
 
 _EAST = r"(?:[EKBFRL]ast|E\.?)"
@@ -186,12 +193,12 @@ _TANGENT_CURVE_RE = re.compile(
     # The arc call restates the turn as prose ("fo the right", "to the rj ht" in
     # covid 5839) -- already captured above, so it is skipped rather than
     # re-parsed, and never gets a chance to fail on its own OCR damage.
-    r".{0,260}?" + _THENCE + r"[,;:]?\s+with\s+(?:said\s+)?(?:the\s+)?circular\s+curve"
+    r".{0,260}?" + _THENCE + r"[,;:]?\s+with\s+(?:said\s+)?(?:the\s+)?" + _CIRCULAR + r"\s+curve"
     # Up to a sentence of prose can sit between the curve restatement and its
     # arc length -- covid 5838 writes "with said circular curve to the right,
     # continuing with the southeast boundary of this tract, an arc length of
     # 364.77 feet". [^;] keeps the match inside that one sentence.
-    r"[^;]{0,200}?an\s+arc\s+(?:length|distance)\s+of\s+([\d,]+\.?\d*)\s*" + _FEET,
+    r"[^;]{0,200}?an\s+arc\s+(?:length|distance)\s+of\s+(?:length\s+of\s+)?([\d,]+\.?\d*)\s*" + _FEET,
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -211,12 +218,12 @@ _TANGENT_CURVE_RE = re.compile(
 # radius-bearing forms above and deduplicated against them by arc position, so a
 # curve that DOES state its radius bearing is never read twice.
 _PC_TANGENT_CURVE_RE = re.compile(
-    r"point\s+of\s+curvature\s+of\s+(?:a|an|another)\s+circular\s+curve\s+(?:to|fo)\s+the\s+(right|left)"
+    r"point\s+of\s+curvature\s+of\s+(?:with\s+)?(?:a|an|another)?\s*" + _CIRCULAR + r"\s+(?:curve\s+)?(?:to|fo)\s+the\s+(right|left)"
     r"[^;]{0,40}?" + _DELTA_KEYWORD + r"\s*(\d{1,3})\s*(?:degrees?|deg\.?|°)" + _SEP + r"(\d{1,2})\s*"
     r"(?:minutes?|min\.?|['\u2019])\s*(\d{1,2})\s*" + _SECONDS_MARK +
     r".{0,90}?\S*dius\s+of\s+([\d,]+\.?\d*)\s*" + _FEET +
-    r".{0,260}?" + _THENCE + r"[,;:]?\s+with\s+(?:said\s+)?(?:the\s+)?circular\s+curve"
-    r"[^;]{0,40}?an\s+arc\s+(?:length|distance)\s+of\s+([\d,]+\.?\d*)\s*" + _FEET,
+    r".{0,260}?" + _THENCE + r"[,;:]?\s+with\s+(?:said\s+)?(?:the\s+)?" + _CIRCULAR + r"\s+curve"
+    r"[^;]{0,40}?an\s+arc\s+(?:length|distance)\s+of\s+(?:length\s+of\s+)?([\d,]+\.?\d*)\s*" + _FEET,
     re.IGNORECASE | re.DOTALL,
 )
 
