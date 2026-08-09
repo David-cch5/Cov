@@ -24,8 +24,8 @@ import sys
 sys.path.insert(0, ".")
 
 from app.ingestion.ocr_escalation import (
-    escalate_to_vision_ocr, prefer_fuller_cache, resolve_low_confidence_covenant,
-    resolve_low_confidence_covenants,
+    escalate_to_vision_ocr, merge_escalated_pages, prefer_fuller_cache,
+    resolve_low_confidence_covenant, resolve_low_confidence_covenants,
 )
 from scripts.ingest_probe import _strip_ocr_confidence_reason
 
@@ -132,6 +132,41 @@ def test_escalate_ocr_confidence_resolved_covid_3428() -> None:
           "resolved a recording_instrument Tesseract's OCR could never recover")
 
 
+def test_escalation_merges_pages_instead_of_replacing_the_document() -> None:
+    """Escalation used to hand its result back as the covenant's WHOLE text, so
+    transcribing 4 of covid 5839's 21 pages threw away the other 17. Field
+    extraction, seeing Exhibit A alone, reported declarant '<UNKNOWN>' at 0.15
+    confidence and left recording_instrument, recording_date and stated_acreage
+    null -- every one of them lives on a page that was never escalated.
+
+    These transcriptions are form-feed delimited, so the splice is exact: only
+    the escalated pages change."""
+    base = "PAGE ONE stamp\fPAGE TWO garbled\fPAGE THREE\f"
+    merged, ok = merge_escalated_pages(base, {2: "PAGE TWO clean"}, 3)
+    assert ok, "a page-aligned merge should succeed"
+    pages = merged.split("\f")
+    assert pages[0] == "PAGE ONE stamp", pages     # untouched
+    assert pages[1] == "PAGE TWO clean", pages     # replaced
+    assert pages[2] == "PAGE THREE", pages         # untouched
+    print("PASS: escalated pages are spliced in; the rest of the document survives")
+
+
+def test_merge_refuses_when_pages_cannot_be_aligned() -> None:
+    """The guard that makes the merge safe, and it caught a real bug in its own
+    first draft: text carrying NO form feeds splits into a single block, page 1
+    'aligns', and the whole document is replaced by one page -- precisely the
+    failure this function exists to prevent. Alignment now requires the block
+    count to match the document's real page count, and a refusal returns the
+    original text untouched."""
+    flat = "one long transcription with no page breaks at all"
+    assert merge_escalated_pages(flat, {1: "fragment"}, 5) == (flat, False)
+    base = "ONE\fTWO\fTHREE\f"
+    assert merge_escalated_pages(base, {9: "x"}, 3) == (base, False)   # page beyond document
+    assert merge_escalated_pages(base, {1: "x"}, 21) == (base, False)  # block count disagrees
+    assert merge_escalated_pages(base, {}, 3) == (base, False)         # nothing escalated
+    print("PASS: an unalignable merge returns the original text, never a fragment")
+
+
 if __name__ == "__main__":
     test_prefer_fuller_cache_finds_real_truncation()
     test_prefer_fuller_cache_no_false_positive()
@@ -141,4 +176,6 @@ if __name__ == "__main__":
     test_resolve_low_confidence_covenants_shares_budget()
     test_strip_ocr_confidence_reason_leaves_other_reasons_intact()
     test_escalate_ocr_confidence_resolved_covid_3428()
+    test_escalation_merges_pages_instead_of_replacing_the_document()
+    test_merge_refuses_when_pages_cannot_be_aligned()
     print("\nall ocr_escalation smoke tests passed")

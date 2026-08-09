@@ -18,6 +18,7 @@ sys.path.insert(0, ".")
 from app.db.review_notes import merge_tagged_note
 from app.db.session import get_session
 from app.ingestion.ocr_escalation import (
+    merge_escalated_pages,
     MAX_PAGES_WITHOUT_APPROVAL, VOCAB_SCORE_THRESHOLD, escalate_to_vision_ocr,
 )
 from app.ingestion.walk import PROJECT_ROOT, iter_candidates
@@ -98,7 +99,24 @@ def escalate_ocr_confidence(candidates: list, max_pages: int = MAX_PAGES_WITHOUT
 
         print(f"  OCR escalation (covid {c.covid}): resolved via {result['resolved_via']}"
               + (f", {result['pages_escalated']} page(s)" if result["pages_escalated"] else " (cached)"))
-        c.text = result["text"]
+        # Merge, never substitute: escalation transcribes SOME pages, and the rest
+        # of the document -- where the recording stamp, declarant and stated
+        # acreage live -- must survive it. If the pages cannot be aligned the
+        # original text is kept and the escalation is reported as unmerged
+        # rather than allowed to replace the document with a fragment.
+        merged_text, merged = merge_escalated_pages(c.text, result.get("page_texts") or {},
+                                              result.get("total_pages"))
+        if merged:
+            c.text = merged_text
+        elif not result.get("partial"):
+            # A whole-document escalation IS the document -- nothing to merge into.
+            # Gated on `partial`, not on page_texts being absent: a cache written
+            # before per-page text was stored is still partial, and substituting it
+            # would reintroduce exactly the bug this replaced.
+            c.text = result["text"]
+        else:
+            print(f"  OCR escalation (covid {c.covid}): pages could not be aligned to the "
+                  f"cached text -- keeping the original transcription")
         c.vocab_score = result.get("min_confidence")
         if c.vocab_score is not None and c.vocab_score >= VOCAB_SCORE_THRESHOLD:
             c.review_reason = _strip_ocr_confidence_reason(c.review_reason)

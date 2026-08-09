@@ -83,6 +83,47 @@ def _escalated_cache_path(covid: str) -> str:
     return os.path.join(ESCALATED_CACHE, f"{covid}_vision_escalated.json")
 
 
+
+def merge_escalated_pages(base_text: str, page_texts: dict,
+                          total_pages: int | None = None) -> tuple[str, bool]:
+    """Splice vision-OCR'd pages INTO the existing transcription, replacing only
+    those pages and leaving every other page of the document intact.
+
+    Confirmed real, and the reason this exists: escalation used to hand its
+    result back as the covenant's whole text. Escalating 4 of covid 5839's 21
+    pages therefore threw away the other 17, and field extraction -- looking at
+    Exhibit A alone -- reported declarant '<UNKNOWN>' at 0.15 confidence, then
+    on a retry left recording_instrument, recording_date and stated_acreage null
+    and mistyped a metes-and-bounds instrument as a subdivision plat. Every one
+    of those fields lives on a page that was never escalated and never should
+    have been discarded.
+
+    These transcriptions are form-feed delimited by page, so the splice is
+    exact. Returns (text, merged): merged=False means the pages could NOT be
+    aligned -- a document whose cached text carries no page breaks, or fewer
+    pages than were escalated -- and in that case base_text comes back
+    untouched, because replacing a whole document with a fragment is the bug
+    this function exists to prevent.
+    """
+    if not base_text or not page_texts:
+        return base_text, False
+    blocks = base_text.split("\f")
+    trailing = bool(blocks) and not blocks[-1].strip()
+    if trailing:
+        blocks = blocks[:-1]
+    # The block count must MATCH the document's real page count. Without this,
+    # text carrying no form feeds at all splits into a single block, page 1
+    # "aligns", and the whole document is replaced by one page -- the very bug
+    # this function exists to prevent, found by its own test.
+    if not blocks or max(page_texts) > len(blocks):
+        return base_text, False
+    if total_pages is not None and len(blocks) != total_pages:
+        return base_text, False
+    for page_no, text in page_texts.items():
+        blocks[page_no - 1] = text
+    return "\f".join(blocks) + ("\f" if trailing else ""), True
+
+
 def escalate_to_vision_ocr(
     covid: str, pdf_path: str, remaining_page_budget: int, model: str = LLM_MODEL_HARDEST,
     pages: list[int] | None = None,
@@ -129,6 +170,9 @@ def escalate_to_vision_ocr(
                     "text": cached["text"], "pages_escalated": 0, "capped": False,
                     "min_confidence": cached.get("min_confidence"),
                     "page_numbers": cached.get("page_numbers"),
+                    "page_texts": {int(k): v for k, v in (cached.get("page_texts") or {}).items()},
+                    "total_pages": cached.get("total_pages"),
+                    "partial": bool(cached.get("partial")),
                     # 0 tokens, not the original run's usage -- no API request was made.
                     "usage": {"input_tokens": 0, "output_tokens": 0,
                               "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}}
@@ -157,6 +201,7 @@ def escalate_to_vision_ocr(
         pages_to_try = images[-n_pages:]  # last N pages -- see docstring's heuristic note
 
     texts, confidences, notes = [], [], []
+    page_texts: dict[int, str] = {}
     usage_totals = {
         "input_tokens": 0, "output_tokens": 0,
         "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
@@ -173,6 +218,7 @@ def escalate_to_vision_ocr(
             img.save(tmp_path)
             result = ocr_page_image(tmp_path, model=model)
             texts.append(result["text"])
+            page_texts[wanted[i]] = result["text"]
             confidences.append(result.get("confidence", 0))
             if result.get("notes"):
                 notes.append(result["notes"])
@@ -186,15 +232,20 @@ def escalate_to_vision_ocr(
     with open(cached_path, "w", encoding="utf-8") as f:
         json.dump({"covid": covid, "text": combined_text, "min_confidence": min_confidence,
                    "notes": notes, "pages_escalated": n_pages, "page_numbers": wanted,
-                   # A page-targeted run transcribes ONLY those pages, so its text is
-                   # NOT the document. Flagged so the cache can never later be handed
-                   # back as a whole-document transcription -- see the cache lookup.
-                   "partial": bool(pages), "total_pages": total_pages,
+                   # Partial means FEWER PAGES THAN THE DOCUMENT HAS -- not merely
+                   # "pages were named". A last-N escalation of 3 pages out of 21 is
+                   # just as partial as a targeted one, and defining it the other way
+                   # let exactly that case go on substituting itself for covid 5839's
+                   # whole text. Flagged so such a cache is never handed back as a
+                   # whole-document transcription.
+                   "partial": n_pages < total_pages, "total_pages": total_pages,
+                   "page_texts": {str(k): v for k, v in page_texts.items()},
                    "model": model, "usage": usage_totals}, f)
 
     return {"covid": covid, "resolved": True, "resolved_via": "vision_ocr", "text": combined_text,
             "pages_escalated": n_pages, "page_numbers": wanted,
             "capped": n_pages < total_pages, "min_confidence": min_confidence,
+            "page_texts": page_texts, "total_pages": total_pages, "partial": n_pages < total_pages,
             "notes": notes, "usage": usage_totals}
 
 
