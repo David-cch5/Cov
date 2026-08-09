@@ -238,6 +238,110 @@ def test_reconcile_covenant_metes_and_bounds_small_residual_needs_review() -> No
           "residual alone is enough to keep the covenant in needs_review")
 
 
+def test_multi_tract_covenant_never_reconciles_against_the_covenant_total() -> None:
+    """Migration 0036. covenant.stated_acreage describes ALL of a covenant's
+    tracts together, but reconcile_tract compared each tract's own
+    classified_acreage against it. On a single-tract covenant that is the same
+    number; on any other it measures one tract against all of them.
+
+    Confirmed real on covid 5838, whose tract 2 is the Gulfside Estates land --
+    the deed's own 31.140 + 2.454 = 33.594 ac, classified at 33.518. It was being
+    checked against tract 1's 318.779 ac and reported 285.261 ac "unaccounted":
+    a gap 850% of the tract's own size, on land that is fully accounted for. With
+    tract.stated_acreage set it reports 0.076 ac, which is just the rounding
+    between the deed's figure and the parcels'.
+
+    Two tracts here: one carrying its own stated acreage, one not. The first must
+    reconcile against ITS number, and the second must report not-checkable rather
+    than borrow the covenant's."""
+    try:
+        with get_session() as session:
+            session.execute(text("""
+                INSERT INTO covenant (covid, county_fips, status, legal_description_raw, stated_acreage)
+                VALUES (999993, '48339', 'needs_review', 'multi-tract fixture', 500.0)
+                ON CONFLICT (covid) DO UPDATE SET stated_acreage = EXCLUDED.stated_acreage
+            """))
+            for tract_no, stated in ((1, 100.0), (2, None)):
+                session.execute(text("""
+                    INSERT INTO tract (covid, tract_no, approximate_geom, boundary_resolution_method,
+                                       classified_acreage, stated_acreage, unaccounted_acreage,
+                                       reconciliation_status)
+                    VALUES (999993, :tract_no, ST_SetSRID(ST_GeomFromGeoJSON(
+                        '{"type":"MultiPolygon","coordinates":[[[[-95.5,30.3],[-95.5,30.301],[-95.499,30.301],[-95.499,30.3],[-95.5,30.3]]]]}'
+                    ), 4326), 'current_parcel_match', 97.5, :stated, 402.5, 'unaccounted_area')
+                    ON CONFLICT (covid, tract_no) DO UPDATE SET
+                        boundary_resolution_method = EXCLUDED.boundary_resolution_method,
+                        classified_acreage = EXCLUDED.classified_acreage,
+                        stated_acreage = EXCLUDED.stated_acreage,
+                        unaccounted_acreage = EXCLUDED.unaccounted_acreage,
+                        reconciliation_status = EXCLUDED.reconciliation_status
+                """), {"tract_no": tract_no, "stated": stated})
+
+        with get_session() as session:
+            own = reconcile_tract(session, covid=999993, tract_no=1)
+            session.commit()
+        # 100.0 stated - 97.5 classified = 2.5, NOT 500.0 - 97.5 = 402.5
+        assert own["checked"] and own["status"] == "unaccounted_area", own
+        assert abs(own["unaccounted_acreage"] - 2.5) < 0.001, own
+
+        with get_session() as session:
+            unknown = reconcile_tract(session, covid=999993, tract_no=2)
+            session.commit()
+        assert not unknown["checked"], unknown
+        assert "2 tracts" in unknown["reason"], unknown
+
+        # the stale 402.5 written by the old covenant-wide comparison must be
+        # cleared, not left sitting as a known-wrong figure
+        with get_session() as session:
+            row = session.execute(text("""
+                SELECT unaccounted_acreage, reconciliation_status
+                FROM tract WHERE covid = 999993 AND tract_no = 2
+            """)).one()
+        assert row.unaccounted_acreage is None, row
+        assert row.reconciliation_status == "pending", row
+        print(f"PASS: multi-tract covenant -> tract 1 reconciles against its own 100 ac "
+              f"({own['unaccounted_acreage']:.1f} ac, not 402.5), tract 2 reports not-checkable "
+              f"and its stale figure is cleared")
+    finally:
+        with get_session() as session:
+            session.execute(text("DELETE FROM tract WHERE covid = 999993"))
+            session.execute(text("DELETE FROM covenant WHERE covid = 999993"))
+            session.commit()
+
+
+def test_single_tract_covenant_still_uses_the_covenant_figure() -> None:
+    """The fallback that must survive: where a covenant has exactly one tract,
+    its stated acreage IS that tract's, and reconciliation has to keep working
+    without tract.stated_acreage being populated. Migration 0036 backfills those
+    rows, but the code path is what is pinned here."""
+    try:
+        with get_session() as session:
+            session.execute(text("""
+                INSERT INTO covenant (covid, county_fips, status, legal_description_raw, stated_acreage)
+                VALUES (999992, '48339', 'needs_review', 'single-tract fixture', 10.0)
+                ON CONFLICT (covid) DO UPDATE SET stated_acreage = EXCLUDED.stated_acreage
+            """))
+            session.execute(text("""
+                INSERT INTO tract (covid, tract_no, approximate_geom, boundary_resolution_method,
+                                   classified_acreage, stated_acreage)
+                VALUES (999992, 1, ST_SetSRID(ST_GeomFromGeoJSON(
+                    '{"type":"MultiPolygon","coordinates":[[[[-95.5,30.3],[-95.5,30.301],[-95.499,30.301],[-95.499,30.3],[-95.5,30.3]]]]}'
+                ), 4326), 'current_parcel_match', 8.0, NULL)
+                ON CONFLICT (covid, tract_no) DO UPDATE SET
+                    classified_acreage = EXCLUDED.classified_acreage, stated_acreage = NULL
+            """))
+        with get_session() as session:
+            got = reconcile_tract(session, covid=999992, tract_no=1)
+            session.commit()
+        assert got["checked"] and abs(got["unaccounted_acreage"] - 2.0) < 0.001, got
+        print("PASS: single-tract covenant -> still falls back to covenant.stated_acreage (2.0 ac gap)")
+    finally:
+        with get_session() as session:
+            session.execute(text("DELETE FROM tract WHERE covid = 999992"))
+            session.execute(text("DELETE FROM covenant WHERE covid = 999992"))
+            session.commit()
+
+
 if __name__ == "__main__":
     test_reconcile_tract_over_classified()
     test_reconcile_tract_unaccounted_area()
@@ -250,4 +354,6 @@ if __name__ == "__main__":
     test_reconcile_covenant_never_silently_clears_an_unrelated_note()
     test_reconcile_covenant_metes_and_bounds_flags_real_residual()
     test_reconcile_covenant_metes_and_bounds_small_residual_needs_review()
+    test_multi_tract_covenant_never_reconciles_against_the_covenant_total()
+    test_single_tract_covenant_still_uses_the_covenant_figure()
     print("\nall reconcile smoke tests passed")
