@@ -15,6 +15,7 @@ from app.db.session import get_session
 from app.ingestion.walk import get_deed_text
 from app.parsing.legal_description.metes_bounds import (
     Course,
+    _feet,
     extract_courses,
     repair_quadrant_by_closure,
     walk_traverse,
@@ -329,6 +330,67 @@ def test_quadrant_repair_refuses_an_ambiguous_case() -> None:
     print("PASS: an ambiguous traverse is left untouched rather than guessed at")
 
 
+def test_ocr_decimal_comma_is_not_read_as_a_thousands_separator() -> None:
+    """A live, corpus-wide bug, not a 5839 quirk. Distances were parsed with
+    `float(raw.replace(",", ""))`, so covid 5839's "a tangent length of 244,30
+    feet" became 24,430 ft -- a silent hundredfold error that corrupts a
+    traverse instead of failing loudly, which is the worst way for this to go
+    wrong.
+
+    A comma means a decimal point only when exactly two digits follow it and
+    there is no real decimal point. Genuine thousands separators always have
+    three digits after them, so the two can never be confused."""
+    assert _feet("244,30") == 244.30
+    assert _feet("128,32") == 128.32
+    assert _feet("1270,00") == 1270.00
+    assert _feet("1,516.17") == 1516.17          # real thousands separator
+    assert _feet("2,364.98") == 2364.98
+    assert _feet("7,233") == 7233.0              # thousands, no decimals at all
+    assert _feet("160.00") == 160.00
+    print("PASS: '244,30 feet' reads as 244.30 ft, not 24,430 -- thousands separators unaffected")
+
+
+def test_point_of_curvature_curve_needs_no_radius_bearing() -> None:
+    """covid 5839's third curve family. A curve at a POINT OF CURVATURE states
+    no radius bearing because it does not need one: by definition it is tangent
+    to the course arriving there, so the tangent IS that course's azimuth.
+
+    Also exercises this deed's own wording and OCR: "delta angle" where every
+    earlier deed said "central angle", and "with the circular curve" without
+    the "said" the previous pattern required."""
+    text = (
+        'THENCE North 00 degrees 00 minutes 00 seconds East, a distance of 100.00 feet to a '
+        '5/8 inch iron rod set for the point of curvature of a circular curve to the right '
+        'which has a delta angle of 90 degrees 00\'00", a radius of 100.00 feet, a tangent '
+        'length of 100.00 feet and an arc length of 157.08 feet; '
+        'THENCE, with the circular curve to the right, an arc length of 157.08 feet to a point;'
+    )
+    courses = extract_courses(text)
+    curves = [c for c in courses if c.is_curve]
+    assert len(curves) == 1, courses
+    chord = curves[0]
+    # tangent = the arriving course's due-north azimuth; a 90-degree right turn
+    # puts the chord at N45E, length 2*100*sin(45) = 141.42 ft
+    assert chord.ns == "North" and chord.ew == "East", chord
+    assert abs(chord.azimuth_degrees - 45.0) < 0.01, chord
+    assert abs(chord.distance_ft - 141.42) < 0.05, chord
+    print(f"PASS: point-of-curvature curve -> chord N45E {chord.distance_ft:.2f} ft, "
+          f"tangent taken from the arriving course (no radius bearing stated)")
+
+
+def test_a_curve_with_no_radius_bearing_and_no_previous_course_is_dropped() -> None:
+    """The guard on the above: with nothing arriving at the point of curvature
+    there is no tangent to inherit, and a chord must not be invented."""
+    text = (
+        'BEGINNING at a point for the point of curvature of a circular curve to the right '
+        'which has a delta angle of 90 degrees 00\'00", a radius of 100.00 feet and an arc '
+        'length of 157.08 feet; THENCE, with the circular curve to the right, an arc length '
+        'of 157.08 feet to a point;'
+    )
+    assert not [c for c in extract_courses(text) if c.is_curve], "invented a chord with no tangent"
+    print("PASS: a point-of-curvature curve with no arriving course is dropped, not guessed at")
+
+
 if __name__ == "__main__":
     test_spelled_out_bearing_units()
     test_curly_quote_minutes_marker()
@@ -342,4 +404,7 @@ if __name__ == "__main__":
     test_quadrant_repair_fixes_covid_5838_tract_7()
     test_quadrant_repair_leaves_a_sound_traverse_alone()
     test_quadrant_repair_refuses_an_ambiguous_case()
+    test_ocr_decimal_comma_is_not_read_as_a_thousands_separator()
+    test_point_of_curvature_curve_needs_no_radius_bearing()
+    test_a_curve_with_no_radius_bearing_and_no_previous_course_is_dropped()
     print("\nall metes-and-bounds parser tests passed")

@@ -26,7 +26,7 @@ class cannot safely carry (see _TIE_D).
 import re
 from dataclasses import dataclass
 
-from app.parsing.legal_description.metes_bounds import _EAST, _SECONDS_MARK, _WEST
+from app.parsing.legal_description.metes_bounds import _EAST, _SECONDS_MARK, _SEP, _WEST
 
 # metes_bounds' own _D deliberately excludes S, because there it would sit next
 # to the North/South quadrant word and could swallow it. Here it cannot: this
@@ -54,9 +54,9 @@ _CORNER_RE = re.compile(
 _TIE_RE = re.compile(
     r"(?:National\s+Geodetic\s+Survey|N\.?G\.?S\.?)\s+monument\s+stamped\s*"
     r"[\"“”'’]{0,2}\s*([A-Za-z0-9][A-Za-z0-9 _.-]{0,20}?)\s*[\"“”'’]{0,2}\s+bears\s+"
-    r"(North|South)\s*(" + _TIE_D + r"{1,3})\s*(?:degrees?|deg\.?|°)\s*(" + _TIE_D + r"{1,2})\s*"
-    r"(?:minutes?|min\.?|['’])\s*(" + _TIE_D + r"{1,2})\s*" + _SECONDS_MARK +
-    r"\s*(" + _EAST + r"|" + _WEST + r")\s*([\d,]+\.?\d*)\s*(?:feet|ft\.?)",
+    r"(North|South)\s*(" + _TIE_D + r"{1,3})\s*(?:degrees?|deg\.?|°)" + _SEP + r"(" + _TIE_D + r"{1,2})\s*"
+    r"(?:minutes?|min\.?|['’])" + _SEP + r"(" + _TIE_D + r"{1,2})\s*" + _SECONDS_MARK + _SEP +
+    r"(" + _EAST + r"|" + _WEST + r")\s*([\d,]+\.?\d*)\s*(?:feet|ft\.?)",
     re.IGNORECASE,
 )
 

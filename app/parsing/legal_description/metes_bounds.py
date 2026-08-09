@@ -27,6 +27,14 @@ _THENCE = r"[‘’'\"`]?\s*(?:THENCE|THENCR|TRENCE|TRENCR|HENCE|TENCE)"
 # closing double quote. A single optional mark cannot match the pair, so the
 # whole 3.26 ft course was dropped. Accepting a RUN of mark characters costs
 # nothing (they are all noise between the seconds digits and the quadrant).
+# covid 5839's scan carries the page's own line-edge artifacts INSIDE bearings --
+# "90 degrees : 00'29\"", "51'16\" : Last", "curve to the left, whose radius point
+# bears". A colon, semicolon or pipe lands where only whitespace is expected. They
+# appear exclusively in SEPARATOR positions, never inside a value, so tolerating
+# them between the parts of a bearing costs no precision: the digits, the marks
+# and the quadrant words are all still matched exactly.
+_SEP = r"[\s:;|]*"
+
 _SECONDS_MARK = r"(?:seconds?|sec\.?|[\"”'’]+)?"
 
 # "feet" is itself an OCR casualty: covid 5838 TRACT 5 recites the 2.59 ft course
@@ -37,7 +45,7 @@ _SECONDS_MARK = r"(?:seconds?|sec\.?|[\"”'’]+)?"
 _FEET = r"(?:feet|fe?et|[“”‘’]e{1,2}t|ft\.?)"
 
 _COURSE_RE = re.compile(
-    _THENCE + r"[,;:]?\s+(North|South)\s*(\d{1,3})\s*(?:degrees?|deg\.?|°)\s*(\d{1,2})\s*(?:minutes?|min\.?|'|’)\s*(\d{1,2})\s*" + _SECONDS_MARK + r"\s+(East|West)"
+    _THENCE + r"[,;:]?\s+(North|South)\s*(\d{1,3})\s*(?:degrees?|deg\.?|°)" + _SEP + r"(\d{1,2})\s*(?:minutes?|min\.?|'|’)" + _SEP + r"(\d{1,2})\s*" + _SECONDS_MARK + r"" + _SEP + r"\s*(East|West)"
     # The intervening text lists adjoiner tracts by ACREAGE, not feet, so the first
     # "<number> feet to <something>" after the bearing is reliably the course's own
     # distance -- more robust than anchoring on the literal phrase "distance of",
@@ -68,7 +76,7 @@ _COURSE_RE = re.compile(
 # feet;" phrasing is literally present, so this never overlaps what _COURSE_RE
 # already catches (which always ends in "to", not a bare semicolon).
 _COMPOUND_BEARING_RE = re.compile(
-    r"(North|South)\s+(\d{1,3})\s*(?:degrees?|deg\.?|°)\s*(\d{1,2})\s*(?:minutes?|min\.?|'|’)\s*(\d{1,2})\s*" + _SECONDS_MARK + r"\s+(East|West)\s*,\s*a distance of\s+([\d,]+\.?\d*)\s*feet\s*(?:\(Deed[^)]*\))?\s*;",
+    r"(North|South)\s+(\d{1,3})\s*(?:degrees?|deg\.?|°)" + _SEP + r"(\d{1,2})\s*(?:minutes?|min\.?|'|’)" + _SEP + r"(\d{1,2})\s*" + _SECONDS_MARK + r"\s+(East|West)\s*,\s*a distance of\s+([\d,]+\.?\d*)\s*feet\s*(?:\(Deed[^)]*\))?\s*;",
     re.IGNORECASE,
 )
 
@@ -116,16 +124,38 @@ def _ocr_int(raw: str) -> float:
     return float(raw.translate(_OCR_DIGITS))
 
 
-_EAST = r"(?:[EKBFR]ast|E\.?)"
+# covid 5839 renders one SF-010 tie as "North 24 degrees 51'16\" Last 4,358.04
+# feet" -- an L for the E. Without it that tie is lost and the tract falls back
+# to a single, uncheckable KNOLL tie.
+# The angle a curve turns through is called a "central angle" in covid 5838 and
+# a "delta angle" in covid 5839, and OCR mangles the noun itself -- "central
+# \u00abgle of", "delta angie of". Matching the keyword, then ANY single token,
+# then "of" tolerates every observed form: the keyword plus one word plus "of",
+# inside a curve clause, is already specific enough that nothing else matches.
+_DELTA_KEYWORD = r"(?:central|delta)\s+\S{1,12}\s+of"
+
+_EAST = r"(?:[EKBFRL]ast|E\.?)"
 _WEST = r"(?:W[ae]st|W\.?)"
+# A bearing, written once. Splicing _SEP into these patterns by hand had already
+# broken one of them silently -- an rf-string became a plain r-string, so {_D}
+# stopped interpolating and the minutes field literally required the text
+# "{_D}{1,2}", which matches nothing. Defining the shape once removes that whole
+# class of mistake. _DMS_OCR additionally tolerates the letter-for-digit
+# substitutions seen in radius bearings (see _D).
+_DMS = (r"(\d{1,3})\s*(?:degrees?|deg\.?|°)" + _SEP +
+        r"(\d{1,2})\s*(?:minutes?|min\.?|['’])" + _SEP +
+        r"(\d{1,2})\s*" + _SECONDS_MARK)
+_DMS_OCR = (r"(" + _D + r"{1,3})\s*(?:degrees?|deg\.?|°)" + _SEP +
+            r"(" + _D + r"{1,2})\s*(?:minutes?|min\.?|['’])" + _SEP +
+            r"(" + _D + r"{1,2})\s*" + _SECONDS_MARK)
+
 _NON_TANGENTIAL_CURVE_RE = re.compile(
-    r"curve\s+to\s+the\s+(right|left)\s+having\s+a\s+central\s+\S{0,10}gle\s+of\s*"
-    r"(\d{1,3})\s*(?:degrees?|deg\.?|°)\s*(\d{1,2})\s*(?:minutes?|min\.?|['’])\s*(\d{1,2})\s*(?:seconds?|sec\.?|[\"”]+)?"
-    r".{0,80}?\S*dius\s+of\s+([\d,]+\.?\d*)\s*feet"
-    r".{0,120}?radius\s+bears\s+(North|South)\s*(\d{1,3})\s*(?:degrees?|deg\.?|°)\s*(\d{1,2})\s*"
-    rf"(?:minutes?|min\.?|['’])\s*(\d{{1,2}})\s*(?:seconds?|sec\.?|[\"”]+)?\s*({_EAST}|{_WEST})"
-    r".{0,300}?THENCE\s+in\s+a\s+(north|south)(east|west)erly\s+direction\s*,?\s*"
-    r"an\s+arc\s+(?:distance|length)\s+of\s+([\d,]+\.?\d*)\s*feet",
+    r"curve\s+to\s+the\s+(right|left)\s+having\s+a\s+" + _DELTA_KEYWORD + r"\s*" + _DMS +
+    r".{0,80}?\S*dius\s+of\s+([\d,]+\.?\d*)\s*" + _FEET +
+    r".{0,120}?radius\s+bears\s+(North|South)\s*" + _DMS_OCR + _SEP +
+    r"(" + _EAST + r"|" + _WEST + r")"
+    r".{0,300}?" + _THENCE + r"\s+in\s+a\s+(north|south)(east|west)erly\s+direction\s*,?\s*"
+    r"an\s+arc\s+(?:distance|length)\s+of\s+([\d,]+\.?\d*)\s*" + _FEET,
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -149,18 +179,70 @@ _NON_TANGENTIAL_CURVE_RE = re.compile(
 # TRACT 2: previous course N54°34'21"W (az 305.43°), candidate tangents 16.45°
 # and 196.45°, the nearer one giving a chord that closes the tract to 0.03 ft.
 _TANGENT_CURVE_RE = re.compile(
-    r"curve\s+to\s+the\s+(right|left)\s+whose\s+radius\s+point\s+bears\s+"
-    rf"(North|South)\s*({_D}{{1,3}})\s*(?:degrees?|deg\.?|°)\s*({_D}{{1,2}})\s*(?:minutes?|min\.?|['’])\s*"
-    rf"({_D}{{1,2}})\s*{_SECONDS_MARK}\s*({_EAST}|{_WEST})"
-    r".{0,90}?central\s+\S{0,10}gle\s+of\s*(\d{1,3})\s*(?:degrees?|deg\.?|°)\s*(\d{1,2})\s*"
-    r"(?:minutes?|min\.?|['’])\s*(\d{1,2})\s*(?:seconds?|sec\.?|[\"”]+)?"
-    r".{0,90}?\S*dius\s+of\s+([\d,]+\.?\d*)\s*feet"
-    r".{0,260}?THENCE[,;:]?\s+with\s+said\s+circular\s+curve\s+to\s+the\s+(?:right|left)"
-    r".{0,160}?an\s+arc\s+(?:length|distance)\s+of\s+([\d,]+\.?\d*)\s*feet",
+    r"curve\s+to\s+the\s+(right|left)[,\s]+whose\s+radius\s+point\s+bears\s+"
+    r"(North|South)\s*" + _DMS_OCR + _SEP + r"(" + _EAST + r"|" + _WEST + r")"
+    r".{0,90}?" + _DELTA_KEYWORD + r"\s*" + _DMS +
+    r".{0,90}?\S*dius\s+of\s+([\d,]+\.?\d*)\s*" + _FEET +
+    # The arc call restates the turn as prose ("fo the right", "to the rj ht" in
+    # covid 5839) -- already captured above, so it is skipped rather than
+    # re-parsed, and never gets a chance to fail on its own OCR damage.
+    r".{0,260}?" + _THENCE + r"[,;:]?\s+with\s+(?:said\s+)?(?:the\s+)?circular\s+curve"
+    # Up to a sentence of prose can sit between the curve restatement and its
+    # arc length -- covid 5838 writes "with said circular curve to the right,
+    # continuing with the southeast boundary of this tract, an arc length of
+    # 364.77 feet". [^;] keeps the match inside that one sentence.
+    r"[^;]{0,200}?an\s+arc\s+(?:length|distance)\s+of\s+([\d,]+\.?\d*)\s*" + _FEET,
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+# A curve stated at a POINT OF CURVATURE, with no radius bearing at all --
+# covid 5839's third real curve shape:
+#
+#   "...a distance of 644.54 feet to a 5/8 inch iron rod ... set for the point of
+#    curvature of a circular curve to the right which has a delta angle of
+#    24 degrees 30'28", a radius of 300.00 feet, a tangent length of 65.16 feet
+#    and an arc length of 128.32 feet; Thence, with said circular curve to the
+#    right, an arc length of 128,32 feet to a 5/8 inch iron rod ..."
+#
+# The deed omits the radius bearing because the geometry supplies it: a curve at
+# a point of curvature is tangent to the course that arrives there, so the
+# tangent is simply the previous course's azimuth. Matched after the two
+# radius-bearing forms above and deduplicated against them by arc position, so a
+# curve that DOES state its radius bearing is never read twice.
+_PC_TANGENT_CURVE_RE = re.compile(
+    r"point\s+of\s+curvature\s+of\s+(?:a|an|another)\s+circular\s+curve\s+(?:to|fo)\s+the\s+(right|left)"
+    r"[^;]{0,40}?" + _DELTA_KEYWORD + r"\s*(\d{1,3})\s*(?:degrees?|deg\.?|°)" + _SEP + r"(\d{1,2})\s*"
+    r"(?:minutes?|min\.?|['\u2019])\s*(\d{1,2})\s*" + _SECONDS_MARK +
+    r".{0,90}?\S*dius\s+of\s+([\d,]+\.?\d*)\s*" + _FEET +
+    r".{0,260}?" + _THENCE + r"[,;:]?\s+with\s+(?:said\s+)?(?:the\s+)?circular\s+curve"
+    r"[^;]{0,40}?an\s+arc\s+(?:length|distance)\s+of\s+([\d,]+\.?\d*)\s*" + _FEET,
     re.IGNORECASE | re.DOTALL,
 )
 
 _BEGINNING_RE = re.compile(r"BEGINNING\s+at\s+([^;]+);", re.IGNORECASE | re.DOTALL)
+
+
+
+def _feet(raw: str) -> float:
+    """Read a distance that may carry an OCR'd DECIMAL comma.
+
+    Confirmed real and dangerous (covid 5839/Nueces): that deed recites
+    "a tangent length of 244,30 feet" and "an arc length of 128,32 feet".
+    Stripping commas as thousands separators turns 244.30 ft into 24,430 ft --
+    a silent hundredfold error that corrupts a traverse rather than failing
+    loudly, which is the worst way for this to go wrong.
+
+    A comma is read as a DECIMAL POINT only when it is followed by exactly two
+    digits at the end of the number and there is no real decimal point already.
+    Genuine thousands separators are always followed by three digits
+    ("1,516.17", "2,364"), so the two forms cannot be confused.
+    """
+    raw = raw.strip()
+    if re.fullmatch(r"\d{1,3}(?:,\d{3})*,\d{2}", raw) or re.fullmatch(r"\d+,\d{2}", raw):
+        head, _, dec = raw.rpartition(",")
+        return float(head.replace(",", "") + "." + dec)
+    return float(raw.replace(",", ""))
 
 
 @dataclass
@@ -198,9 +280,30 @@ class Course:
         return 360 - angle  # NORTH / WEST
 
 
+def _chord(turn: str, delta_deg: float, radius_ft: float, arc_ft: float,
+           tangent: float) -> "Course":
+    """Chord course from a resolved tangent: the tangent rotated half the
+    central angle toward the side the curve turns, of length 2R sin(delta/2)."""
+    az = (tangent + (delta_deg / 2.0 if turn.lower() == "right" else -delta_deg / 2.0)) % 360.0
+    chord_ft = 2.0 * radius_ft * math.sin(math.radians(delta_deg) / 2.0)
+
+    ns = "North" if (az < 90.0 or az > 270.0) else "South"
+    ew = "East" if az < 180.0 else "West"
+    acute = az if az < 90.0 else (360.0 - az if az > 270.0 else abs(180.0 - az))
+    deg = int(acute)
+    minutes = int((acute - deg) * 60)
+    seconds = (((acute - deg) * 60) - minutes) * 60
+    return Course(
+        ns=ns, degrees=float(deg), minutes=float(minutes), seconds=seconds,
+        ew=ew, distance_ft=chord_ft, is_curve=True, radius_ft=radius_ft,
+        delta_deg=delta_deg, curve_direction=turn.lower(), arc_length_ft=arc_ft,
+    )
+
+
 def _chord_from_curve(
-    turn: str, delta_deg: float, radius_ft: float,
-    radius_ns: str, radius_brg_deg: float, radius_ew: str, arc_ft: float,
+    turn: str, delta_deg: float, radius_ft: float, arc_ft: float,
+    radius_ns: str | None = None, radius_brg_deg: float | None = None,
+    radius_ew: str | None = None,
     general_ns: str | None = None, general_ew: str | None = None,
     prev_azimuth: float | None = None,
 ) -> Course:
@@ -214,13 +317,28 @@ def _chord_from_curve(
     previous course's azimuth, since a boundary curve continues the traverse.
     With neither available this raises, and the caller drops the course so the
     gap surfaces as a bad closure."""
-    r_az = radius_brg_deg if radius_ns.lower() == "north" else 180.0 - radius_brg_deg
-    if re.match(_WEST, radius_ew, re.IGNORECASE):
-        r_az = -r_az
-    r_az %= 360.0
-
-    candidates = ((r_az + 90.0) % 360.0, (r_az - 90.0) % 360.0)
-    tangent = None
+    if radius_ns is None:
+        # A POINT OF CURVATURE curve states no radius bearing because it does not
+        # need one: by definition the curve is tangent to the course arriving at
+        # that point, so the tangent IS the previous course's azimuth and there
+        # is nothing to resolve. Confirmed real (covid 5839/Nueces): "...644.54
+        # feet to a 5/8 inch iron rod set for the point of curvature of a
+        # circular curve to the right which has a delta angle of 24 degrees
+        # 30'28\", a radius of 300.00 feet". Without a previous course this is
+        # genuinely unanchored, so it raises rather than assuming one.
+        if prev_azimuth is None:
+            raise ValueError(
+                "point-of-curvature curve has no radius bearing and no previous course to "
+                "take its tangent from -- not guessed at"
+            )
+        return _chord(turn, delta_deg, radius_ft, arc_ft, prev_azimuth)
+    else:
+        r_az = radius_brg_deg if radius_ns.lower() == "north" else 180.0 - radius_brg_deg
+        if re.match(_WEST, radius_ew, re.IGNORECASE):
+            r_az = -r_az
+        r_az %= 360.0
+        candidates = ((r_az + 90.0) % 360.0, (r_az - 90.0) % 360.0)
+        tangent = None
     if general_ns and general_ew:
         # Strongest signal: the deed names the direction outright.
         want_north = general_ns.lower() == "north"
@@ -249,20 +367,7 @@ def _chord_from_curve(
     else:
         raise ValueError("curve has neither a stated direction nor a previous course to resolve against")
 
-    az = (tangent + (delta_deg / 2.0 if turn.lower() == "right" else -delta_deg / 2.0)) % 360.0
-    chord_ft = 2.0 * radius_ft * math.sin(math.radians(delta_deg) / 2.0)
-
-    ns = "North" if (az < 90.0 or az > 270.0) else "South"
-    ew = "East" if az < 180.0 else "West"
-    acute = az if az < 90.0 else (360.0 - az if az > 270.0 else abs(180.0 - az))
-    deg = int(acute)
-    minutes = int((acute - deg) * 60)
-    seconds = (((acute - deg) * 60) - minutes) * 60
-    return Course(
-        ns=ns, degrees=float(deg), minutes=float(minutes), seconds=seconds,
-        ew=ew, distance_ft=chord_ft, is_curve=True, radius_ft=radius_ft,
-        delta_deg=delta_deg, curve_direction=turn.lower(), arc_length_ft=arc_ft,
-    )
+    return _chord(turn, delta_deg, radius_ft, arc_ft, tangent)
 
 
 def extract_courses(text: str) -> list[Course]:
@@ -285,7 +390,7 @@ def extract_courses(text: str) -> list[Course]:
         ns, deg, minute, sec, ew, dist = m.groups()
         matches.append((m.start(), Course(
             ns=ns, degrees=float(deg), minutes=float(minute), seconds=float(sec),
-            ew=ew, distance_ft=float(dist.replace(",", "")),
+            ew=ew, distance_ft=_feet(dist),
         )))
     for m in _COMPOUND_BEARING_RE.finditer(text):
         # Confirmed real (covid 5838/Nueces): this pattern's own "<bearing>, a
@@ -302,7 +407,7 @@ def extract_courses(text: str) -> list[Course]:
         ns, deg, minute, sec, ew, dist = m.groups()
         matches.append((m.start(), Course(
             ns=ns, degrees=float(deg), minutes=float(minute), seconds=float(sec),
-            ew=ew, distance_ft=float(dist.replace(",", "")),
+            ew=ew, distance_ft=_feet(dist),
         )))
     # Curves are resolved AFTER the straight courses are in document order,
     # because the tangent-form ones need the previous course's own azimuth to
@@ -317,10 +422,10 @@ def extract_courses(text: str) -> list[Course]:
          gen_ns, gen_ew, arc) = m.groups()
         pending.append((m.end(), dict(
             turn=turn, delta_deg=float(d_deg) + float(d_min) / 60.0 + float(d_sec) / 3600.0,
-            radius_ft=float(radius.replace(",", "")), radius_ns=r_ns,
+            radius_ft=_feet(radius), radius_ns=r_ns,
             radius_brg_deg=float(r_deg) + float(r_min) / 60.0 + float(r_sec) / 3600.0,
             radius_ew=r_ew, general_ns=gen_ns, general_ew=gen_ew,
-            arc_ft=float(arc.replace(",", "")))))
+            arc_ft=_feet(arc))))
     for m in _TANGENT_CURVE_RE.finditer(text):
         (turn, r_ns, r_deg, r_min, r_sec, r_ew, d_deg, d_min, d_sec, radius, arc) = m.groups()
         r_deg, r_min, r_sec = _ocr_int(r_deg), _ocr_int(r_min), _ocr_int(r_sec)
@@ -328,9 +433,20 @@ def extract_courses(text: str) -> list[Course]:
             continue                       # already captured by the direction-word form
         pending.append((m.end(), dict(
             turn=turn, delta_deg=float(d_deg) + float(d_min) / 60.0 + float(d_sec) / 3600.0,
-            radius_ft=float(radius.replace(",", "")), radius_ns=r_ns,
+            radius_ft=_feet(radius), radius_ns=r_ns,
             radius_brg_deg=r_deg + r_min / 60.0 + r_sec / 3600.0,
-            radius_ew=r_ew, arc_ft=float(arc.replace(",", "")))))
+            radius_ew=r_ew, arc_ft=_feet(arc))))
+    # LAST, so the two forms that state a radius bearing get first claim: this
+    # pattern also matches their text (they sit at a point of curvature too), and
+    # reading a NON-tangential curve as tangent would take its chord off the
+    # previous course instead of off its own stated radius.
+    for m in _PC_TANGENT_CURVE_RE.finditer(text):
+        turn, d_deg, d_min, d_sec, radius, arc = m.groups()
+        if any(abs(pos - m.end()) < 5 for pos, _ in pending):
+            continue                       # already read with its radius bearing
+        pending.append((m.end(), dict(
+            turn=turn, delta_deg=float(d_deg) + float(d_min) / 60.0 + float(d_sec) / 3600.0,
+            radius_ft=_feet(radius), arc_ft=_feet(arc))))
 
     for pos, kw in sorted(pending, key=lambda pair: pair[0]):
         # Must be the NEAREST preceding course, taken by position -- not the last

@@ -85,6 +85,7 @@ def _escalated_cache_path(covid: str) -> str:
 
 def escalate_to_vision_ocr(
     covid: str, pdf_path: str, remaining_page_budget: int, model: str = LLM_MODEL_HARDEST,
+    pages: list[int] | None = None,
 ) -> dict:
     """The costed tier ONLY -- does not retry prefer_fuller_cache (a caller
     that already tried it, e.g. app/ingestion/walk.py's own iter_candidates,
@@ -98,7 +99,19 @@ def escalate_to_vision_ocr(
     MAX_PAGES_PER_DOCUMENT regardless of how much budget remains. Returns
     resolved=False, capped=True if the budget can't cover even one page --
     explicitly left for a human to approve a larger budget, never silently
-    skipped."""
+    skipped.
+
+    `pages` (1-indexed) overrides the last-N heuristic when the caller already
+    KNOWS which pages matter, which is strictly better than guessing: the cached
+    text of these documents is form-feed delimited, so the page carrying a given
+    tract can be located for free before spending anything. Confirmed useful on
+    covid 5839, whose 43.354 acre tract runs pages 14-17 of 21 -- the last-N
+    heuristic would have read pages 19-21 and missed it entirely.
+
+    An explicit page list also bypasses MAX_PAGES_PER_DOCUMENT, because that cap
+    exists to stop an unbounded guess from walking a whole document; naming the
+    pages IS the deliberate choice it asks for. remaining_page_budget still
+    binds, so the spend stays capped by the caller either way."""
     cached_path = _escalated_cache_path(covid)
     if os.path.exists(cached_path):
         with open(cached_path, encoding="utf-8") as f:
@@ -118,8 +131,20 @@ def escalate_to_vision_ocr(
 
     images = convert_from_path(pdf_path)
     total_pages = len(images)
-    n_pages = min(remaining_page_budget, total_pages, MAX_PAGES_PER_DOCUMENT)
-    pages_to_try = images[-n_pages:]  # last N pages -- see docstring's heuristic note
+    if pages:
+        wanted = [n for n in sorted(set(pages)) if 1 <= n <= total_pages]
+        if not wanted:
+            return {"covid": covid, "resolved": False, "resolved_via": None,
+                    "pages_escalated": 0, "capped": False,
+                    "reason": f"none of pages {sorted(set(pages))} exist in a "
+                              f"{total_pages}-page document"}
+        wanted = wanted[:remaining_page_budget]
+        pages_to_try = [images[n - 1] for n in wanted]
+        n_pages = len(pages_to_try)
+    else:
+        n_pages = min(remaining_page_budget, total_pages, MAX_PAGES_PER_DOCUMENT)
+        wanted = list(range(total_pages - n_pages + 1, total_pages + 1))
+        pages_to_try = images[-n_pages:]  # last N pages -- see docstring's heuristic note
 
     texts, confidences, notes = [], [], []
     usage_totals = {
@@ -146,15 +171,16 @@ def escalate_to_vision_ocr(
 
     combined_text = "\n\n".join(texts)
     min_confidence = min(confidences) if confidences else None
-    print(f"  [ocr_escalation] covid={covid} pages={n_pages} total_usage={usage_totals}")
+    print(f"  [ocr_escalation] covid={covid} pages={wanted} total_usage={usage_totals}")
 
     with open(cached_path, "w", encoding="utf-8") as f:
         json.dump({"covid": covid, "text": combined_text, "min_confidence": min_confidence,
-                   "notes": notes, "pages_escalated": n_pages, "model": model,
-                   "usage": usage_totals}, f)
+                   "notes": notes, "pages_escalated": n_pages, "page_numbers": wanted,
+                   "model": model, "usage": usage_totals}, f)
 
     return {"covid": covid, "resolved": True, "resolved_via": "vision_ocr", "text": combined_text,
-            "pages_escalated": n_pages, "capped": n_pages < total_pages, "min_confidence": min_confidence,
+            "pages_escalated": n_pages, "page_numbers": wanted,
+            "capped": n_pages < total_pages, "min_confidence": min_confidence,
             "notes": notes, "usage": usage_totals}
 
 
