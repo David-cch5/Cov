@@ -520,6 +520,110 @@ def walk_traverse(courses: list[Course]) -> dict:
     }
 
 
+# Digit pairs OCR actually confuses, by glyph shape. Used only to generate
+# CANDIDATE re-readings of a bearing that already failed to close -- never to
+# alter a value that parsed cleanly.
+_CONFUSABLE_DIGITS = {
+    "0": "689", "1": "7", "2": "7", "3": "58", "4": "9",
+    "5": "368", "6": "058", "7": "12", "8": "03569", "9": "048",
+}
+
+
+def _digit_rereadings(value: float, ceiling: int) -> list[int]:
+    """Plausible OCR re-readings of a printed number: one digit swapped for a
+    confusable one, or two adjacent digits transposed. covid 5838 supplied a
+    real transposition -- a tract headed "3.828 acres" whose own terminator and
+    traverse both say 3.282."""
+    raw = f"{int(value)}"
+    out = set()
+    for i, ch in enumerate(raw):
+        for sub in _CONFUSABLE_DIGITS.get(ch, ""):
+            out.add(int(raw[:i] + sub + raw[i + 1:]))
+    for i in range(len(raw) - 1):
+        out.add(int(raw[:i] + raw[i + 1] + raw[i] + raw[i + 2:]))
+    return [v for v in out if 0 <= v < ceiling and v != int(value)]
+
+
+def repair_bearing_by_closure(
+    courses: list[Course],
+    stated_acres: float | None = None,
+    max_closure_ft: float = 1.0,
+    min_closure_ratio_denominator: float = 20_000.0,
+    max_area_deviation: float = 0.01,
+) -> tuple[list[Course], dict | None]:
+    """Recover a misread DEGREES or MINUTES value in one bearing, when the
+    traverse's own closure and area together prove which reading was meant.
+
+    repair_quadrant_by_closure covers the case where only the N/S/E/W letter is
+    wrong. This covers the other half: covid 5839's 43.354 acre tract has every
+    course the deed calls, every distance matching, and still misses its own
+    Point of Beginning by 1,294 feet -- so the defect is in a bearing's digits,
+    which a quadrant flip cannot reach.
+
+    The search space is deliberately NOT arbitrary numbers. Candidates are only
+    plausible OCR re-readings of the digits actually printed: one digit swapped
+    for a confusable one, or two transposed. A value nothing misread cannot be
+    "repaired" into existence.
+
+    Two independent conditions must BOTH hold, and only one candidate may
+    satisfy them:
+      * the traverse closes to survey tolerance, and
+      * the area lands on the deed's own stated acreage.
+    Requiring both is what makes this safe rather than curve-fitting. Closure
+    alone can be hit by luck across several hundred candidates; closure AND an
+    independently stated acreage, from a single-digit change, effectively cannot.
+    With no stated acreage the area test cannot run, so the bar rises: the repair
+    is refused outright rather than accepted on closure alone.
+
+    Returns (courses, repair); repair is None when nothing was changed.
+    """
+    base = walk_traverse(courses)
+    if base["closure_error_ft"] <= max_closure_ft:
+        return courses, None
+    if stated_acres is None:
+        return courses, None
+
+    candidates = []
+    for i, course in enumerate(courses):
+        if course.is_curve:
+            # A curve's bearing is DERIVED, not printed -- a wrong chord means
+            # its radius bearing or its tangent was misread, which is a
+            # different defect with a different fix.
+            continue
+        for field, ceiling in (("degrees", 90), ("minutes", 60)):
+            for value in _digit_rereadings(getattr(course, field), ceiling):
+                trial = list(courses)
+                trial[i] = replace(course, **{field: float(value)})
+                result = walk_traverse(trial)
+                if result["closure_error_ft"] > max_closure_ft:
+                    continue
+                if (result["closure_ratio"] or 1) > 1.0 / min_closure_ratio_denominator:
+                    continue
+                if abs(result["area_acres"] - stated_acres) / stated_acres > max_area_deviation:
+                    continue
+                candidates.append((i, field, value, trial, result))
+
+    if len(candidates) != 1:
+        return courses, None
+
+    i, field, value, repaired, result = candidates[0]
+    before, after = courses[i], repaired[i]
+    return repaired, {
+        "course_index": i, "field": field,
+        "from": getattr(before, field), "to": float(value),
+        "bearing_before": f"{before.ns} {before.degrees:.0f}°{before.minutes:02.0f}'"
+                          f"{before.seconds:02.0f}\" {before.ew}",
+        "bearing_after": f"{after.ns} {after.degrees:.0f}°{after.minutes:02.0f}'"
+                         f"{after.seconds:02.0f}\" {after.ew}",
+        "distance_ft": before.distance_ft,
+        "closure_before_ft": base["closure_error_ft"],
+        "closure_after_ft": result["closure_error_ft"],
+        "area_before_acres": base["area_acres"],
+        "area_after_acres": result["area_acres"],
+        "stated_acres": stated_acres,
+    }
+
+
 def repair_quadrant_by_closure(
     courses: list[Course],
     max_closure_ft: float = 0.5,

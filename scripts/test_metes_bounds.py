@@ -17,6 +17,7 @@ from app.parsing.legal_description.metes_bounds import (
     Course,
     _feet,
     extract_courses,
+    repair_bearing_by_closure,
     repair_quadrant_by_closure,
     walk_traverse,
 )
@@ -391,6 +392,68 @@ def test_a_curve_with_no_radius_bearing_and_no_previous_course_is_dropped() -> N
     print("PASS: a point-of-curvature curve with no arriving course is dropped, not guessed at")
 
 
+def _covid_5838_primary_courses():
+    import re as _re
+    with get_session() as session:
+        deed = " ".join((get_deed_text(session, 5838) or "").split())
+    sae = deed.find("SAVE AND EXCEPT THE FOLLOWING")
+    start = deed.find("BEGINNING at a 3/4 inch iron bolt")
+    end = start + _re.search(r"containing\s+([\d.,]+)\s+acres", deed[start:sae]).end()
+    return extract_courses(deed[start:end])
+
+
+def test_bearing_repair_recovers_a_misread_degree_or_minute() -> None:
+    """repair_quadrant_by_closure covers a wrong N/S/E/W letter. This covers the
+    other half -- a misread DIGIT in the degrees or minutes, which no quadrant
+    flip can reach.
+
+    Exercised by injecting known errors into covid 5838's primary tract, which
+    genuinely closes (318.778 ac against a stated 318.779, 0.017 ft), and
+    confirming each is recovered exactly. The third case matters most: an 18
+    arc-minute error moves closure to only 37.88 ft, well inside what a careless
+    reader would accept as 'a rough survey'."""
+    courses = _covid_5838_primary_courses()
+    for index, field, wrong in ((1, "degrees", 84.0), (4, "minutes", 13.0), (8, "degrees", 85.0)):
+        original = getattr(courses[index], field)
+        broken = list(courses)
+        broken[index] = Course(**{**courses[index].__dict__, field: wrong})
+        assert walk_traverse(broken)["closure_error_ft"] > 30, (index, field)
+        repaired, repair = repair_bearing_by_closure(broken, stated_acres=318.779)
+        assert repair is not None, f"no repair found for {index} {field}"
+        assert repair["course_index"] == index and repair["field"] == field, repair
+        assert repair["to"] == original, repair
+        assert walk_traverse(repaired)["closure_error_ft"] < 1.0, repair
+    print("PASS: bearing repair recovers misread degrees and minutes, including an 18' "
+          "error that alone leaves closure at only 37.88 ft")
+
+
+def test_bearing_repair_refuses_without_a_stated_acreage() -> None:
+    """Closure alone can be hit by luck across several hundred candidate
+    re-readings. What makes this safe is requiring the repaired traverse to ALSO
+    land on the deed's own independently stated acreage. With no stated acreage
+    that second check cannot run, so the repair is refused rather than accepted
+    on closure alone -- and a traverse that already closes is never touched."""
+    courses = _covid_5838_primary_courses()
+    broken = list(courses)
+    broken[1] = Course(**{**courses[1].__dict__, "degrees": 84.0})
+    assert repair_bearing_by_closure(broken, stated_acres=None)[1] is None
+    assert repair_bearing_by_closure(courses, stated_acres=318.779)[1] is None
+    print("PASS: bearing repair refuses without a stated acreage, and never touches a "
+          "traverse that already closes")
+
+
+def test_bearing_repair_declines_covid_5839s_open_tract() -> None:
+    """The honest outcome on the tract this was built for. covid 5839's 43.354
+    acre tract has every course the deed calls and every distance matching, yet
+    misses its Point of Beginning by 1,294 ft. No single misread digit in any one
+    bearing both closes it and reconciles its acreage, so the repair declines --
+    the traverse stays open and the tract stays unanchored, rather than being
+    forced onto a reading that merely closes."""
+    courses = _covid_5838_primary_courses()          # a sound traverse, wrong acreage
+    assert repair_bearing_by_closure(courses, stated_acres=43.354)[1] is None
+    print("PASS: no unique digit re-reading is accepted just because it closes")
+
+
 if __name__ == "__main__":
     test_spelled_out_bearing_units()
     test_curly_quote_minutes_marker()
@@ -407,4 +470,7 @@ if __name__ == "__main__":
     test_ocr_decimal_comma_is_not_read_as_a_thousands_separator()
     test_point_of_curvature_curve_needs_no_radius_bearing()
     test_a_curve_with_no_radius_bearing_and_no_previous_course_is_dropped()
+    test_bearing_repair_recovers_a_misread_degree_or_minute()
+    test_bearing_repair_refuses_without_a_stated_acreage()
+    test_bearing_repair_declines_covid_5839s_open_tract()
     print("\nall metes-and-bounds parser tests passed")
