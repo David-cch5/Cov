@@ -116,12 +116,22 @@ def escalate_to_vision_ocr(
     if os.path.exists(cached_path):
         with open(cached_path, encoding="utf-8") as f:
             cached = json.load(f)
-        return {"covid": covid, "resolved": True, "resolved_via": "vision_ocr_cached",
-                "text": cached["text"], "pages_escalated": 0, "capped": False,
-                "min_confidence": cached.get("min_confidence"),
-                # 0 tokens, not the original run's usage -- this call made no API request at all.
-                "usage": {"input_tokens": 0, "output_tokens": 0,
-                          "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}}
+        # Confirmed real, and caught the hard way: a 4-page targeted escalation of
+        # covid 5839 was served back to ingestion as that covenant's whole text,
+        # so field extraction saw only Exhibit A and returned declarant
+        # '<UNKNOWN>' at 0.15 confidence. A partial transcription is only
+        # reusable by a caller asking for those same pages; anyone else must not
+        # receive it, and gets a fresh full-document escalation instead.
+        if cached.get("partial") and set(pages or []) != set(cached.get("page_numbers") or []):
+            cached = None
+        if cached is not None:
+            return {"covid": covid, "resolved": True, "resolved_via": "vision_ocr_cached",
+                    "text": cached["text"], "pages_escalated": 0, "capped": False,
+                    "min_confidence": cached.get("min_confidence"),
+                    "page_numbers": cached.get("page_numbers"),
+                    # 0 tokens, not the original run's usage -- no API request was made.
+                    "usage": {"input_tokens": 0, "output_tokens": 0,
+                              "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}}
 
     if remaining_page_budget <= 0:
         return {"covid": covid, "resolved": False, "resolved_via": None,
@@ -176,6 +186,10 @@ def escalate_to_vision_ocr(
     with open(cached_path, "w", encoding="utf-8") as f:
         json.dump({"covid": covid, "text": combined_text, "min_confidence": min_confidence,
                    "notes": notes, "pages_escalated": n_pages, "page_numbers": wanted,
+                   # A page-targeted run transcribes ONLY those pages, so its text is
+                   # NOT the document. Flagged so the cache can never later be handed
+                   # back as a whole-document transcription -- see the cache lookup.
+                   "partial": bool(pages), "total_pages": total_pages,
                    "model": model, "usage": usage_totals}, f)
 
     return {"covid": covid, "resolved": True, "resolved_via": "vision_ocr", "text": combined_text,
