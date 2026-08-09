@@ -99,8 +99,19 @@ never anchor a tract by hand-writing a one-off script per covenant again.
    - **Check for an NGS tie before anything cleverer.** When a deed says "a National Geodetic
      Survey monument stamped X bears <bearing> <distance>", the answer is published, free and
      survey-grade: `extract_ngs_monument_ties` → `app/gis/ngs.py`'s `find_monuments` →
-     `anchor_by_ngs_monument_tie`. It needs no rotation solve, because a deed reciting ties this
-     way is working on the State Plane grid, so its bearings ARE grid azimuths.
+     `anchor_by_ngs_monument_tie`, wired as Tier 0b in `anchor_resolver.py`. It needs no rotation
+     solve, because a deed reciting ties this way is working on the State Plane grid, so its
+     bearings ARE grid azimuths.
+   - Only ties attached to the **Point of Beginning** are used deterministically. A tie names the
+     corner it runs from, and mapping a named corner onto a traverse vertex is the same judgment
+     call tiers 0c/0d defer to the LLM. "At the POB" means before the first real COURSE, not the
+     first "thence" — covid 5838's 3.103 ac tract reaches its tie through a two-leg offset whose
+     own text contains "thence".
+   - **Keep the NGS search box small.** `/api/nde/bounds` silently caps at 500 marks with no error
+     and no truncation flag. Nueces' own parcel extent returns 415 and finds both SF 010 and KNOLL;
+     buffered by 0.25° it returns exactly 500 and finds NEITHER. `find_monuments` raises on that
+     rather than reporting a published monument as missing — a tie runs thousands of feet, so
+     0.05° is already generous.
    - Three independent checks make it trustworthy, and all three are cheap: the zone mapping is
      confirmed by reprojecting the monument's own lat/lon back onto its datasheet's own grid
      coordinates (0.006 ft on covid 5838); two ties to two monuments reconstruct the

@@ -23,10 +23,14 @@ sys.path.insert(0, ".")
 
 from app.db.session import get_session
 from app.gis.anchor_resolver import (
-    _MAX_ACREAGE_DEVIATION, _polygon_area_acres, _try_parcel_tie, _try_sibling_tract_tie,
+    _MAX_ACREAGE_DEVIATION, _NGS_BBOX_BUFFER_DEG, _get_deed_text, _ngs_search_bbox,
+    _polygon_area_acres, _try_ngs_monument_tie, _try_parcel_tie, _try_sibling_tract_tie,
     _try_stated_coordinate, _verify_llm_anchor,
 )
-from app.parsing.legal_description.metes_bounds import extract_courses
+from app.gis.ngs import NGS_BOUNDS_RESULT_CAP, find_monuments
+from app.parsing.legal_description.metes_bounds import (
+    extract_courses, repair_quadrant_by_closure,
+)
 
 _SIMPLE_SQUARE_COURSES_TEXT = (
     "BEGINNING at a point;\n"
@@ -80,6 +84,95 @@ def test_sibling_and_parcel_tie_are_deliberately_stubbed() -> None:
         assert _try_sibling_tract_tie(session, covid=5838, tract_no=1) is None
         assert _try_parcel_tie(session, "48355", "any text", []) is None
     print("PASS: sibling-tie and parcel-tie tiers correctly deferred (not half-automated)")
+
+
+def _covid_5838_excepted_segments():
+    import re
+    with get_session() as session:
+        deed = _get_deed_text(session, 5838, None)
+    sae = deed.find("SAVE AND EXCEPT THE FOLLOWING")
+    out, prev = [], sae
+    for m in re.finditer(r"containing\s+([\d.,]+)\s+acres", deed[sae:]):
+        end = sae + m.end()
+        out.append((float(m.group(1).replace(",", "")), deed[prev:end]))
+        prev = end
+    return deed, out
+
+
+def test_ngs_tier_declines_a_tie_that_is_not_at_the_point_of_beginning() -> None:
+    """The restriction that makes this tier safe. covid 5838 tract 1 begins at
+    "a 3/4 inch iron bolt" reciting no monument at all -- yet its document
+    contains TWELVE monument ties, every one belonging to a SAVE AND EXCEPT
+    tract further down. Anchoring tract 1 off one of those would place it on
+    another tract's corner entirely, so the tier must return None and let the
+    LLM tiers reason about it instead."""
+    deed, _ = _covid_5838_excepted_segments()
+    with get_session() as session:
+        got = _try_ngs_monument_tie(session, "48355", deed, extract_courses(deed))
+    assert got is None, got
+    print("PASS: NGS tier declines covid 5838 tract 1 -- its 12 ties all belong to other tracts")
+
+
+def test_ngs_tier_places_every_tie_that_is_at_the_point_of_beginning() -> None:
+    """All six of covid 5838's SAVE AND EXCEPT tracts DO tie their own Point of
+    Beginning to SF 010, and each must place at full confidence: the zone check
+    reproduces the monument's own datasheet grid coordinates, and a second tie
+    to KNOLL cross-checks the placement.
+
+    The 3.103 ac tract is the one that pins the 'first COURSE, not first thence'
+    rule: it reaches its tie through a two-leg offset reciting "...and thence
+    North 35 24'54\" East 50.00 feet and from which north corner...", so a
+    first-THENCE rule would wrongly treat its tie as post-boundary and decline."""
+    _, segments = _covid_5838_excepted_segments()
+    assert len(segments) == 6, len(segments)
+    with get_session() as session:
+        for acres, segment in segments:
+            courses, _ = repair_quadrant_by_closure(extract_courses(segment))
+            got = _try_ngs_monument_tie(session, "48355", segment, courses)
+            assert got is not None, f"{acres} ac declined"
+            assert got["method"] == "ngs_monument_tie", got
+            assert got["confidence"] == 0.95, (acres, got)
+            assert "SF 010" in got["reasoning"], got
+    print("PASS: NGS tier places all 6 covid 5838 carve-outs at 0.95 (zone check + cross-check)")
+
+
+def test_ngs_search_bbox_is_narrow_and_skips_an_unloaded_county() -> None:
+    """A county with no parcels yet gives no search area, which must skip the
+    tier rather than search blind. And the buffer stays small on purpose --
+    see test_ngs_bounds_cap_is_an_error_not_an_answer for what going wide does."""
+    with get_session() as session:
+        assert _ngs_search_bbox(session, "99999") is None
+        bbox = _ngs_search_bbox(session, "48355")
+    assert bbox is not None
+    assert _NGS_BBOX_BUFFER_DEG <= 0.1, _NGS_BBOX_BUFFER_DEG
+    assert bbox["max_lat"] - bbox["min_lat"] < 1.0, bbox
+    print(f"PASS: NGS bbox -> unloaded county skipped; Nueces box "
+          f"{bbox['max_lat'] - bbox['min_lat']:.2f}deg tall at a {_NGS_BBOX_BUFFER_DEG}deg buffer")
+
+
+def test_ngs_bounds_cap_is_an_error_not_an_answer() -> None:
+    """NGS's bounds endpoint silently caps its result list and reports nothing
+    about it -- no error, no truncation flag. Measured: Nueces' own parcel extent
+    returns 415 marks and finds SF 010 and KNOLL; buffered by 0.25 degrees it
+    returns exactly 500 and finds NEITHER. Treating that as "monument not found"
+    would report a published, existing monument as missing, so find_monuments
+    must raise instead."""
+    with get_session() as session:
+        narrow = _ngs_search_bbox(session, "48355")
+    wide = {"min_lon": narrow["min_lon"] - 0.25, "max_lon": narrow["max_lon"] + 0.25,
+            "min_lat": narrow["min_lat"] - 0.25, "max_lat": narrow["max_lat"] + 0.25}
+    try:
+        got = find_monuments({"SF-010", "Knoll"}, wide)
+    except ValueError as exc:
+        assert str(NGS_BOUNDS_RESULT_CAP) in str(exc), exc
+        print(f"PASS: a capped NGS search raises instead of reporting a real monument missing")
+        return
+    except Exception as exc:                       # noqa: BLE001 -- outage, not a regression
+        print(f"SKIP: live NGS unavailable ({type(exc).__name__})")
+        return
+    # If NGS ever raises the cap, the wide search simply succeeds -- also fine.
+    assert {"SF 010", "KNOLL"} <= set(got), got
+    print("PASS: wide NGS search returned both monuments (result cap appears to have been raised)")
 
 
 def test_verify_llm_anchor_rejects_acreage_mismatch() -> None:
@@ -166,6 +259,10 @@ if __name__ == "__main__":
     test_stated_coordinate_absent_returns_none()
     test_stated_coordinate_unknown_county_returns_none()
     test_sibling_and_parcel_tie_are_deliberately_stubbed()
+    test_ngs_tier_declines_a_tie_that_is_not_at_the_point_of_beginning()
+    test_ngs_tier_places_every_tie_that_is_at_the_point_of_beginning()
+    test_ngs_search_bbox_is_narrow_and_skips_an_unloaded_county()
+    test_ngs_bounds_cap_is_an_error_not_an_answer()
     test_verify_llm_anchor_rejects_acreage_mismatch()
     test_verify_llm_anchor_accepts_reconciled_case()
     test_verify_llm_anchor_rejects_malformed_geojson()

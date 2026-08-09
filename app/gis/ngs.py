@@ -27,6 +27,16 @@ import requests
 NGS_BOUNDS_URL = "https://geodesy.noaa.gov/api/nde/bounds"
 NGS_DATASHEET_URL = "https://geodesy.noaa.gov/cgi-bin/ds_mark.prl"
 
+# The bounds endpoint returns at most this many marks and says nothing about it
+# -- no error, no "truncated" field, just a short list. Measured directly against
+# Nueces County: the loaded-parcel extent returns 415 marks and finds both SF 010
+# and KNOLL, while the same box buffered by 0.25 degrees returns exactly 500 and
+# finds NEITHER. A too-broad search therefore reports a monument as missing when
+# it is published and present, which is the worst possible failure here -- so
+# hitting the cap without finding everything asked for is treated as an error,
+# never as an answer.
+NGS_BOUNDS_RESULT_CAP = 500
+
 # NGS datasheet State Plane zone codes -> EPSG (NAD83, US survey feet).
 # Deliberately keyed on the datasheet's own spelling so the mapping is checkable
 # against the sheet rather than inferred from the county.
@@ -134,9 +144,10 @@ def find_monuments(designations, bbox: dict, timeout: int = 45) -> dict:
         "minlat": bbox["min_lat"], "maxlat": bbox["max_lat"],
     }, timeout=timeout)
     resp.raise_for_status()
+    marks = resp.json()
 
     found: dict[str, NgsMonument] = {}
-    for mark in resp.json():
+    for mark in marks:
         key = normalize_designation(mark.get("name"))
         if key not in wanted or key in found:
             continue
@@ -151,5 +162,12 @@ def find_monuments(designations, bbox: dict, timeout: int = 45) -> dict:
             spc_east_sft=sheet.get("spc_east_sft"),
             convergence_deg=sheet.get("convergence_deg"), grid_scale=sheet.get("grid_scale"),
             condition=sheet.get("condition") or mark.get("condition"),
+        )
+    missing = wanted - set(found)
+    if missing and len(marks) >= NGS_BOUNDS_RESULT_CAP:
+        raise ValueError(
+            f"NGS bounds search hit its {NGS_BOUNDS_RESULT_CAP}-result cap and did not return "
+            f"{sorted(missing)} -- the result set is truncated, so this is not evidence the "
+            f"monument does not exist. Narrow the bbox and search again."
         )
     return found

@@ -31,9 +31,19 @@ from app.db.review_notes import merge_tagged_note
 from app.gis.classifier import COUNTY_ADAPTERS, classify_metes_and_bounds_tract
 from app.ingestion.walk import get_deed_text
 from app.gis.geocode_anchor import resolve_metes_bounds_approximate
-from app.gis.state_plane_anchor import EPSG_BY_TX_ZONE, traverse_to_geojson_state_plane
+from app.gis.ngs import find_monuments
+from app.gis.state_plane_anchor import (
+    EPSG_BY_TX_ZONE,
+    anchor_by_ngs_monument_tie,
+    traverse_to_geojson_state_plane,
+)
 from app.llm.anchor_agent import escalate_anchor_to_llm
-from app.parsing.legal_description.metes_bounds import extract_point_of_beginning, walk_traverse
+from app.parsing.legal_description.metes_bounds import (
+    _COURSE_RE,
+    extract_point_of_beginning,
+    walk_traverse,
+)
+from app.parsing.legal_description.monument_ties import extract_ngs_monument_ties
 from app.parsing.legal_description.metes_bounds_llm import extract_courses_with_escalation
 from app.queue.job_queue import JobFailed
 
@@ -51,6 +61,9 @@ _KNOWN_TX_ZONES = {
 _STATE_PLANE_COORD_RE = re.compile(
     r"X\s*=\s*([\d,]+\.?\d*)[^\d]+Y\s*=\s*([\d,]+\.?\d*)", re.IGNORECASE,
 )
+
+# See _ngs_search_bbox: wider is not safer here, it is broken.
+_NGS_BBOX_BUFFER_DEG = 0.05
 
 _MIN_CONFIDENCE_TO_AUTOCOMMIT = 0.75
 # More than this far off the deed's own stated acreage means the candidate
@@ -85,8 +98,120 @@ def _try_stated_coordinate(county_fips: str, legal_description_raw: str, courses
     }
 
 
+def _ngs_search_bbox(session, county_fips: str) -> dict | None:
+    """Where to look for the deed's monuments: the county's own already-loaded
+    parcel extent, buffered a little.
+
+    The buffer is deliberately SMALL. A tie runs thousands of feet -- covid
+    5838's longest is 6,093 ft, about 0.017 degrees -- so 0.05 degrees (roughly
+    3.4 miles) is already generous, and going wider actively breaks the search:
+    NGS's bounds endpoint silently caps at NGS_BOUNDS_RESULT_CAP marks, and the
+    same Nueces box buffered by 0.25 degrees returns 500 marks containing
+    NEITHER monument this deed names, where the unbuffered extent returns 415
+    containing both. find_monuments raises on that case rather than reporting a
+    published monument as missing.
+
+    Returns None when the county has no parcels loaded yet, which correctly
+    skips this tier rather than searching blind."""
+    row = session.execute(
+        text("""
+            SELECT ST_XMin(e) AS min_lon, ST_XMax(e) AS max_lon,
+                   ST_YMin(e) AS min_lat, ST_YMax(e) AS max_lat
+            FROM (SELECT ST_Extent(geom) AS e FROM parcel WHERE county_fips = :fips) x
+        """), {"fips": county_fips},
+    ).fetchone()
+    if row is None or row.min_lon is None:
+        return None
+    buf = _NGS_BBOX_BUFFER_DEG
+    return {"min_lon": row.min_lon - buf, "max_lon": row.max_lon + buf,
+            "min_lat": row.min_lat - buf, "max_lat": row.max_lat + buf}
+
+
+def _try_ngs_monument_tie(session, county_fips: str, deed_text: str, courses: list) -> dict | None:
+    """Tier 0b: the deed ties its Point of Beginning to a published National
+    Geodetic Survey control monument -- "a National Geodetic Survey monument
+    stamped \"SF-010\" bears North 14 01'24\" East 4708.73 feet". That is a real,
+    free, survey-grade georeference: reversing the deed's own bearing and
+    distance from the monument's published State Plane coordinates puts the
+    corner on the ground, with no parcel fitting and no rotation solve (a deed
+    reciting ties this way is working on the grid, so its bearings ARE grid
+    azimuths -- see app/gis/state_plane_anchor.py's own notes).
+
+    ONLY ties attached to the POINT OF BEGINNING are used, and that restriction
+    is the point. A tie names the corner it runs from ("from which north corner
+    of this tract"), and mapping a named corner onto a particular traverse
+    vertex is exactly the judgment call 0c and 0d below decline to automate. A
+    tie sitting in the opening BEGINNING clause, before the first THENCE, is
+    unambiguously vertex 0. Anything later is left to Tier 1, which has the
+    tools to reason about it.
+
+    That rule is deliberately strict enough to decline covid 5838 tract 1: its
+    own POB is an iron bolt reciting no monument at all, and all twelve of that
+    deed's ties belong to its SAVE AND EXCEPT tracts further down the document.
+    Anchoring tract 1 off one of those would be wrong, and this returns None
+    rather than reaching for them.
+
+    Confidence reflects what was actually checked: 0.95 when two ties to two
+    monuments cross-check against the monuments' own published separation, 0.80
+    for a lone tie carrying only the zone check. Either way the candidate still
+    has to survive _attempt_and_verify's live classification before it commits.
+    """
+    if not courses:
+        return None
+    # The boundary starts at the first real COURSE, not the first "thence"
+    # token. That distinction is load-bearing: covid 5838's 3.103 ac tract
+    # reaches its tie through a two-leg offset that says "...105.56 feet and
+    # thence North 35 24'54" East 50.00 feet and from which north corner of this
+    # tract, a National Geodetic Survey monument..." -- the word appears INSIDE
+    # the tie description, before the tie itself. _COURSE_RE requires a full
+    # bearing, distance and "to"/"for" terminator, so it does not match that leg
+    # and the tie is correctly still read as belonging to the Point of Beginning.
+    first_course = _COURSE_RE.search(deed_text)
+    if first_course is None:
+        return None
+    pob_ties = [t for t in extract_ngs_monument_ties(deed_text) if t.position < first_course.start()]
+    if not pob_ties:
+        return None
+
+    bbox = _ngs_search_bbox(session, county_fips)
+    if bbox is None:
+        return None
+    try:
+        monuments = find_monuments({t.designation for t in pob_ties}, bbox)
+        if not monuments:
+            return None
+        placed = anchor_by_ngs_monument_tie(walk_traverse(courses)["vertices"], pob_ties, monuments)
+    except Exception as exc:                  # noqa: BLE001
+        # A NGS outage or an unresolvable tie is a reason to fall through to the
+        # next tier, never to crash the covenant's whole resolution attempt.
+        print(f"  [anchor_resolver] NGS monument tier unavailable: {type(exc).__name__}: {exc}", flush=True)
+        return None
+
+    zone_error = placed.get("zone_check_ft")
+    if zone_error is None or zone_error >= 1.0:
+        # The zone mapping is checkable against the monument's own datasheet and
+        # is off by miles when wrong -- never place on one that doesn't reproduce.
+        return None
+
+    cross = placed.get("cross_check")
+    corrected = (cross or {}).get("corrected")
+    detail = (f"cross-checked against a second monument tie" if cross and cross.get("agree")
+              else f"cross-checked after correcting the {corrected['tie']} tie's {corrected['field']} "
+                   f"quadrant letter" if corrected
+              else "single tie, no second monument to cross-check")
+    return {
+        "geojson": placed["geojson"],
+        "method": "ngs_monument_tie",
+        "confidence": 0.95 if placed["verified"] else 0.80,
+        "reasoning": (f"deed ties its Point of Beginning to NGS monument {placed['monument']} "
+                      f"(PID {placed['pid']}) bearing {placed['tie_used']}; placed on EPSG "
+                      f"{placed['epsg']}, monument reprojects onto its own datasheet grid "
+                      f"coordinates to {zone_error:.3f} ft; {detail}"),
+    }
+
+
 def _try_sibling_tract_tie(session, covid: int, tract_no: int) -> dict | None:
-    """Tier 0b: not automated in this pass. A sibling tract being already
+    """Tier 0c: not automated in this pass. A sibling tract being already
     anchored is a necessary precondition, but identifying WHICH course/
     vertex of THIS tract ties to which real corner of the sibling is a
     judgment call this function deliberately does not attempt -- that's
@@ -95,7 +220,7 @@ def _try_sibling_tract_tie(session, covid: int, tract_no: int) -> dict | None:
 
 
 def _try_parcel_tie(session, county_fips: str, legal_description_raw: str, courses: list) -> dict | None:
-    """Tier 0c: not automated in this pass, for the same reason as 0b.
+    """Tier 0d: not automated in this pass, for the same reason as 0c.
     Confirmed real by this project's own experience: my own manual attempt
     at exactly this kind of tie on covid 5838 accepted a wrong correspondence
     (a 606 ft real edge forced to match a 719.14 ft recited course, a 16%
@@ -290,6 +415,7 @@ def resolve_metes_and_bounds_anchor(session, covid: int, tract_no: int = 1) -> d
 
     for attempt_fn, args in [
         (_try_stated_coordinate, (county_fips, legal_description_raw, courses)),
+        (_try_ngs_monument_tie, (session, county_fips, legal_description_raw, courses)),
         (_try_sibling_tract_tie, (session, covid, tract_no)),
         (_try_parcel_tie, (session, county_fips, legal_description_raw, courses)),
     ]:
