@@ -95,15 +95,20 @@ def test_reconcile_tract_metes_and_bounds_real_residual_unaccounted() -> None:
     metes-and-bounds polygon (934.58 ac) now has a real spatial parcel
     census against it (app/gis/classifier.py's
     classify_metes_and_bounds_tract, run live against Montgomery's ArcGIS
-    service -- 327 parcels matched, 856.418 ac classified). The 78.159-ac
-    gap is a REAL geometric residual (ST_Difference against tract.geom),
-    not a stated-acreage comparison -- flagged unaccounted_area for human
-    review rather than silently accepted."""
+    service -- 856.263 ac classified). The 78.314-ac gap is a REAL geometric
+    residual (ST_Difference against tract.geom), not a stated-acreage
+    comparison -- flagged unaccounted_area for human review rather than
+    silently accepted.
+
+    Was 78.159 ac against 856.418 classified until 2026-08-08, when apn 32827
+    and 449104 were attributed to tract 2 (they straddle this covenant's own
+    internal tract line at 0.03% and 4.22% here, against 99.14% and 95.78%
+    there). The 0.155 ac they had covered is now correctly unmatched."""
     with get_session() as session:
         result = reconcile_tract(session, covid=3194, tract_no=1)
     assert result["checked"] is True, result
     assert result["status"] == "unaccounted_area", result
-    assert abs(result["unaccounted_acreage"] - 78.159) < 0.01, result
+    assert abs(result["unaccounted_acreage"] - 78.314) < 0.01, result
     print("PASS: reconcile_tract (covid 3194 tract 1) -> real geometric residual from "
           "spatial parcel classification correctly flagged as unaccounted_area")
 

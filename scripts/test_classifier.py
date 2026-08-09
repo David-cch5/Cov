@@ -210,14 +210,20 @@ def test_persisted_montgomery_3194_real_classification() -> None:
             WHERE covid = 3194 AND tract_no = 1 GROUP BY classification
         """)).fetchall())
     assert counts["interior"] == 265, counts
-    # 61, not the original 62: apn 463635 overlapped by 3.07 m2 and was excluded
-    # in the 2026-08-07 review of every flagged non-tract parcel
-    # (scripts/review_flagged_non_tract_parcels.py).
-    assert counts["boundary"] == 61, counts
-    assert abs(float(row.classified_acreage) - 856.418) < 0.01, row
-    assert abs(float(row.residual_acreage) - 78.159) < 0.01, row
+    # 59, down from 62. apn 463635 overlapped by 3.07 m2 and went in the
+    # 2026-08-07 review of every flagged non-tract parcel
+    # (scripts/review_flagged_non_tract_parcels.py). apn 32827 and 449104
+    # followed on 2026-08-08: both straddle the internal line between this
+    # covenant's own two tracts, at 0.03% and 4.22% here against 99.14% and
+    # 95.78% in tract 2, so each is attributed to the one tract that actually
+    # holds it. Neither left the covenant -- both remain classified in tract 2.
+    assert counts["boundary"] == 59, counts
+    assert abs(float(row.classified_acreage) - 856.263) < 0.01, row
+    # Residual rose 78.159 -> 78.314: the 0.155 ac those two clips had covered
+    # is now correctly unmatched inside tract 1's own polygon.
+    assert abs(float(row.residual_acreage) - 78.314) < 0.01, row
     print("PASS: parcel_covenant (covid 3194 tract 1) -> real, committed spatial "
-          "classification (265 interior / 61 boundary) matches the live run's own result")
+          "classification (265 interior / 59 boundary) matches the live run's own result")
 
 
 def test_persisted_montgomery_8245_real_classification() -> None:
