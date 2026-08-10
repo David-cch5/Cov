@@ -55,7 +55,8 @@ def record_release(
     recording_instrument: str | None = None, recording_date: date | None = None,
     consideration_amount: float | None = None, notes: str | None = None,
     source_id: int | None = None, retroactive_basis: str | None = None,
-    effect: str = "prospective", execution_date: date | None = None,
+    effect: str = "prospective", settles_prior_fees: bool = False,
+    settlement_note: str | None = None, execution_date: date | None = None,
     acknowledgement_required: bool = False, acknowledged_date: date | None = None,
     no_intervening_conveyance_affidavit: bool = False,
     terminates_instrument: str | None = None,
@@ -97,6 +98,13 @@ def record_release(
         raise ValueError("a covenant-wide release cannot also name individual parcels -- "
                          "use scope='partial' if only some land is released")
 
+    if settles_prior_fees and release_type != "buyout":
+        raise ValueError(
+            "only a buyout can settle fees accrued before it -- a termination pays for "
+            "nothing. A validly terminated covenant had no prior sales (which is what these "
+            "instruments swear to), so there are no accrued fees for it to settle; if prior "
+            "fees exist, that is a conflict to resolve, not something to mark settled"
+        )
     if effect not in EFFECTS:
         raise ValueError(f"effect must be one of {EFFECTS}, got {effect!r}")
     if effect == "void_ab_initio" and not (no_intervening_conveyance_affidavit or retroactive_basis):
@@ -135,11 +143,12 @@ def record_release(
                                           acknowledged_date,
                                           no_intervening_conveyance_affidavit,
                                           terminates_instrument, referenced_instruments,
-                                          terminated_under)
+                                          terminated_under, settles_prior_fees,
+                                          settlement_note)
             VALUES (:covid, :release_type, :scope, :effective_date, :instrument,
                     :recording_date, :consideration, :notes, :source_id,
                     :effect, :execution_date, :ack_required, :ack_date, :affidavit,
-                    :terminates, :referenced, :under)
+                    :terminates, :referenced, :under, :settles, :settlement_note)
             RETURNING release_id
         """),
         {"covid": covid, "release_type": release_type, "scope": scope,
@@ -149,7 +158,8 @@ def record_release(
          "execution_date": execution_date, "ack_required": acknowledgement_required,
          "ack_date": acknowledged_date, "affidavit": no_intervening_conveyance_affidavit,
          "terminates": terminates_instrument, "referenced": referenced_instruments,
-         "under": terminated_under},
+         "under": terminated_under, "settles": settles_prior_fees,
+         "settlement_note": settlement_note},
     ).scalar()
 
     for county_fips, apn in (parcels or []):
@@ -236,6 +246,118 @@ def release_for_transfer(session, covid: int, county_fips: str, apn: str,
             "needs_review": bool(reasons),
             "review_reasons": reasons,
             "releases_transfer": not reasons}
+
+
+def settle_prior_fees(session, release_id: int) -> dict:
+    """Discharge the fees a buyout's consideration covered, by LINKING them to it.
+
+    Nothing is deleted and no amount is rewritten. Each affected fee_collection row
+    keeps its base_amount, its fee_percent_applied and what it was owed on, and
+    gains settled_by_release_id plus status='paid' -- because it was paid, as part
+    of a larger consideration, not forgone. status='waived' would say the opposite.
+
+    Only rows with no collection activity of their own are touched. A fee already
+    invoiced or partly collected has a payment history that a buyout cannot silently
+    absorb; those are returned as `conflicts` for a human to reconcile against the
+    agreement.
+
+    Refuses unless the release is a buyout with settles_prior_fees set, because
+    whether the consideration covered prior fees is a term of the agreement and
+    cannot be inferred from the instrument's existence.
+    """
+    release = session.execute(
+        text("""SELECT release_id, covid, release_type, settles_prior_fees, effective_date, scope
+                FROM covenant_release WHERE release_id = :rid"""),
+        {"rid": release_id},
+    ).mappings().first()
+    if release is None:
+        raise ValueError(f"no covenant_release {release_id}")
+    if release["release_type"] != "buyout" or not release["settles_prior_fees"]:
+        raise ValueError(
+            f"release {release_id} is a {release['release_type']} with "
+            f"settles_prior_fees={release['settles_prior_fees']} -- only a buyout whose "
+            f"agreement covered prior fees can settle them"
+        )
+
+    scoped = """
+        AND (:scope = 'covenant'
+             OR EXISTS (SELECT 1 FROM covenant_release_parcel p
+                        WHERE p.release_id = :rid
+                          AND p.county_fips = fc.county_fips AND p.apn = fc.parcel_apn))
+    """
+    conflicts = session.execute(
+        text(f"""
+            SELECT fc.county_fips, fc.instrument_number, fc.recording_date, fc.parcel_apn,
+                   fc.status, fc.invoiced_amount, fc.collected_amount
+            FROM fee_collection fc
+            JOIN transfer t ON t.county_fips = fc.county_fips
+                           AND t.instrument_number = fc.instrument_number
+                           AND t.recording_date = fc.recording_date
+                           AND t.parcel_apn = fc.parcel_apn
+            WHERE t.covid = :covid AND fc.recording_date < :effective
+              AND fc.settled_by_release_id IS NULL
+              AND (fc.invoiced_amount IS NOT NULL OR fc.collected_amount IS NOT NULL)
+              {scoped}
+        """),
+        {"covid": release["covid"], "effective": release["effective_date"],
+         "rid": release_id, "scope": release["scope"]},
+    ).mappings().all()
+
+    settled = session.execute(
+        text(f"""
+            UPDATE fee_collection fc
+            SET settled_by_release_id = :rid, status = 'paid'
+            WHERE fc.settled_by_release_id IS NULL
+              AND fc.invoiced_amount IS NULL AND fc.collected_amount IS NULL
+              AND fc.recording_date < :effective
+              AND EXISTS (SELECT 1 FROM transfer t
+                          WHERE t.county_fips = fc.county_fips
+                            AND t.instrument_number = fc.instrument_number
+                            AND t.recording_date = fc.recording_date
+                            AND t.parcel_apn = fc.parcel_apn
+                            AND t.covid = :covid)
+              {scoped}
+            RETURNING fc.instrument_number
+        """),
+        {"covid": release["covid"], "effective": release["effective_date"],
+         "rid": release_id, "scope": release["scope"]},
+    ).fetchall()
+    return {"release_id": release_id, "settled": len(settled),
+            "conflicts": [dict(c) for c in conflicts]}
+
+
+def termination_fee_conflicts(session, covid: int) -> list[dict]:
+    """Fees accrued before a TERMINATION, which should not exist.
+
+    A validly terminated covenant had no prior sales -- the instruments say so
+    under oath. So a fee_collection row predating a termination means either the
+    termination is not valid as to that land or the fee record is wrong. Either way
+    it is a real conflict, and reporting it is the only honest thing to do with it:
+    a termination pays for nothing, so it cannot settle these.
+    """
+    rows = session.execute(
+        text("""
+            SELECT r.release_id, r.recording_instrument, r.effective_date, r.effect,
+                   fc.county_fips, fc.parcel_apn, fc.instrument_number, fc.recording_date,
+                   fc.status, fc.base_amount, fc.collected_amount
+            FROM covenant_release r
+            JOIN transfer t ON t.covid = r.covid
+            JOIN fee_collection fc ON fc.county_fips = t.county_fips
+                                  AND fc.instrument_number = t.instrument_number
+                                  AND fc.recording_date = t.recording_date
+                                  AND fc.parcel_apn = t.parcel_apn
+            WHERE r.covid = :covid AND r.release_type = 'termination'
+              AND t.recording_date < r.effective_date
+              AND (r.scope = 'covenant'
+                   OR EXISTS (SELECT 1 FROM covenant_release_parcel p
+                              WHERE p.release_id = r.release_id
+                                AND p.county_fips = t.parcel_county_fips
+                                AND p.apn = t.parcel_apn))
+            ORDER BY fc.recording_date
+        """),
+        {"covid": covid},
+    ).mappings().all()
+    return [dict(r) for r in rows]
 
 
 def released_parcels(session, covid: int, as_of: date | None = None) -> dict:

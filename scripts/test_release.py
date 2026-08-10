@@ -19,6 +19,8 @@ from sqlalchemy import text
 from app.db.session import get_session
 from app.title.fee_compute import compute_fee_for_transfer
 from app.title.release import (
+    settle_prior_fees,
+    termination_fee_conflicts,
     apply_releases_to_transfers,
     record_release,
     release_for_transfer,
@@ -398,6 +400,120 @@ def test_unexecuted_acknowledgement_is_not_an_effective_termination() -> None:
             _teardown(session); session.commit()
 
 
+def _add_fee(session, instrument, when, invoiced=None, collected=None) -> None:
+    session.execute(text("""
+        INSERT INTO fee_collection (county_fips, instrument_number, collection_seq,
+                                    recording_date, parcel_apn, fee_percent_applied,
+                                    base_amount, invoiced_amount, collected_amount, status)
+        VALUES (:cf, :inst, 1, :rd, :apn, 1.0, 100000, :inv, :col,
+                CASE WHEN :col IS NOT NULL THEN 'paid'
+                     WHEN :inv IS NOT NULL THEN 'invoiced' ELSE 'owed' END)
+        ON CONFLICT DO NOTHING
+    """), {"cf": COUNTY, "inst": instrument, "rd": when, "apn": APN_A,
+           "inv": invoiced, "col": collected})
+
+
+def test_buyout_settles_prior_fees_by_linking_not_deleting() -> None:
+    """A buyout's consideration may cover fees accrued before it, depending on the
+    agreement. When it does, those fees are DISCHARGED, not erased: the
+    fee_collection row keeps its base_amount and what it was owed on, and gains
+    settled_by_release_id plus status='paid' -- because it was paid, as part of a
+    larger consideration. 'waived' would say the opposite, that a still-owed fee
+    was forgone."""
+    try:
+        with get_session() as session:
+            _setup(session)
+            _add_fee(session, "BEFORE-REL", date(2019, 3, 1))
+            got = record_release(session, covid=COVID, release_type="buyout",
+                                 scope="covenant", recording_date=EFFECTIVE,
+                                 consideration_amount=250000, settles_prior_fees=True,
+                                 settlement_note="agreement recites the price includes "
+                                                 "all fees accrued to closing")
+            result = settle_prior_fees(session, got["release_id"])
+            session.commit()
+            row = session.execute(text("""
+                SELECT base_amount, status, settled_by_release_id FROM fee_collection
+                WHERE county_fips = :cf AND instrument_number = 'BEFORE-REL'
+            """), {"cf": COUNTY}).mappings().one()
+        assert result["settled"] == 1, result
+        assert row["settled_by_release_id"] == got["release_id"], dict(row)
+        assert row["status"] == "paid", dict(row)
+        assert float(row["base_amount"]) == 100000.0, dict(row)   # the record survives
+        print("PASS: a buyout discharges prior fees by linking them, preserving what each "
+              "was owed on")
+    finally:
+        with get_session() as session:
+            session.execute(text("DELETE FROM fee_collection WHERE county_fips = :cf "
+                                 "AND instrument_number IN ('BEFORE-REL','AFTER-REL')"),
+                            {"cf": COUNTY})
+            _teardown(session); session.commit()
+
+
+def test_a_termination_cannot_settle_prior_fees_and_reports_them_instead() -> None:
+    """A validly terminated covenant had no prior sales -- these instruments swear
+    to it. So there are no accrued fees for a termination to settle, and a fee
+    predating one means either the termination is not valid as to that land or the
+    fee record is wrong. Both are conflicts for a human; a termination pays for
+    nothing, so it cannot absorb them."""
+    try:
+        with get_session() as session:
+            _setup(session)
+            _add_fee(session, "BEFORE-REL", date(2019, 3, 1))
+            try:
+                record_release(session, covid=COVID, release_type="termination",
+                               scope="covenant", recording_date=EFFECTIVE,
+                               settles_prior_fees=True)
+                raise AssertionError("expected a ValueError: a termination settles nothing")
+            except ValueError as exc:
+                assert "only a buyout" in str(exc), exc
+
+            record_release(session, covid=COVID, release_type="termination",
+                           scope="covenant", recording_date=EFFECTIVE)
+            session.commit()
+            conflicts = termination_fee_conflicts(session, COVID)
+        assert len(conflicts) == 1, conflicts
+        assert conflicts[0]["instrument_number"] == "BEFORE-REL", conflicts
+        print(f"PASS: a termination refuses to settle prior fees and reports them as a "
+              f"conflict ({len(conflicts)} found)")
+    finally:
+        with get_session() as session:
+            session.execute(text("DELETE FROM fee_collection WHERE county_fips = :cf "
+                                 "AND instrument_number IN ('BEFORE-REL','AFTER-REL')"),
+                            {"cf": COUNTY})
+            _teardown(session); session.commit()
+
+
+def test_a_fee_with_payment_history_is_a_conflict_not_a_settlement() -> None:
+    """A fee already invoiced or partly collected has a payment history of its own,
+    which a buyout cannot silently absorb -- the money moved, and the agreement has
+    to be reconciled against that rather than papered over."""
+    try:
+        with get_session() as session:
+            _setup(session)
+            _add_fee(session, "BEFORE-REL", date(2019, 3, 1), invoiced=1000)
+            got = record_release(session, covid=COVID, release_type="buyout",
+                                 scope="covenant", recording_date=EFFECTIVE,
+                                 consideration_amount=250000, settles_prior_fees=True)
+            result = settle_prior_fees(session, got["release_id"])
+            session.commit()
+            row = session.execute(text("""
+                SELECT status, settled_by_release_id FROM fee_collection
+                WHERE county_fips = :cf AND instrument_number = 'BEFORE-REL'
+            """), {"cf": COUNTY}).mappings().one()
+        assert result["settled"] == 0, result
+        assert len(result["conflicts"]) == 1, result
+        assert row["settled_by_release_id"] is None, dict(row)
+        assert row["status"] == "invoiced", dict(row)          # untouched
+        print("PASS: an already-invoiced fee is reported as a conflict, never silently "
+              "absorbed into a buyout")
+    finally:
+        with get_session() as session:
+            session.execute(text("DELETE FROM fee_collection WHERE county_fips = :cf "
+                                 "AND instrument_number IN ('BEFORE-REL','AFTER-REL')"),
+                            {"cf": COUNTY})
+            _teardown(session); session.commit()
+
+
 if __name__ == "__main__":
     test_release_exempts_only_transfers_on_or_after_its_effective_date()
     test_partial_release_leaves_other_parcels_encumbered()
@@ -410,4 +526,7 @@ if __name__ == "__main__":
     test_void_ab_initio_release_reaches_the_covenants_whole_life()
     test_retroactive_without_the_affidavit_reports_but_does_not_apply()
     test_unexecuted_acknowledgement_is_not_an_effective_termination()
+    test_buyout_settles_prior_fees_by_linking_not_deleting()
+    test_a_termination_cannot_settle_prior_fees_and_reports_them_instead()
+    test_a_fee_with_payment_history_is_a_conflict_not_a_settlement()
     print("\nall covenant-release tests passed")
