@@ -55,6 +55,20 @@ Corollary: **the closure error tells you what you failed to read.** A traverse t
 exactly the length of the one course the parser had dropped. Chase the discrepancy to its cause
 before accepting or approximating anything.
 
+
+## Terminated / released covenants are HISTORIC — record, don't research
+A covenant fully released (terminated or bought out, `scope='covenant'`) is worth keeping on
+the record — that record is how anyone later shows the land WAS encumbered and no longer is —
+but it is **not worth researching**. No chain-of-title walk, no GIS anchoring, no LLM
+escalation: each costs real money to establish facts about an obligation that no longer exists.
+`app/title/release.py`'s `is_fully_released` is the check, and
+`resolve_metes_and_bounds_anchor` skips on it by default; `research_released=True` is the
+deliberate override. Do the work only on specific instruction.
+- A **partial** release does not make a covenant historic — land is still encumbered.
+- A release that `needs_review` (unexecuted acknowledgement, retroactive with no sworn
+  no-conveyance statement) does NOT make it historic either: that is precisely the case where
+  the covenant may still be live, so skipping research there would assume the answer.
+
 ## Non-negotiables
 - **Accuracy over completeness.** Every covenant passes a reconciliation check before it is
   considered done: classified acreage must reconcile with the covenant's stated acreage, and

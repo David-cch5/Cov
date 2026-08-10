@@ -360,6 +360,44 @@ def termination_fee_conflicts(session, covid: int) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def is_fully_released(session, covid: int, as_of: date | None = None) -> dict | None:
+    """The release that has ended this covenant ENTIRELY, or None.
+
+    A fully released covenant is HISTORIC. It is worth recording -- the record is
+    why anyone can later show the land was once encumbered and no longer is -- but
+    it is not worth researching. No chain-of-title walk, no GIS anchoring, no LLM
+    escalation, because every one of those costs money to establish facts about an
+    obligation that no longer exists. The expensive entrypoints check this and skip
+    by default; a caller who genuinely wants the work done passes an explicit
+    override rather than getting it by accident.
+
+    Only scope='covenant' counts. A partial release, however large, leaves land
+    still encumbered and the covenant still worth working.
+
+    A release that needs review does NOT make a covenant historic: an unexecuted
+    acknowledgement or a retroactive release with no sworn no-conveyance statement
+    is exactly the situation where the covenant might still be live, and skipping
+    research on that basis would be assuming the answer.
+    """
+    row = session.execute(
+        text("""
+            SELECT release_id, release_type, effect, scope, effective_date,
+                   recording_instrument, recording_date,
+                   acknowledgement_required, acknowledged_date,
+                   no_intervening_conveyance_affidavit
+            FROM covenant_release
+            WHERE covid = :covid AND scope = 'covenant'
+              AND (:as_of IS NULL OR effective_date <= :as_of)
+              AND (NOT acknowledgement_required OR acknowledged_date IS NOT NULL)
+              AND (effect = 'prospective' OR no_intervening_conveyance_affidavit)
+            ORDER BY effective_date, release_id
+            LIMIT 1
+        """),
+        {"covid": covid, "as_of": as_of},
+    ).mappings().first()
+    return dict(row) if row else None
+
+
 def released_parcels(session, covid: int, as_of: date | None = None) -> dict:
     """Every parcel of a covenant released as of a date, and by what.
 

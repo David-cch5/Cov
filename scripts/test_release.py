@@ -19,6 +19,7 @@ from sqlalchemy import text
 from app.db.session import get_session
 from app.title.fee_compute import compute_fee_for_transfer
 from app.title.release import (
+    is_fully_released,
     settle_prior_fees,
     termination_fee_conflicts,
     apply_releases_to_transfers,
@@ -514,6 +515,69 @@ def test_a_fee_with_payment_history_is_a_conflict_not_a_settlement() -> None:
             _teardown(session); session.commit()
 
 
+def test_a_fully_released_covenant_is_historic_not_research() -> None:
+    """A fully released covenant is worth recording and not worth researching --
+    anchoring is the most expensive thing this project does, and spending it to
+    locate land whose covenant no longer exists is pure waste.
+
+    The three negative cases matter as much as the positive one. A PARTIAL release
+    leaves land encumbered. An unexecuted acknowledgement, or a retroactive release
+    with no sworn no-conveyance statement, is exactly the situation where the
+    covenant may still be live -- skipping research there would assume the answer
+    rather than establish it."""
+    try:
+        with get_session() as session:
+            _setup(session)
+            assert is_fully_released(session, COVID) is None, "nothing released yet"
+
+            # partial -- land still encumbered, so still worth working
+            record_release(session, covid=COVID, release_type="buyout", scope="partial",
+                           parcels=[(COUNTY, APN_A)], recording_date=EFFECTIVE)
+            session.commit()
+            assert is_fully_released(session, COVID) is None, "a partial release is not historic"
+
+            # covenant-wide but acknowledgement pending -- may still be live
+            record_release(session, covid=COVID, release_type="termination", scope="covenant",
+                           recording_date=EFFECTIVE, acknowledgement_required=True,
+                           acknowledged_date=None, recording_instrument="PENDING-ACK")
+            session.commit()
+            assert is_fully_released(session, COVID) is None, "a pending acknowledgement is not historic"
+
+            # covenant-wide and effective
+            record_release(session, covid=COVID, release_type="termination", scope="covenant",
+                           recording_date=EFFECTIVE, recording_instrument="TERM-FULL")
+            session.commit()
+            got = is_fully_released(session, COVID)
+        assert got is not None and got["recording_instrument"] == "TERM-FULL", got
+        print("PASS: only an effective covenant-wide release makes a covenant historic; "
+              "partial and needs-review releases do not")
+    finally:
+        with get_session() as session:
+            _teardown(session); session.commit()
+
+
+def test_anchor_resolution_skips_a_released_covenant_by_default() -> None:
+    """The guard where the money is. resolve_metes_and_bounds_anchor escalates to
+    Opus and then Fable; it must not reach either for a covenant that no longer
+    exists, and must say so rather than failing silently."""
+    from app.gis.anchor_resolver import resolve_metes_and_bounds_anchor
+    try:
+        with get_session() as session:
+            _setup(session)
+            record_release(session, covid=COVID, release_type="termination", scope="covenant",
+                           recording_date=EFFECTIVE, recording_instrument="TERM-FULL")
+            session.commit()
+            got = resolve_metes_and_bounds_anchor(session, covid=COVID, tract_no=1)
+        assert got["committed"] is False, got
+        assert got["tier"] == "skipped_released", got
+        assert "research_released=True" in got["reason"], got
+        print("PASS: anchor resolution skips a released covenant before any paid tier, and "
+              "names the override")
+    finally:
+        with get_session() as session:
+            _teardown(session); session.commit()
+
+
 if __name__ == "__main__":
     test_release_exempts_only_transfers_on_or_after_its_effective_date()
     test_partial_release_leaves_other_parcels_encumbered()
@@ -529,4 +593,6 @@ if __name__ == "__main__":
     test_buyout_settles_prior_fees_by_linking_not_deleting()
     test_a_termination_cannot_settle_prior_fees_and_reports_them_instead()
     test_a_fee_with_payment_history_is_a_conflict_not_a_settlement()
+    test_a_fully_released_covenant_is_historic_not_research()
+    test_anchor_resolution_skips_a_released_covenant_by_default()
     print("\nall covenant-release tests passed")

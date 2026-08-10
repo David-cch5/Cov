@@ -38,6 +38,7 @@ from app.gis.state_plane_anchor import (
     traverse_to_geojson_state_plane,
 )
 from app.llm.anchor_agent import escalate_anchor_to_llm
+from app.title.release import is_fully_released
 from app.parsing.legal_description.metes_bounds import (
     _COURSE_RE,
     extract_point_of_beginning,
@@ -360,7 +361,8 @@ def _get_deed_text(session, covid: int, legal_description_raw: str | None) -> st
     return get_deed_text(session, covid, legal_description_raw)
 
 
-def resolve_metes_and_bounds_anchor(session, covid: int, tract_no: int = 1) -> dict:
+def resolve_metes_and_bounds_anchor(session, covid: int, tract_no: int = 1,
+                                    research_released: bool = False) -> dict:
     """Tiered anchor resolution: deterministic techniques first, then Opus 5,
     then Fable 5, then the existing rough-placement fallback. Returns a dict
     describing which tier succeeded (or that every tier fell through to the
@@ -368,6 +370,24 @@ def resolve_metes_and_bounds_anchor(session, covid: int, tract_no: int = 1) -> d
     confident anchor couldn't be found; that is itself a legitimate, correct
     outcome per CLAUDE.md's own rule, not something to force a guess for.
     """
+    # A fully released covenant is historic: worth recording, not worth
+    # researching. Anchoring is the most expensive thing this project does -- the
+    # LLM tiers below are budget-capped precisely because they cost real money --
+    # and spending it to locate land whose covenant no longer exists is pure waste.
+    # research_released=True is the deliberate override for when it is wanted
+    # anyway; nothing reaches the paid tiers by accident.
+    if not research_released:
+        released = is_fully_released(session, covid)
+        if released is not None:
+            return {"covid": covid, "tract_no": tract_no, "committed": False,
+                    "tier": "skipped_released",
+                    "reason": (f"covenant fully released by {released['release_type']} "
+                               f"{released['recording_instrument'] or released['release_id']} "
+                               f"effective {released['effective_date']} -- historic, so no "
+                               f"anchoring research is done. Pass research_released=True to "
+                               f"override."),
+                    "release": released, "llm_usage": {}}
+
     row = session.execute(
         text("SELECT county_fips, legal_description_raw, stated_acreage FROM covenant WHERE covid = :covid"),
         {"covid": covid},
