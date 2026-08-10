@@ -5,6 +5,25 @@ It captures decisions already settled with the stakeholder. Build in the order b
 
 ---
 
+> **What this document is, and is not.** This is the ORIGINAL design spec, written
+> 2026-07-25 before the app existed. It still describes the intended architecture,
+> pipeline order and cost controls accurately, and it is the right thing to read for
+> *why the system is shaped this way*.
+>
+> It is NOT the current state of the code, and it is not the authority on any rule.
+> Where this document and the sources below disagree, **the sources below win**:
+>
+> | For | Read |
+> |---|---|
+> | Standing rules, non-negotiables, model routing, tiered policies | `CLAUDE.md` (always current) |
+> | The schema, and WHY each part of it exists | `app/db/migrations/versions/*.py` docstrings — they cannot drift from the schema they create |
+> | What the code actually does, and the decisions behind it | module docstrings, and `scripts/test_*.py` — decisions there are executable and fail if violated |
+> | How a specific covenant was resolved | that covenant's own `review_reason` notes in the database |
+>
+> A short list of the material changes since this was written is at the end, under
+> **Decisions since the initial spec**. That list is a pointer, not a substitute for
+> the sources.
+
 ## 1. Objective & scope
 
 Process recorded private-transfer-fee covenants. For each covenant:
@@ -42,9 +61,10 @@ probe** on Montgomery County + a small multi-county sample. Full portfolio (~1,0
   dual-engine cross-check is deferred. Do NOT prompt for a second provider's credentials
   during the build; the stakeholder will supply it later.
 - **Model routing (Claude):** default **Sonnet at high / "max smart" effort** for coding, bulk
-  work, and field extraction (Haiku for trivial structuring); escalate to **Opus 4.8** for hard
+  work, and field extraction (Haiku for trivial structuring); escalate to **Opus 5** for hard
   reasoning and **Fable 5** for the hardest reasoning and for bad-scan vision OCR (Opus 4.8 as a
-  cheaper vision fallback).
+  cheaper vision fallback). *(Superseded the original "Opus 4.8 for hard reasoning"; see
+  `app/config.py`'s `LLM_MODEL_HARD` and CLAUDE.md, which are authoritative.)*
 - **Workers:** stateless; pull jobs from a queue table with `SELECT … FOR UPDATE SKIP LOCKED`;
   idempotent upserts keyed by covid / parcel id / instrument number; shard by county across
   the 4 Mac minis; per-portal politeness (1–2 workers per recorder).
@@ -52,10 +72,21 @@ probe** on Montgomery County + a small multi-county sample. Full portfolio (~1,0
 ## 4. Data model (lineage is the point)
 
 `covenant` → `tract` (encumbered-land geometry + residual raw-acreage polygon) → `parcel`
-(+ `parcel_history`) → `transfer` (chain of title, parcel→parcel linked). Plus `owner`,
+(+ `parcel_history`) → `transfer` (chain of title, parcel→parcel linked). Plus `contact`,
 `price_estimate`, `monitor_run`, `event`, and `source` (provenance). Append-only / temporal
 snapshots so the monitor can show what changed and when. Any lot must be traceable back to its
 covenant and forward through its full conveyance history.
+
+*That sketch is the shape, not the inventory — the schema is 33 tables now. `\dt covenant.*`, or
+the migrations in order, is the accurate list; this is only what a reader of the sketch would be
+surprised to be missing. The covenant↔parcel edge is its own table, `parcel_covenant`, with
+`parcel_covenant_exclusion` holding reviewed exclusions durably so a re-run cannot silently
+re-admit a parcel the deed does not convey. Then `parcel_lineage` and `plat` (subdivision
+lineage), `covenant_document` and `recorder_document_image` (document storage),
+`fee_collection`, `fee_payoff_statement`, `estoppel_certificate`, `exemption_category`,
+`covenant_template` (+ `_exemption`), `covenant_trustee`, `covenant_beneficiary`, `job_queue`,
+the two county registries, `captcha_session`, and `covenant_release` (+ `covenant_release_parcel`)
+for terminations and buyouts — see §"Decisions since the initial spec".*
 
 ## 5. Pipeline (build in this order)
 
@@ -87,9 +118,10 @@ covenant and forward through its full conveyance history.
    and classified-parcel area vs polygon; flag unaccounted area and boundary parcels. **If the
    POB cannot be georeferenced with confidence, route to human review — do NOT fall back to a
    loose bounding box or guess.** This gate must pass before a covenant is "done."
-   NOTE: the 4440 output in `_pilot/` was produced with an APPROXIMATE bounding-box +
-   tract-lineage method (the POB was read, not plotted) — treat it as a smoke test, NOT ground
-   truth; re-derive 4440 with the rigorous method and compare.
+   ~~NOTE: the 4440 output in `_pilot/` was produced with an APPROXIMATE bounding-box +
+   tract-lineage method~~ **DONE** — covid 4440 was re-derived with the rigorous method, and its
+   boundary parcels reviewed (22 deed-confirmed adjoiner/sliver exclusions across both tracts,
+   6 wrongly-excluded parcels restored). The `_pilot/` bounding-box output is superseded.
 5. **Deed / chain of title** — per-county recorder adapter, tiered by access:
    (a) API/downloadable index, (b) public portal via **headless browser (Playwright)** that
    waits on specific elements/network responses, (c) CAPTCHA/login/paywall → human-assist queue,
@@ -178,3 +210,45 @@ recorded chain "deed-of-record complete; economic transfers may exist via entity
 ## 9. Phasing (full program, for reference)
 P1 Core app (~1 wk) → P2 Texas-metro validation (~2–3 d) → P3 multi-state GIS coverage →
 P4 chain of title (rolling) → P5 monitor. **Right now: P1 + the Montgomery cost probe only.**
+
+## Decisions since the initial spec
+
+A pointer list, newest first. Each entry names where the reasoning actually lives — the
+migration docstrings and tests are the authority, not this summary.
+
+**Releases: terminations and buyouts** (migrations 0037–0041, `app/title/release.py`,
+`scripts/test_release.py`). Nothing in the original spec could say a covenant had STOPPED
+applying to land. It now can, and the semantics were corrected five times against real
+recorded instruments (kept in `_termination_examples/`):
+- Every ingested covenant is **valid as of today**. A termination found in the public records
+  is a downloaded document at `validity_status='pending_review'` and asserts nothing until
+  adjudicated. An invalid one is answered by a rescission (generation deferred).
+- A **termination** may be prospective or **void ab initio** ("null and void as if it had never
+  been recorded"), the latter licensed by the instrument's sworn no-intervening-conveyance
+  statement.
+- A **buyout** is prospective only — it is negotiated to stop future collection.
+- History is never erased: a released parcel stays in the census, prior `fee_collection` rows
+  keep their amounts, and a buyout covering an outstanding balance *links* to it.
+- A release adjudicated valid and covenant-wide makes the covenant **historic — recorded, not
+  researched**, so the paid anchor tiers do not spend on it.
+
+**Per-tract stated acreage** (migration 0036). `covenant.stated_acreage` covers all tracts
+together; reconciling one tract against it misreported a 33.5-ac tract as having a 285-ac gap.
+
+**Anchor resolution is tiered and automated** (`app/gis/anchor_resolver.py`, CLAUDE.md).
+The spec's "georeference the POB by tying to authoritative geometry" is now a real orchestrator:
+stated State Plane coordinate → **published NGS monument tie** (`app/gis/ngs.py`) → deferred
+judgment tiers → Opus 5 → Fable 5 → the existing approximate placement. Every tier verifies
+independently before committing; a released covenant is skipped before any paid tier.
+
+**OCR escalation merges, never substitutes** (`app/ingestion/ocr_escalation.py`). Vision-OCR'd
+pages are spliced into the existing transcription. Replacing a document with a 4-page fragment
+cost covid 5839 its declarant, recording instrument and stated acreage.
+
+**Reading the legal description is the whole game** (CLAUDE.md's own longest section). Nearly
+every hard problem here has been a misreading, not a GIS or survey problem — and the closure
+error tells you what you failed to read. Also: before treating a tract as a geometry problem,
+check whether the deed already names an existing parcel (covid 5839 named its CAD account).
+
+**Boundary parcels are never trusted on a raw match count** (CLAUDE.md non-negotiable,
+`app/gis/classifier.py`). Confirmed real: 254 matched parcels were actually 214.
