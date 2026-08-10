@@ -172,8 +172,9 @@ def test_live_tesseract_reads_a_real_page() -> None:
         print(f"SKIP: {d['relpath']} not present")
         return
     assert pdf_page_count(pdf) == d["pages"], "pdfinfo page count must match the cache"
-    text, page_texts = ocr_with_tesseract(pdf, max_pages=1)
+    text, page_texts, rotations = ocr_with_tesseract(pdf, max_pages=1)
     assert len(page_texts) == 1, page_texts.keys()
+    assert rotations == {}, f"an upright page needs no rotation, got {rotations}"
     a = assess(text, 1)
     assert a["content_chars"] > 500, f"Tesseract read too little: {a}"
     assert a["legibility"] > 0.75, f"Tesseract output not legible: {a}"
@@ -190,7 +191,7 @@ def test_acquired_text_uses_the_corpus_page_delimiter() -> None:
     if not os.path.exists(pdf):
         print(f"SKIP: {d['relpath']} not present")
         return
-    text, _ = ocr_with_tesseract(pdf, max_pages=3)
+    text, _, _ = ocr_with_tesseract(pdf, max_pages=3)
     assert text.count(PAGE_DELIMITER) == 2, (
         f"3 pages must join with 2 form feeds, found {text.count(PAGE_DELIMITER)}")
     print("PASS: acquired text is form-feed delimited, matching the corpus convention")
@@ -214,6 +215,41 @@ def test_acquire_text_falls_through_the_layer_to_ocr() -> None:
           f"(layer gave {r['attempts'][0]['content_chars']} body chars)")
 
 
+def test_upside_down_page_is_found_by_measuring_not_by_asking_osd() -> None:
+    """covid 4956 page 12 IS the Exhibit A -- the whole legal description -- and
+    it is scanned upside down. Read upright it yields
+    "ONINIVLNOO CNV ONINNIDAD JO LNIOd" where the deed says "POINT OF BEGINNING
+    AND CONTAINING", and no course parses at all.
+
+    Tesseract's own OSD is not the answer here: it reports "Orientation in
+    degrees: 270 / Rotate: 90" at confidence 21.47, and rotating by its answer
+    gives legibility 0.4356 with zero THENCE. The rotation has to be chosen by
+    measuring what each candidate actually reads.
+    """
+    pdf = os.path.join(PROJECT_ROOT, "4956", "4956_D1380.pdf")
+    if not os.path.exists(pdf):
+        print("SKIP: covid 4956's PDF not present")
+        return
+
+    text, page_texts, rotations = ocr_with_tesseract(pdf)
+    assert 12 in rotations, (
+        f"page 12 is upside down and must be rotated; rotations={rotations}")
+    exhibit = page_texts[12]
+    for token in ("THENCE", "BEGINNING", "acres", "feet"):
+        assert token.lower() in exhibit.lower(), (
+            f"{token!r} missing from the recovered Exhibit A -- rotation did not help")
+    # The real tract, from the correctly-oriented page.
+    assert "Elisha Fike" in exhibit, "the survey name should be legible once upright"
+    assert "0.9907" in exhibit, "the stated acreage should be legible once upright"
+    # Upright pages must NOT be needlessly rotated.
+    assert set(rotations) == {12}, f"only page 12 should rotate, got {sorted(rotations)}"
+    a = assess(text, 13)
+    assert a["usable"], a
+    print(f"PASS: covid 4956 page 12 recovered by rotating {rotations[12]} deg -- "
+          f"Elisha Fike Survey, 0.9907 acres, THENCE courses present; "
+          f"no other page rotated")
+
+
 if __name__ == "__main__":
     test_vocabulary_loads()
     test_stamp_only_document_is_rejected()
@@ -225,6 +261,7 @@ if __name__ == "__main__":
     test_worst_pages_targets_the_thinnest()
     test_oversized_pages_render_at_a_fitted_dpi()
     test_live_tesseract_reads_a_real_page()
+    test_upside_down_page_is_found_by_measuring_not_by_asking_osd()
     test_acquired_text_uses_the_corpus_page_delimiter()
     test_acquire_text_falls_through_the_layer_to_ocr()
     print("\nall text-acquisition tests passed")

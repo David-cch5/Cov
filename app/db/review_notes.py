@@ -43,7 +43,19 @@ import re
 # Real tag vocabulary in the live data spans automated, manual and bare-date
 # qualifiers (ANCHOR RESOLVED (manual, ...), RE-VERIFIED (2026-07-24), ...), so
 # the qualifier is deliberately unconstrained -- matching on tag shape alone.
-_NEXT_TAG_OR_END = r"(?=;\s*[A-Z][A-Z0-9 /&'-]{2,}\(|$)"
+# The underscore is load-bearing. Without it, a tag containing one is not
+# recognised as a note boundary, so removing an EARLIER note deletes it too --
+# the exact data loss this module exists to prevent, arriving through the tag
+# vocabulary rather than through a greedy `.*$`. Demonstrated on real note text:
+#
+#   merge_tagged_note("ANCHOR RESOLVED (...): anchored; "
+#                     "CLASSIFY_PARCELS-STAGE (...): needs checking",
+#                     "ANCHOR RESOLVED", None)   ->   ""
+#
+# Both notes gone. A hyphen-only tag ("NON-TRACT PARCEL EXCLUSION") survived the
+# same call, which is why this went unnoticed: every tag in the live data
+# predates the pipeline's own stage tags, and none of them contained one.
+_NEXT_TAG_OR_END = r"(?=;\s*[A-Z][A-Z0-9_ /&'-]{2,}\(|$)"
 
 
 def merge_tagged_note(review_reason: str | None, tag: str, note: str | None = None) -> str:
@@ -79,3 +91,36 @@ def merge_tagged_note(review_reason: str | None, tag: str, note: str | None = No
     if note:
         reason = f"{reason}; {note}" if reason else note
     return reason
+
+# Tags whose notes RECORD work that succeeded rather than raising a concern.
+# review_reason is the only place per-covenant provenance lives, so success
+# records share the field with real concerns -- and anything reading the field to
+# decide "is this covenant clean?" has to tell them apart.
+#
+# Confirmed real on covid 4956: its tract reconciled to 0.0000 ac unaccounted and
+# the covenant still came back needs_review, because "ANCHOR RESOLVED (automated,
+# tier=llm_parcel_tie, confidence=0.90)" was sitting in review_reason. A note
+# saying the anchor WORKED was holding the covenant open, and no LLM-anchored
+# covenant could ever have reached 'reconciled'.
+#
+# Deliberately an allow-list, not a deny-list: an unrecognised tag counts as a
+# concern, so the safe direction stays the default and adding a record-style note
+# is a deliberate act.
+RECORD_ONLY_TAGS = (
+    "ANCHOR RESOLVED",
+    "ENCUMBERED LAND SUMMARY",
+    "RE-VERIFIED",
+)
+
+
+def strip_record_only_notes(review_reason: str | None) -> str:
+    """review_reason with the record-style notes removed, leaving only notes that
+    represent something still open. Returns "" when nothing is outstanding.
+
+    Does not modify anything -- callers use it to JUDGE a review_reason, while
+    the field itself keeps every note, because the provenance is worth having.
+    """
+    remaining = review_reason or ""
+    for tag in RECORD_ONLY_TAGS:
+        remaining = merge_tagged_note(remaining, tag, None)
+    return remaining.strip()

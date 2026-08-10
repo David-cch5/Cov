@@ -23,7 +23,7 @@ from app.ingestion.intake import (
     already_ingested, assign_covid, candidate_for_dropped_file, pending_drops,
     resolve_county_fips, resolve_jurisdiction,
 )
-from app.ingestion.walk import PROJECT_ROOT
+from app.ingestion.walk import PROJECT_ROOT, get_deed_text
 
 SCRATCH = os.path.join(PROJECT_ROOT, "_intake_test_scratch")
 
@@ -47,8 +47,13 @@ def test_county_resolution_against_every_known_covenant() -> None:
 
         correct, wrong, unresolved = 0, [], []
         for covid, (county, state_code) in sorted(truth.items()):
-            body = _cached_text(covid)
-            if body is None:
+            # Read what the APP reads -- get_deed_text picks the best available
+            # cache by yield -- not _textcache_final blindly. That distinction is
+            # the point for covid 4956, whose corpus cache is 13 pages of vendor
+            # page-stamps naming DALLAS only inside the stamp itself, never next
+            # to the word "County". Its re-OCR resolves fine.
+            body = get_deed_text(session, int(covid), None)
+            if not body:
                 continue
             j = resolve_jurisdiction(body)
             if j["county_name"] == county:

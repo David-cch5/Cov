@@ -74,6 +74,36 @@ def _county_of(covid: int | None) -> str | None:
         ).scalar()
 
 
+# A status a later, more expensive stage has established, which a re-run of an
+# earlier stage must not silently undo. Same set app/gis/reconcile.py already
+# guards; kept identical on purpose so the two cannot disagree about what
+# "already progressed" means.
+_DO_NOT_REGRESS = ("title_in_progress", "done")
+
+
+def _mark_covenant_needs_review(covid: int | None) -> None:
+    """A stage that halted with a question must leave the covenant SAYING so.
+
+    Found on covid 4956: classify_parcels correctly flagged a clipped
+    neighbouring parcel and wrote its note, but the covenant still read
+    'reconciled' from an earlier run -- so the one field anybody actually filters
+    on claimed the covenant was finished while the note beside it said it was
+    not. A note nobody queries is not a safeguard.
+
+    'reconciled' is deliberately NOT protected here: regressing it is the whole
+    point when a later check finds the census wrong.
+    """
+    if covid is None:
+        return
+    from sqlalchemy import text as _text
+    with get_session() as session:
+        session.execute(
+            _text("UPDATE covenant SET status = 'needs_review', updated_at = now() "
+                  "WHERE covid = :c AND status <> ALL(:keep)"),
+            {"c": covid, "keep": list(_DO_NOT_REGRESS)},
+        )
+
+
 def run_job(job: dict, *, verbose: bool = True) -> dict:
     """Run one claimed job to a conclusion. Returns what happened.
 
@@ -111,6 +141,7 @@ def run_job(job: dict, *, verbose: bool = True) -> dict:
 
     if verdict.status == "needs_review":
         hold_for_review(job["job_id"], verdict.note)
+        _mark_covenant_needs_review(covid)
         if verbose:
             print(f"  = needs_review: {verdict.note}", flush=True)
         return {"stage": stage, "outcome": "needs_review", "covid": covid, "note": verdict.note}

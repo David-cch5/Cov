@@ -149,6 +149,34 @@ def test_empty_and_none_inputs() -> None:
     print("PASS: merge_tagged_note -> None/empty input, and removing the only note, all handled")
 
 
+def test_an_underscore_in_a_tag_is_still_a_note_boundary() -> None:
+    """Real data loss, found when app/pipeline's stage tags became the first ones
+    in this project to contain an underscore. The note-boundary pattern's tag
+    character class omitted it, so removing an EARLIER note swallowed the
+    underscore-tagged one along with it:
+
+        merge_tagged_note("ANCHOR RESOLVED (...): anchored; "
+                          "CLASSIFY_PARCELS-STAGE (...): needs checking",
+                          "ANCHOR RESOLVED", None)   ->   ""
+
+    Both notes gone -- exactly the failure this module exists to prevent, arriving
+    through the tag vocabulary rather than through a greedy `.*$`. It went
+    unnoticed because every tag in the live data is hyphen-only and survives the
+    same call.
+    """
+    record = "ANCHOR RESOLVED (automated, tier=llm_parcel_tie): anchored"
+    for other in ("CLASSIFY_PARCELS-STAGE (automated): needs checking",
+                  "RESOLVE_TRACT-STAGE (automated): could not anchor",
+                  "NON-TRACT PARCEL EXCLUSION (automated, tract 1): excluded"):
+        kept = merge_tagged_note(f"{record}; {other}", "ANCHOR RESOLVED", None)
+        assert kept == other, f"removing the first note lost {other!r}; got {kept!r}"
+        # And the reverse direction: removing the second must keep the first.
+        tag = other.split(" (")[0]
+        kept = merge_tagged_note(f"{record}; {other}", tag, None)
+        assert kept == record, f"removing {tag!r} lost the first note; got {kept!r}"
+    print("PASS: an underscore in a tag is a note boundary in both directions")
+
+
 if __name__ == "__main__":
     test_replaces_own_note_only()
     test_greedy_tail_bug_chain_py_covid_4780()
@@ -161,3 +189,4 @@ if __name__ == "__main__":
     test_no_prefix_collision_between_similar_tags()
     test_empty_and_none_inputs()
     print("\nall review_notes smoke tests passed")
+    test_an_underscore_in_a_tag_is_still_a_note_boundary()

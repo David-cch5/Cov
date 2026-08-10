@@ -137,7 +137,30 @@ _MIN_ACCEPTABLE_CLOSURE_RATIO = 1 / 500
 def _looks_incomplete(text_segment: str, courses: list[Course]) -> bool:
     thence_count = len(re.findall(r"\bTHENCE\b", text_segment, re.IGNORECASE))
     if thence_count == 0:
-        return False  # nothing to compare against -- don't second-guess a clean zero-course case
+        # Nothing to compare against -- don't second-guess a clean zero-course
+        # case. This LOOKS like a bug (zero courses and no escalation?) and is
+        # not. Do not "fix" it into escalating; escalating here fabricates.
+        #
+        # Evidence, from covid 4956. Its Exhibit A is page 12 of 13 and was
+        # scanned upside down, so OCR produced mirrored gibberish with no
+        # recognisable THENCE. Field extraction ran on that text anyway and
+        # returned a confident, plausible, WRONG legal description:
+        #
+        #   fabricated                            actual (page rotated)
+        #   Warren Angus Survey, Abstract No. 51  Elisha Fike Survey, Abstract 478
+        #   Metropolitan Central Party Addition   Metropolitan Commercial Park Addition
+        #   0.9906 acres                          0.9907 acres
+        #
+        # None of the fabricated names appear anywhere in the document. An LLM
+        # asked to read scrambled text does not decline; it produces something
+        # shaped like an answer, and "never fabricate title data" is a
+        # non-negotiable here. Text with no traverse vocabulary at all is either
+        # genuinely not metes-and-bounds (a subdivision-plat covenant, where zero
+        # courses is the right answer) or unreadable -- and the fix for
+        # unreadable is to read it properly, which is what
+        # app/ingestion/text_extract.py's rotation trial now does, recovering all
+        # 4 of this deed's THENCE calls for free.
+        return False
     if len(courses) < thence_count * _COURSE_COUNT_SHORTFALL_RATIO:
         return True
     if not courses:

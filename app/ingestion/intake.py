@@ -78,6 +78,12 @@ _NOT_A_COUNTY = {
     "THE", "SAID", "THIS", "SUCH", "ANY", "EACH", "WHICH", "THAT", "AND", "OR",
     "CLERK", "RECORDS", "RECORD", "COURT", "TAX", "APPRAISAL", "DISTRICT",
     "OFFICIAL", "PUBLIC", "REAL", "DEED", "PLAT", "ACKNOWLEDGMENT", "SUBJECT",
+    # Legal boilerplate that lands next to "County" often enough to place in a
+    # tally. Seen for real: covid 4956's re-OCR put PRESENTS ("KNOW ALL MEN BY
+    # THESE PRESENTS") as runner-up behind DALLAS. It lost, but a document
+    # mentioning its county only once or twice is exactly where a stray token
+    # could win, and the margin is what a caller judges trust on.
+    "PRESENTS", "WITNESS", "WHEREOF", "SEAL", "NOTARY", "STATE", "COMMISSION",
 }
 _NOT_A_STATE = {"ACKNOWLEDGMENT", "INCORPORATION", "ORGANIZATION", "RESIDENCE",
                 "TEXAS AX", "THE", "SAID", "THIS", "FACTS", "MIND", "TITLE"}

@@ -104,6 +104,29 @@ TESSERACT_DPI = 300
 # the constraint is the vision API's own hard per-side limit, not memory.
 MAX_RENDER_PIXELS = 80_000_000
 
+# A page that OCRs below this is a candidate for being scanned sideways or
+# upside down, and gets re-tried at other rotations. Only suspect pages pay for
+# the extra passes, so a normal document (pages at 0.97-0.98) costs nothing
+# extra. Set at 0.70 because a rotated page scores around 0.43 while readable
+# pages sit far above it.
+ROTATION_TRIAL_THRESHOLD = 0.70
+
+# A rotation is accepted only if it beats the original by this much. Necessary
+# because a low score does NOT by itself mean "rotated": lost word spacing takes
+# genuinely readable pages down to 0.43 too (covid 3925). Requiring a clear
+# margin means the trial can only ever improve a page -- if nothing wins
+# decisively, the original stands.
+ROTATION_ACCEPT_MARGIN = 0.15
+
+# Deliberately NOT pytesseract.image_to_osd. Measured on covid 4956 page 12, an
+# upside-down Exhibit A: OSD reported "Orientation in degrees: 270 / Rotate: 90"
+# at confidence 21.47, and rotating by its answer yields legibility 0.4356 with
+# zero THENCE -- garbage. Rotating 180 instead yields 0.9289 with 4 THENCE and
+# 2 BEGINNING. So orientation is chosen by MEASURING each candidate's output,
+# the same way every other repair in this project is accepted only when it
+# demonstrably resolves the discrepancy.
+ROTATION_CANDIDATES = (180, 270, 90)
+
 _TOKEN = re.compile(r"[A-Za-z]{2,}")
 
 # The imaging vendor's overlay stamp, which IS the entire text layer on some of
@@ -270,15 +293,26 @@ def extract_text_layer(pdf_path: str) -> str:
 
 def ocr_with_tesseract(pdf_path: str, *, dpi: int = TESSERACT_DPI,
                         max_pages: int | None = None,
-                        progress: bool = False) -> tuple[str, dict[int, str]]:
-    """Free OCR, page by page. Returns (form-feed joined text, {page_no: text})
-    -- the per-page mapping is what lets a later vision escalation replace one
-    bad page instead of the whole document, the same shape
-    ocr_escalation.merge_escalated_pages already consumes.
+                        progress: bool = False) -> tuple[str, dict[int, str], dict[int, int]]:
+    """Free OCR, page by page. Returns (form-feed joined text, {page_no: text},
+    {page_no: rotation_applied}) -- the per-page mapping is what lets a later
+    vision escalation replace one bad page instead of the whole document, the
+    same shape ocr_escalation.merge_escalated_pages already consumes, and the
+    rotations are provenance: which pages were not scanned upright.
 
     Rendered one page at a time rather than converting the whole PDF up front:
     a 26-page instrument at 300 DPI is a lot of resident bitmap, and a failure
     on page 9 should still leave pages 1-8 usable rather than losing the run.
+
+    A PAGE SCANNED SIDEWAYS OR UPSIDE DOWN IS RE-TRIED AT OTHER ROTATIONS, and
+    the winner is chosen by measuring the output rather than by asking
+    Tesseract's OSD, which was measured getting it wrong. This is not an edge
+    case: covid 4956's Exhibit A -- the whole legal description, the one page
+    that matters most -- is page 12 of 13 and scanned upside down. Read
+    upright it yields "ONINIVLNOO CNV ONINNIDAD JO LNIOd" where the deed says
+    "POINT OF BEGINNING AND CONTAINING", and zero courses parse. Rotated, it
+    yields the real tract: 0.9907 acres in the Elisha Fike Survey, Abstract 478,
+    Lot 14 and part of Lot 13, Block 1, Metropolitan Commercial Park Addition.
     """
     import pytesseract
     from pdf2image import convert_from_path
@@ -287,6 +321,7 @@ def ocr_with_tesseract(pdf_path: str, *, dpi: int = TESSERACT_DPI,
     last = min(total, max_pages) if max_pages else total
     sizes = page_sizes_pts(pdf_path)
     pages: dict[int, str] = {}
+    rotations: dict[int, int] = {}
     for n in range(1, (last or 0) + 1):
         page_dpi = safe_dpi(*sizes[n], requested=dpi) if n in sizes else dpi
         if progress and page_dpi != dpi:
@@ -307,6 +342,23 @@ def ocr_with_tesseract(pdf_path: str, *, dpi: int = TESSERACT_DPI,
                 if progress:
                     print(f"    page {n}: {w}x{h} downscaled to {image.size[0]}x{image.size[1]}")
             pages[n] = pytesseract.image_to_string(image, config=TESSERACT_CONFIG)
+            best_score = legibility("\n".join(_content_lines(pages[n])))
+            if best_score < ROTATION_TRIAL_THRESHOLD:
+                # Suspect page: try the other orientations and keep whichever
+                # reads best, but only if it wins by a clear margin.
+                for degrees in ROTATION_CANDIDATES:
+                    turned = image.rotate(degrees, expand=True)
+                    try:
+                        candidate = pytesseract.image_to_string(turned, config=TESSERACT_CONFIG)
+                    finally:
+                        turned.close()
+                    score = legibility("\n".join(_content_lines(candidate)))
+                    if score > best_score + ROTATION_ACCEPT_MARGIN:
+                        pages[n], best_score = candidate, score
+                        rotations[n] = degrees
+                if progress:
+                    print(f"    page {n}: rotated {rotations.get(n, 0)} deg "
+                          f"(legibility now {best_score:.4f})")
         except Exception as e:
             pages[n] = ""
             if progress:
@@ -316,7 +368,7 @@ def ocr_with_tesseract(pdf_path: str, *, dpi: int = TESSERACT_DPI,
         if progress:
             print(f"    page {n}/{last}: {len(pages[n])} chars")
     text = PAGE_DELIMITER.join(pages.get(n, "") for n in range(1, (last or 0) + 1))
-    return text, pages
+    return text, pages, rotations
 
 
 def acquire_text(pdf_path: str, *, max_pages: int | None = None,
@@ -340,7 +392,7 @@ def acquire_text(pdf_path: str, *, max_pages: int | None = None,
     attempts.append({"method": "pdf_text_layer", **layer_assessment})
     if layer_assessment["usable"]:
         return {"pdf_path": pdf_path, "text": layer, "page_texts": None,
-                "method": "pdf_text_layer", "pages": pages_total,
+                "method": "pdf_text_layer", "pages": pages_total, "rotations": {},
                 "assessment": layer_assessment, "attempts": attempts,
                 "needs_escalation": False}
 
@@ -348,12 +400,13 @@ def acquire_text(pdf_path: str, *, max_pages: int | None = None,
         why = "; ".join(layer_assessment["reasons"]) or "no embedded text"
         print(f"  text layer unusable ({why}) -- running Tesseract")
 
-    text, page_texts = ocr_with_tesseract(pdf_path, max_pages=max_pages, progress=progress)
+    text, page_texts, rotations = ocr_with_tesseract(pdf_path, max_pages=max_pages,
+                                                     progress=progress)
     ocr_assessment = assess(text, pages_total or 0)
     attempts.append({"method": "tesseract", **ocr_assessment})
 
     return {"pdf_path": pdf_path, "text": text, "page_texts": page_texts,
-            "method": "tesseract", "pages": pages_total,
+            "method": "tesseract", "pages": pages_total, "rotations": rotations,
             "assessment": ocr_assessment, "attempts": attempts,
             "needs_escalation": not ocr_assessment["usable"]}
 

@@ -291,6 +291,66 @@ def test_real_stage_handlers_are_callable_with_the_expected_signature() -> None:
           f"delegate they call resolves")
 
 
+def test_needs_review_regresses_a_covenant_that_claimed_reconciled() -> None:
+    """A note nobody queries is not a safeguard. Found on covid 4956:
+    classify_parcels correctly flagged a clipped neighbouring parcel and wrote
+    its note, while covenant.status -- the field anything actually filters on --
+    still read 'reconciled' from an earlier run."""
+    _cleanup()
+    with get_session() as session:
+        before = session.execute(
+            text("SELECT status FROM covenant WHERE covid = :c"), {"c": TEST_COVID}).scalar()
+        session.execute(text("UPDATE covenant SET status = 'reconciled' WHERE covid = :c"),
+                        {"c": TEST_COVID})
+    original = STAGES["classify_parcels"]
+    STAGES["classify_parcels"] = lambda s, c, p: StageVerdict(
+        "needs_review", "a boundary parcel needs checking", covid=c)
+    try:
+        enqueue_stage("classify_parcels", TEST_COVID)
+        job = claim_next(job_types=[job_type("classify_parcels")])
+        run_job(job, verbose=False)
+        with get_session() as session:
+            after = session.execute(
+                text("SELECT status FROM covenant WHERE covid = :c"), {"c": TEST_COVID}).scalar()
+        assert after == "needs_review", (
+            f"a halted stage must leave the covenant saying needs_review, got {after!r}")
+    finally:
+        STAGES["classify_parcels"] = original
+        with get_session() as session:
+            session.execute(text("UPDATE covenant SET status = :s WHERE covid = :c"),
+                            {"s": before, "c": TEST_COVID})
+    print(f"PASS: a needs_review verdict regresses status from 'reconciled' "
+          f"(restored to {before!r})")
+
+
+def test_record_only_notes_do_not_hold_a_covenant_open() -> None:
+    """The mirror image, and just as real. covid 4956's tract reconciled to
+    0.0000 ac unaccounted and the covenant still came back needs_review, because
+    "ANCHOR RESOLVED (... confidence=0.90)" -- a note saying the anchor WORKED --
+    was sitting in review_reason. No LLM-anchored covenant could ever have
+    reached 'reconciled'."""
+    from app.db.review_notes import RECORD_ONLY_TAGS, strip_record_only_notes
+
+    success = ("ANCHOR RESOLVED (automated, tier=llm_parcel_tie, confidence=0.90): tract 1 "
+               "anchored to a real, independently-verified position")
+    assert strip_record_only_notes(success) == "", (
+        f"a pure success record must leave nothing outstanding, got "
+        f"{strip_record_only_notes(success)!r}")
+
+    concern = "CLASSIFY_PARCELS-STAGE (automated): a boundary parcel needs checking"
+    both = f"{success}; {concern}"
+    remaining = strip_record_only_notes(both)
+    assert "CLASSIFY_PARCELS-STAGE" in remaining, remaining
+    assert "ANCHOR RESOLVED" not in remaining, remaining
+
+    # An unrecognised tag must count as a concern -- the safe direction is default.
+    unknown = "SOMETHING NEW (automated): who knows"
+    assert strip_record_only_notes(unknown) == unknown
+    assert "ANCHOR RESOLVED" in RECORD_ONLY_TAGS
+    print(f"PASS: record-only notes ({len(RECORD_ONLY_TAGS)} tags) do not hold a covenant "
+          f"open; an unknown tag still counts as a concern")
+
+
 if __name__ == "__main__":
     _cleanup()
     try:
@@ -305,6 +365,8 @@ if __name__ == "__main__":
         test_duplicate_enqueue_is_refused_not_duplicated()
         test_unknown_stage_is_refused()
         test_scan_enqueues_new_drops_and_skips_finished_ones()
+        test_needs_review_regresses_a_covenant_that_claimed_reconciled()
+        test_record_only_notes_do_not_hold_a_covenant_open()
         print("\nall pipeline tests passed")
     finally:
         _cleanup()

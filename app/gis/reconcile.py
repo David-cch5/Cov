@@ -32,7 +32,7 @@ from datetime import date
 
 from sqlalchemy import text
 
-from app.db.review_notes import merge_tagged_note
+from app.db.review_notes import merge_tagged_note, strip_record_only_notes
 
 # Matched acreage rarely sums to the covenant's stated acreage EXACTLY even when every
 # real lot was found (each parcel's own recorded acreage is itself already rounded,
@@ -202,7 +202,24 @@ def reconcile_covenant(session, covid: int) -> dict:
     reason = merge_tagged_note(existing.review_reason, "RECONCILIATION-STAGE", note)
 
     _DO_NOT_REGRESS = {"title_in_progress", "done"}
-    if problems or reason:
+    # Not every tagged note is an open concern. Some are RECORDS of work that
+    # succeeded, written into review_reason as provenance -- and treating one of
+    # those as a reason to review means the covenant can never be finished.
+    #
+    # Confirmed real on covid 4956, the first covenant taken end to end by the
+    # queued pipeline: its single tract reconciled exactly (0.0000 ac
+    # unaccounted), and it still came back needs_review, because
+    # app/gis/anchor_resolver.py had left "ANCHOR RESOLVED (automated,
+    # tier=llm_parcel_tie, confidence=0.90): tract 1 anchored to a real,
+    # independently-verified position" in review_reason. A success note was
+    # holding the covenant open. Left unfixed, no LLM-anchored covenant could
+    # ever reach 'reconciled'.
+    #
+    # Listed by tag rather than inferred, so adding a record-style note is a
+    # deliberate act: anything not named here still counts as a concern, which
+    # keeps the safe direction the default.
+    open_concerns = strip_record_only_notes(reason)
+    if problems or open_concerns:
         # either reconciliation itself found a problem, or some OTHER stage's own
         # still-open concern remains in review_reason -- either way, this covenant is
         # not clean, and that must not be silently overridden by a good reconciliation

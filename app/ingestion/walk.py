@@ -270,12 +270,29 @@ def get_deed_text(session, covid: int, legal_description_raw: str | None = None)
         # already uses for text_extract.
         from app.ingestion.intake import INTAKE_TEXT_DIR
 
+        # Best by YIELD across every cache, not the first one that exists. Order
+        # would otherwise decide, and _textcache_final comes first -- so covid
+        # 4956, whose corpus entry is 13 pages of imaging-vendor page-stamps and
+        # zero document body, would keep beating a good re-OCR of the same PDF.
+        # Same principle _best_cache_file applies within one directory and
+        # prefer_fuller_cache applies across the legacy caches: fuller wins.
+        from app.ingestion.text_extract import assess
+
         basename = os.path.basename(doc.relpath)
+        best_text, best_yield = None, -1.0
         for cache_dir in (TEXTCACHE, INTAKE_TEXT_DIR):
             cache_path = os.path.join(cache_dir, f"{covid}_{basename}.json")
-            if os.path.exists(cache_path):
-                with open(cache_path, encoding="utf-8") as f:
-                    full_text = json.load(f).get("text")
-                if full_text:
-                    return full_text
+            if not os.path.exists(cache_path):
+                continue
+            with open(cache_path, encoding="utf-8") as f:
+                cached = json.load(f)
+            candidate_text = cached.get("text")
+            if not candidate_text:
+                continue
+            a = assess(candidate_text, cached.get("pages") or 0)
+            score = a["chars_per_page"] if cached.get("pages") else float(a["content_chars"])
+            if score > best_yield:
+                best_text, best_yield = candidate_text, score
+        if best_text:
+            return best_text
     return legal_description_raw or ""

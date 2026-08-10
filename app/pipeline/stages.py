@@ -53,6 +53,14 @@ MANUAL_STAGES = ("chain_of_title", "fee_compute")
 
 JOB_TYPE_PREFIX = "pipeline_"
 
+# A boundary parcel overlapping the tract by less than this is presumed to be a
+# neighbour clipped at digitization tolerance until a human says otherwise. Set
+# at 0.5 -- a parcel genuinely half in the tract deserves the same look as one
+# 13% in, and the cost of asking is a note, while the cost of not asking is a
+# wrong parcel census carried into fee collection. covid 8534 tract 1's 254
+# "matched" parcels were 214; covid 4956's 2 were 1.
+LOW_OVERLAP_REVIEW_THRESHOLD = 0.5
+
 
 def job_type(stage: str) -> str:
     return f"{JOB_TYPE_PREFIX}{stage}"
@@ -243,7 +251,53 @@ def run_classify_parcels(session, covid: int, payload: dict) -> StageVerdict:
     from app.gis.classifier import classify_metes_and_bounds_tract
 
     result = classify_metes_and_bounds_tract(session, covid)
+
+    # EVERY low-overlap boundary parcel is checked, not just the whole-subdivision
+    # signature. The classifier's own auto-flag catches a whole subdivision whose
+    # members are ALL low-overlap; it does not catch a SINGLE clipped neighbour,
+    # and that is not a hypothetical gap:
+    #
+    #   covid 4956, the first covenant this pipeline took end to end, is "all of
+    #   Lot 14 and part of Lot 13, Block 1, Metropolitan Commercial Park
+    #   Addition". It matched two parcels. One recites "METROPOLITAN COMMERCIAL
+    #   PARK BLK 1 LOT 14 & PT LT 13" at 1.00 overlap -- the deed's own words. The
+    #   other recites "CONLON THOMAS BLK 1 LT 1.1", a different subdivision with a
+    #   different owner across Beta Road, at 0.13 overlap: a digitization clip.
+    #   The census was 1 parcel, reported as 2, and the covenant went on to be
+    #   marked 'reconciled'.
+    #
+    # So the deed's own text is put in front of a human alongside each suspect
+    # parcel's recited legal description. The exclusion itself stays a human call
+    # via exclude_non_tract_parcels, per CLAUDE.md -- this only refuses to call an
+    # unchecked census done.
+    suspect = session.execute(
+        text("""
+            SELECT pc.apn, round(pc.confidence::numeric, 2) AS overlap,
+                   p.recited_legal_description, p.owner_name_raw
+              FROM parcel_covenant pc
+              JOIN parcel p USING (county_fips, apn)
+             WHERE pc.covid = :c
+               AND pc.run_seq = (SELECT max(run_seq) FROM parcel_covenant WHERE covid = :c)
+               AND pc.classification = 'boundary'
+               AND pc.confidence < :threshold
+             ORDER BY pc.confidence
+        """),
+        {"c": covid, "threshold": LOW_OVERLAP_REVIEW_THRESHOLD},
+    ).fetchall()
+
     flagged = result.get("possible_non_tract_subdivisions") or []
+    if suspect:
+        listed = "; ".join(
+            f"{r.apn} at {r.overlap} overlap, recites {(r.recited_legal_description or '?')!r}"
+            f" (owner {(r.owner_name_raw or '?')!r})" for r in suspect)
+        note = (f"{result.get('matched_parcels', '?')} parcels matched, but "
+                f"{len(suspect)} are boundary parcels below {LOW_OVERLAP_REVIEW_THRESHOLD} "
+                f"overlap and must be checked against the deed's own text before the census "
+                f"counts -- a neighbouring subdivision clips the polygon at ordinary "
+                f"digitization tolerance: {listed}")
+        _record_stage_note(session, covid, "classify_parcels", note)
+        return StageVerdict("needs_review", note, covid=covid, detail=result)
+
     if flagged:
         note = (f"{result.get('matched_parcels', '?')} parcels matched, but "
                 f"{len(flagged)} whole subdivision(s) are entirely low-overlap "
@@ -295,7 +349,22 @@ def run_reconcile(session, covid: int, payload: dict) -> StageVerdict:
     detail = "; ".join(
         [f"tract {tn}: {note}" for tn, note in problems.items()]
         + [f"tract {tn} not checkable: {reason}" for tn, reason in unchecked.items()]
-    ) or f"reconciliation left this covenant at status {final_status!r}"
+    )
+    if not detail:
+        # Every tract reconciled, yet the covenant is not clean -- so something
+        # ELSE is still open in review_reason and reconcile_covenant deliberately
+        # refuses to override it. Quote it, rather than reporting the bare status:
+        # "reconciliation left this covenant at needs_review" tells a reader
+        # nothing about what to actually go and do.
+        from app.db.review_notes import strip_record_only_notes
+
+        outstanding = strip_record_only_notes(session.execute(
+            text("SELECT review_reason FROM covenant WHERE covid = :c"), {"c": covid},
+        ).scalar())
+        detail = (f"every tract reconciled, but another stage's concern is still open: "
+                  f"{outstanding}" if outstanding else
+                  f"every tract reconciled, yet status is {final_status!r} -- "
+                  f"no tract problem and no open note found, which should not happen")
     return StageVerdict("needs_review", detail, covid=covid, detail=result)
 
 
