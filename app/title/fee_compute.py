@@ -93,8 +93,11 @@ def compute_fee_for_transfer(session, county_fips: str, instrument_number: str,
     # transfer was already classified still takes effect, without needing every
     # transfer re-walked first. Nothing before the effective date is touched: a
     # fee owed then was owed, and stays owed.
+    # A transfer recorded the same day as the release is NOT auto-released --
+    # recording sequence within the day decides, and leaving the fee owed is the
+    # conservative direction.
     released = release_for_transfer(session, row.covid, county_fips, parcel_apn, recording_date)
-    if released is not None:
+    if released is not None and released["releases_transfer"]:
         _clear_stale_fee_collection(session, county_fips, instrument_number, recording_date, parcel_apn)
         detail = released["recording_instrument"] or f"release {released['release_id']}"
         return {"fee_owed": False,

@@ -16,10 +16,17 @@ encumbered and stopped being so on a date. Recording one as the other would eras
 the period the covenant genuinely ran, and with it the basis for every fee
 already collected in that period.
 
-So a released parcel STAYS in the census and keeps its history. Nothing before
-the effective date changes: earlier transfers keep their fee_collection rows, and
-a fee already taken remains correctly taken, because it was owed when it was
-taken. Only transfers on or after the effective date become exempt.
+So a released parcel STAYS in the census and keeps its history. Nothing on or
+before the effective date changes: earlier transfers keep their fee_collection
+rows, and a fee already taken remains correctly taken, because it was owed when
+it was taken.
+
+A RELEASE OPERATES PROSPECTIVELY. Per these covenants' own terms a termination
+takes effect after it is recorded, so only transfers recorded strictly AFTER the
+effective date are exempt, and effective_date defaults to the recording date
+rather than being supplied independently. A transfer recorded the SAME DAY is
+left owed and flagged: which instrument came first that day is decided by
+recording sequence, which this system does not model.
 
 That is the same shape as the pre_effective_date exemption at the other end of a
 covenant's life, which is why this reports through exemption_category rather than
@@ -42,14 +49,23 @@ EXEMPTION_FOR_TYPE = {"termination": "post_termination", "buyout": "post_buyout"
 
 
 def record_release(
-    session, covid: int, release_type: str, effective_date: date,
+    session, covid: int, release_type: str, effective_date: date | None = None,
     scope: str = "covenant", parcels: list[tuple[str, str]] | None = None,
     recording_instrument: str | None = None, recording_date: date | None = None,
     consideration_amount: float | None = None, notes: str | None = None,
-    source_id: int | None = None,
+    source_id: int | None = None, retroactive_basis: str | None = None,
 ) -> dict:
     """Record a termination or buyout. `parcels` is [(county_fips, apn), ...]
     and is required for scope='partial'.
+
+    EFFECTIVE DATE FOLLOWS THE RECORDING DATE. Per these covenants' own terms a
+    termination takes effect after it is recorded -- it does not reach back. So
+    effective_date defaults to recording_date, and an effective_date EARLIER than
+    the recording date is refused unless the caller supplies retroactive_basis
+    quoting the instrument language that permits it. The exception exists because
+    the answer does depend on the instrument's own wording; requiring the quote
+    keeps a retroactive release a deliberate, evidenced act rather than a typo
+    that silently voids fees already owed.
 
     A partial release naming no parcels is refused rather than written: it would
     read as releasing nothing, or as releasing everything, depending on which
@@ -64,6 +80,21 @@ def record_release(
     if scope == "covenant" and parcels:
         raise ValueError("a covenant-wide release cannot also name individual parcels -- "
                          "use scope='partial' if only some land is released")
+
+    if effective_date is None:
+        if recording_date is None:
+            raise ValueError("a release needs either an effective_date or a recording_date "
+                             "to derive one from -- it cannot take effect on no date at all")
+        effective_date = recording_date
+    if recording_date is not None and effective_date < recording_date:
+        if not retroactive_basis:
+            raise ValueError(
+                f"effective_date {effective_date} precedes recording_date {recording_date}. "
+                f"These covenants terminate prospectively, so this needs retroactive_basis "
+                f"quoting the instrument language that makes it reach back -- otherwise fees "
+                f"already owed would be voided by what is probably a transcription error"
+            )
+        notes = f"RETROACTIVE, basis: {retroactive_basis}" + (f" | {notes}" if notes else "")
 
     release_id = session.execute(
         text("""
@@ -97,10 +128,17 @@ def release_for_transfer(session, covid: int, county_fips: str, apn: str,
                          recording_date: date) -> dict | None:
     """The release that exempts this transfer, or None.
 
-    A transfer is released only when it is recorded ON OR AFTER the effective
-    date AND its parcel is in scope. Earlier transfers are deliberately NOT
-    matched -- that is the whole point: the fee was owed when it was taken, and
-    a later release does not claw it back.
+    A transfer is released only when it is recorded strictly AFTER the effective
+    date and its parcel is in scope, because these covenants terminate
+    prospectively. Earlier transfers are deliberately NOT matched -- that is the
+    whole point: the fee was owed when it was taken, and a later release does not
+    claw it back.
+
+    A transfer recorded on the SAME DAY as the release is not auto-released. Which
+    came first is decided by recording sequence within that day, which this system
+    does not model, and the conservative direction is to leave the fee owed and
+    let a human read the instrument numbers. Such a transfer comes back with
+    same_day=True and needs_review=True rather than silently either way.
 
     Where several releases could apply, the EARLIEST effective one wins: the
     obligation ended the first time it ended, and a subsequent instrument cannot
@@ -125,7 +163,12 @@ def release_for_transfer(session, covid: int, county_fips: str, apn: str,
     ).mappings().first()
     if row is None:
         return None
-    return {**dict(row), "exemption_category": EXEMPTION_FOR_TYPE[row["release_type"]]}
+    same_day = row["effective_date"] == recording_date
+    return {**dict(row),
+            "exemption_category": EXEMPTION_FOR_TYPE[row["release_type"]],
+            "same_day": same_day,
+            "needs_review": same_day,
+            "releases_transfer": not same_day}
 
 
 def released_parcels(session, covid: int, as_of: date | None = None) -> dict:
@@ -165,6 +208,10 @@ def apply_releases_to_transfers(session, covid: int) -> dict:
     exemption is an independent finding about that transfer -- a foreclosure, a
     spousal transfer -- and is not overwritten just because the land was later
     released; the transfer was exempt for its own reason at the time.
+
+    Same-day transfers are deliberately NOT stamped here, for the reason
+    release_for_transfer gives: recording sequence decides, and this settles it
+    the conservative way by leaving the fee owed for a human to resolve.
     """
     result = session.execute(
         text("""
@@ -181,7 +228,7 @@ def apply_releases_to_transfers(session, covid: int) -> dict:
               AND t.exemption_category IS NULL
               AND t.superseded_at IS NULL
               AND r.covid = t.covid
-              AND r.effective_date <= t.recording_date
+              AND r.effective_date < t.recording_date   -- strictly after; see release_for_transfer
               AND (r.scope = 'covenant'
                    OR EXISTS (SELECT 1 FROM covenant_release_parcel p
                               WHERE p.release_id = r.release_id

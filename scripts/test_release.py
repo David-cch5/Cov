@@ -89,9 +89,10 @@ def _teardown(session) -> None:
 
 
 def test_release_exempts_only_transfers_on_or_after_its_effective_date() -> None:
-    """The whole point. A release ends the obligation going forward and leaves
-    everything before it alone -- a fee taken on the earlier transfer was owed
-    when it was taken, and a later termination does not claw it back."""
+    """The whole point. A release ends the obligation going FORWARD -- per these
+    covenants a termination takes effect after it is recorded -- and leaves
+    everything before it alone: a fee taken on the earlier transfer was owed when
+    it was taken, and a later termination does not claw it back."""
     try:
         with get_session() as session:
             _setup(session)
@@ -106,8 +107,14 @@ def test_release_exempts_only_transfers_on_or_after_its_effective_date() -> None
             on_the_day = release_for_transfer(session, COVID, COUNTY, APN_A, EFFECTIVE)
         assert before is None, before
         assert after is not None and after["exemption_category"] == "post_termination", after
-        assert on_the_day is not None, "a transfer ON the effective date is released"
-        print("PASS: a release exempts transfers on/after its effective date and none before")
+        assert after["releases_transfer"] is True, after
+        # Same day: recording sequence decides, which this system does not model,
+        # so the fee stays owed and a human reads the instrument numbers.
+        assert on_the_day is not None and on_the_day["same_day"] is True, on_the_day
+        assert on_the_day["releases_transfer"] is False, on_the_day
+        assert on_the_day["needs_review"] is True, on_the_day
+        print("PASS: a release exempts transfers recorded AFTER it; same-day is flagged, "
+              "not released; earlier transfers untouched")
     finally:
         with get_session() as session:
             _teardown(session); session.commit()
@@ -256,6 +263,41 @@ def test_fee_compute_honours_a_release_recorded_after_the_fact() -> None:
             _teardown(session); session.commit()
 
 
+def test_effective_date_defaults_to_recording_and_refuses_to_reach_back() -> None:
+    """Per these covenants a termination is effective after the date it is
+    recorded, so effective_date is derived from recording_date rather than
+    supplied independently. An earlier effective date would void fees already
+    owed, so it is refused unless the caller quotes the instrument language that
+    permits it -- the answer does depend on the wording, but a retroactive
+    release has to be a deliberate, evidenced act rather than a typo."""
+    try:
+        with get_session() as session:
+            _setup(session)
+            got = record_release(session, covid=COVID, release_type="termination",
+                                 scope="covenant", recording_date=date(2020, 6, 1))
+            assert got["effective_date"] == date(2020, 6, 1), got
+
+            try:
+                record_release(session, covid=COVID, release_type="termination",
+                               scope="covenant", recording_date=date(2020, 6, 1),
+                               effective_date=date(2019, 1, 1))
+                raise AssertionError("expected a ValueError for a retroactive effective date")
+            except ValueError as exc:
+                assert "retroactive_basis" in str(exc), exc
+
+            back = record_release(session, covid=COVID, release_type="termination",
+                                  scope="covenant", recording_date=date(2020, 6, 1),
+                                  effective_date=date(2019, 1, 1),
+                                  retroactive_basis="instrument recites it is effective nunc pro tunc")
+            assert back["effective_date"] == date(2019, 1, 1), back
+            session.rollback()
+        print("PASS: effective_date defaults to the recording date; reaching back needs a "
+              "quoted basis and is otherwise refused")
+    finally:
+        with get_session() as session:
+            _teardown(session); session.commit()
+
+
 if __name__ == "__main__":
     test_release_exempts_only_transfers_on_or_after_its_effective_date()
     test_partial_release_leaves_other_parcels_encumbered()
@@ -264,4 +306,5 @@ if __name__ == "__main__":
     test_malformed_releases_are_refused()
     test_earliest_effective_release_wins()
     test_fee_compute_honours_a_release_recorded_after_the_fact()
+    test_effective_date_defaults_to_recording_and_refuses_to_reach_back()
     print("\nall covenant-release tests passed")
