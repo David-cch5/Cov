@@ -5,8 +5,10 @@ Two situations do that, for different reasons:
 
   termination  an instrument terminates the covenant as to some or all of the
                land, including the declarant's own reserved right to terminate
-  buyout       the fee obligation is bought out, after which the covenant is no
-               longer enforced against that land
+  buyout       the fee obligation is bought out. Negotiated to STOP FUTURE
+               COLLECTION: after its effective date those parcels no longer
+               collect fees. Inherently prospective -- nobody pays to undo the
+               past, they pay to stop what would otherwise keep accruing.
 
 WHAT MAKES THIS DIFFERENT FROM AN EXCLUSION
 app/gis/classifier.py's exclude_non_tract_parcels says a parcel was NEVER part of
@@ -87,7 +89,10 @@ def record_release(
       effect='void_ab_initio'  the covenant is void "as if it had never been
                                recorded" -- it reaches back to inception, so
                                effective_date is not what governs and every
-                               transfer is released.
+                               transfer is released. A TERMINATION shape only: a
+                               buyout is always prospective, because stopping
+                               future collection is what it is for (migration
+                               0041, enforced by CHECK).
 
     A void_ab_initio release is licensed by the sworn statement these instruments
     carry that nothing was conveyed since the covenant was filed -- no intervening
@@ -123,6 +128,13 @@ def record_release(
         )
     if effect not in EFFECTS:
         raise ValueError(f"effect must be one of {EFFECTS}, got {effect!r}")
+    if release_type == "buyout" and effect != "prospective":
+        raise ValueError(
+            "a buyout is always prospective -- it is negotiated to stop FUTURE collection, "
+            "and after its effective date those parcels no longer collect fees. Reaching back "
+            "to inception is a termination shape ('null and void as if it had never been "
+            "recorded'), which is not something anyone pays for"
+        )
     if effect == "void_ab_initio" and not (no_intervening_conveyance_affidavit or retroactive_basis):
         raise ValueError(
             "a void_ab_initio release reaches back to the covenant's inception, so it needs "
@@ -271,7 +283,14 @@ def release_for_transfer(session, covid: int, county_fips: str, apn: str,
 
 
 def settle_prior_fees(session, release_id: int) -> dict:
-    """Discharge the fees a buyout's consideration covered, by LINKING them to it.
+    """Discharge a fee already outstanding that a buyout's consideration also covered.
+
+    This is NOT how a buyout stops collection. That is automatic and prospective:
+    after the effective date those parcels no longer collect fees, with no flag
+    involved. This handles only the separate, optional payment term that the
+    negotiated amount ALSO covered a balance already outstanding. A buyout without
+    that term still stops future fees; it simply leaves the existing balance where
+    it was.
 
     Nothing is deleted and no amount is rewritten. Each affected fee_collection row
     keeps its base_amount, its fee_percent_applied and what it was owed on, and

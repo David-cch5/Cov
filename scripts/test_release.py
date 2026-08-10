@@ -659,6 +659,51 @@ def test_an_invalid_termination_releases_nothing_and_carries_its_rescission() ->
             _teardown(session); session.commit()
 
 
+def test_a_buyout_is_always_prospective() -> None:
+    """A buyout is negotiated to stop FUTURE collection -- after its effective date
+    those parcels no longer collect fees. That makes it inherently prospective.
+
+    Reaching back to inception is a TERMINATION shape: the covenant declared never
+    to have been a lawful restriction at all. Nobody negotiates and pays for that,
+    so a void-ab-initio buyout is refused in code and by a CHECK constraint."""
+    try:
+        with get_session() as session:
+            _setup(session)
+            # Refused before any SQL runs, so the fixture is untouched -- no rollback,
+            # which would take _setup with it.
+            try:
+                record_release(session, covid=COVID, release_type="buyout", scope="covenant",
+                               effect="void_ab_initio", recording_date=EFFECTIVE,
+                               no_intervening_conveyance_affidavit=True,
+                               validity_status="valid")
+                raise AssertionError("expected a ValueError: a buyout cannot be void ab initio")
+            except ValueError as exc:
+                assert "always prospective" in str(exc), exc
+
+            # A termination MAY reach back -- that asymmetry is the point.
+            record_release(session, covid=COVID, release_type="termination", scope="partial",
+                           parcels=[(COUNTY, APN_B)], effect="void_ab_initio",
+                           recording_date=EFFECTIVE,
+                           no_intervening_conveyance_affidavit=True, validity_status="valid")
+            # The buyout's own effect: fees stop AFTER the date, nothing before.
+            record_release(session, covid=COVID, release_type="buyout", scope="partial",
+                           parcels=[(COUNTY, APN_A)], recording_date=EFFECTIVE,
+                           consideration_amount=250000, validity_status="valid")
+            session.commit()
+
+            after = release_for_transfer(session, COVID, COUNTY, APN_A, date(2021, 3, 1))
+            before = release_for_transfer(session, COVID, COUNTY, APN_A, date(2019, 3, 1))
+            reaches_back = release_for_transfer(session, COVID, COUNTY, APN_B, date(2019, 3, 1))
+        assert after is not None and after["releases_transfer"] is True, after
+        assert before is None, before                      # the buyout leaves the past alone
+        assert reaches_back is not None and reaches_back["void_ab_initio"] is True, reaches_back
+        print("PASS: a buyout is always prospective -- it stops future collection and leaves "
+              "earlier transfers alone; only a termination may reach back")
+    finally:
+        with get_session() as session:
+            _teardown(session); session.commit()
+
+
 if __name__ == "__main__":
     test_release_exempts_only_transfers_on_or_after_its_effective_date()
     test_partial_release_leaves_other_parcels_encumbered()
@@ -678,4 +723,5 @@ if __name__ == "__main__":
     test_anchor_resolution_skips_a_released_covenant_by_default()
     test_a_found_termination_asserts_nothing_until_adjudicated()
     test_an_invalid_termination_releases_nothing_and_carries_its_rescission()
+    test_a_buyout_is_always_prospective()
     print("\nall covenant-release tests passed")
