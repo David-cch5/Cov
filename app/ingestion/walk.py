@@ -246,16 +246,36 @@ def get_deed_text(session, covid: int, legal_description_raw: str | None = None)
     detection) need it, and anchor_resolver already imports classifier -- putting
     it in either one would be a circular import. This module already owns
     TEXTCACHE and imports nothing from app.gis.
+
+    SEARCHES EVERY CACHE A DOCUMENT'S TEXT CAN LIVE IN, not just the corpus one.
+    Confirmed the hard way on the first live drag-and-drop run: this looked only
+    in _textcache_final, so a covenant that arrived as a dropped file -- whose
+    text app/ingestion/intake.py caches under _intake_text/ -- fell through to
+    legal_description_raw and got a 577-character ingestion SUMMARY where the
+    corpus copy of the very same document yields 72,363 characters. Course
+    extraction then found zero courses and anchoring failed outright.
+
+    That is CLAUDE.md's single most expensive recurring mistake arriving by a new
+    route: "read the legal description from the DOCUMENT ITSELF, not a summary."
+    The corpus path had been fixed for it; the drop path silently had not, and
+    would have hit it on every covenant.
     """
     doc = session.execute(
         text("SELECT relpath FROM covenant_document WHERE covid = :covid AND doc_type = 'original'"),
         {"covid": covid},
     ).fetchone()
     if doc and doc.relpath:
-        cache_path = os.path.join(TEXTCACHE, f"{covid}_{os.path.basename(doc.relpath)}.json")
-        if os.path.exists(cache_path):
-            with open(cache_path) as f:
-                full_text = json.load(f).get("text")
-            if full_text:
-                return full_text
+        # Imported lazily: app/ingestion/intake.py imports FROM this module, so a
+        # module-level import would be circular. Same pattern _best_cache_file
+        # already uses for text_extract.
+        from app.ingestion.intake import INTAKE_TEXT_DIR
+
+        basename = os.path.basename(doc.relpath)
+        for cache_dir in (TEXTCACHE, INTAKE_TEXT_DIR):
+            cache_path = os.path.join(cache_dir, f"{covid}_{basename}.json")
+            if os.path.exists(cache_path):
+                with open(cache_path, encoding="utf-8") as f:
+                    full_text = json.load(f).get("text")
+                if full_text:
+                    return full_text
     return legal_description_raw or ""

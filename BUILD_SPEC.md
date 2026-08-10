@@ -63,8 +63,14 @@ probe** on Montgomery County + a small multi-county sample. Full portfolio (~1,0
 - **Model routing (Claude):** default **Sonnet at high / "max smart" effort** for coding, bulk
   work, and field extraction (Haiku for trivial structuring); escalate to **Opus 5** for hard
   reasoning and **Fable 5** for the hardest reasoning and for bad-scan vision OCR (Opus 4.8 as a
-  cheaper vision fallback). *(Superseded the original "Opus 4.8 for hard reasoning"; see
-  `app/config.py`'s `LLM_MODEL_HARD` and CLAUDE.md, which are authoritative.)*
+  cheaper vision fallback). *(Superseded the original "Opus 4.8 for hard reasoning".)*
+  **CLAUDE.md states the policy; the EFFECTIVE model is whatever `app/config.py` resolves at
+  run time, and `.env` beats the source default there — `load_dotenv()` populates the
+  environment, and `os.environ.get(name, default)` then never sees the default. That is not a
+  hypothetical: `.env` pinned `LLM_MODEL_HARD=claude-opus-4-8` for weeks after the source
+  default was corrected to `claude-opus-5`, so every hard-reasoning escalation quietly ran a
+  model behind the documented policy. `scripts/test_config.py` now asserts the resolved values,
+  which is the only place the two can be compared.*
 - **Workers:** stateless; pull jobs from a queue table with `SELECT … FOR UPDATE SKIP LOCKED`;
   idempotent upserts keyed by covid / parcel id / instrument number; shard by county across
   the 4 Mac minis; per-portal politeness (1–2 workers per recorder).

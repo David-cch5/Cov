@@ -56,6 +56,20 @@ class NgsServiceEmpty(NgsUnanswered):
     """Returned no marks at all. Transient: retry later, unchanged."""
 
 
+class NgsServiceUnavailable(NgsUnanswered):
+    """The request did not complete -- a 5xx, a timeout, a refused connection, a
+    body that is not JSON. Transient: retry later.
+
+    Split out after the service itself demonstrated the gap. The empty-response
+    guard was already in place when /api/nde/bounds started answering 503, and a
+    503 arrives as requests' own HTTPError from raise_for_status() -- which fell
+    into the caller's broad "this tier cannot place it" handler and resumed the
+    walk toward the paid tiers. Exactly the failure the empty-response guard was
+    written to prevent, reached through a different door. Any way the service can
+    decline to answer has to land in the same family, or the cheap tier keeps
+    quietly losing to the expensive one."""
+
+
 class NgsResultTruncated(NgsUnanswered):
     """Hit the silent result cap, so the answer is incomplete. NOT transient --
     retrying the same oversized bbox returns the same truncated set. The search
@@ -145,10 +159,30 @@ def parse_datasheet(text: str) -> dict:
     return out
 
 
-def fetch_datasheet(pid: str, timeout: int = 30) -> str:
-    resp = requests.get(NGS_DATASHEET_URL, params={"PidBox": pid}, timeout=timeout)
+def _get(url: str, params: dict, timeout: int) -> requests.Response:
+    """Every NGS request goes through here so that any way the service can fail
+    to answer becomes NgsServiceUnavailable rather than a bare transport error.
+
+    A raw HTTPError/Timeout reaching app/gis/anchor_resolver.py lands in its
+    broad "this tier cannot place it" handler and resumes the walk toward the
+    paid tiers -- which is how a 503 came to mean the same thing as "there is no
+    monument here". A 4xx is left as itself: a malformed request is a bug to fix,
+    not an outage to wait out."""
+    try:
+        resp = requests.get(url, params=params, timeout=timeout)
+    except requests.RequestException as e:
+        raise NgsServiceUnavailable(f"NGS request to {url} did not complete: "
+                                    f"{type(e).__name__}: {e}") from e
+    if resp.status_code >= 500:
+        raise NgsServiceUnavailable(
+            f"NGS returned HTTP {resp.status_code} for {url} -- the service is unavailable, "
+            f"not an answer about the monument. Retry later; do not fall through to a paid tier.")
     resp.raise_for_status()
-    return resp.text
+    return resp
+
+
+def fetch_datasheet(pid: str, timeout: int = 30) -> str:
+    return _get(NGS_DATASHEET_URL, {"PidBox": pid}, timeout).text
 
 
 def find_monuments(designations, bbox: dict, timeout: int = 45) -> dict:
@@ -163,12 +197,18 @@ def find_monuments(designations, bbox: dict, timeout: int = 45) -> dict:
     a different monument, not the same one spelled loosely.
     """
     wanted = {normalize_designation(d) for d in designations}
-    resp = requests.get(NGS_BOUNDS_URL, params={
+    resp = _get(NGS_BOUNDS_URL, {
         "minlon": bbox["min_lon"], "maxlon": bbox["max_lon"],
         "minlat": bbox["min_lat"], "maxlat": bbox["max_lat"],
-    }, timeout=timeout)
-    resp.raise_for_status()
-    marks = resp.json()
+    }, timeout)
+    try:
+        marks = resp.json()
+    except ValueError as e:
+        # A 200 whose body is not JSON is a maintenance page or a truncated
+        # response, i.e. the service not answering -- same family, not a finding.
+        raise NgsServiceUnavailable(
+            f"NGS bounds search returned HTTP {resp.status_code} with a non-JSON body "
+            f"({len(resp.content)} bytes) -- the service is not answering: {e}") from e
 
     found: dict[str, NgsMonument] = {}
     for mark in marks:

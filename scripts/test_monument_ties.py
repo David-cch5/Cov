@@ -200,6 +200,8 @@ def test_service_not_answering_is_not_evidence_of_no_monument() -> None:
     bbox = {"min_lat": 27.70, "max_lat": 27.90, "min_lon": -97.16, "max_lon": -97.00}
 
     class _Resp:
+        status_code = 200
+        content = b"[]"
         def __init__(self, payload): self._payload = payload
         def raise_for_status(self): pass
         def json(self): return self._payload
@@ -226,11 +228,45 @@ def test_service_not_answering_is_not_evidence_of_no_monument() -> None:
         else:
             raise AssertionError("a capped result set must raise")
 
-        # Both are one family, so a caller can decline to escalate on either.
+        # 3. A 5xx -- how the service actually failed later the same hour. This
+        #    arrives as requests' own HTTPError from raise_for_status(), which used
+        #    to land in anchor_resolver's broad "cannot place it" handler and
+        #    resume the walk toward the paid tiers: the very failure the
+        #    empty-response guard was written to stop, through another door.
+        from app.gis.ngs import NgsServiceUnavailable
+
+        class _Down:
+            status_code = 503
+            content = b"<html>Service Unavailable</html>"
+            def raise_for_status(self): raise AssertionError("must not reach raise_for_status")
+            def json(self): raise AssertionError("must not reach json")
+
+        ngs_module.requests.get = lambda *a, **k: _Down()
+        try:
+            find_monuments({"SF-010"}, bbox)
+        except NgsServiceUnavailable as e:
+            assert "503" in str(e) and "not an answer" in str(e), str(e)
+        else:
+            raise AssertionError("a 5xx must raise NgsServiceUnavailable")
+
+        # 4. A refused connection / timeout, likewise.
+        def _boom(*a, **k):
+            raise ngs_module.requests.exceptions.ConnectTimeout("timed out")
+
+        ngs_module.requests.get = _boom
+        try:
+            find_monuments({"SF-010"}, bbox)
+        except NgsServiceUnavailable as e:
+            assert "did not complete" in str(e), str(e)
+        else:
+            raise AssertionError("a transport failure must raise NgsServiceUnavailable")
+
+        # All are one family, so a caller can decline to escalate on any of them.
         assert issubclass(NgsServiceEmpty, NgsUnanswered)
         assert issubclass(NgsResultTruncated, NgsUnanswered)
+        assert issubclass(NgsServiceUnavailable, NgsUnanswered)
 
-        # 3. A genuine "not in this area" -- marks came back, ours is not among
+        # 5. A genuine "not in this area" -- marks came back, ours is not among
         #    them, nowhere near the cap -- is a real answer and must NOT raise.
         ngs_module.requests.get = lambda *a, **k: _Resp(
             [{"name": "SOMETHING ELSE", "pid": "AA0001"}])
@@ -239,7 +275,8 @@ def test_service_not_answering_is_not_evidence_of_no_monument() -> None:
     finally:
         ngs_module.requests.get = original
     print("PASS: an unanswered NGS search raises (empty=retry, capped=fix the bbox) while a "
-          "genuine 'not in this area' still returns empty")
+          "genuine 'not in this area' still returns empty; 5xx and transport failures "
+          "join the same family")
 
 
 def test_anchor_resolver_does_not_buy_what_ngs_gives_free() -> None:
