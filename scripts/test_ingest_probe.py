@@ -100,6 +100,29 @@ def test_ingest_one_raises_clear_error_on_unresolved_county() -> None:
           "crashing on a raw NOT NULL violation")
 
 
+def test_best_cache_file_prefers_the_fuller_document() -> None:
+    """19 of 1,056 cached covenants have more than one cache file, and this
+    used to be text_files[0] -- filesystem order. covid 4497's two files are a
+    real 14-page document (54,005 chars) and a 26-page one holding 4,691 chars
+    (180/page, no usable body). Order must not decide which one the whole
+    pipeline reads."""
+    import os
+
+    from app.ingestion.walk import TEXTCACHE, _best_cache_file
+
+    names = [f for f in os.listdir(TEXTCACHE) if f.startswith("4497_")]
+    if len(names) < 2:
+        print("SKIP: covid 4497 no longer has duplicate cache files")
+        return
+    # Both orderings must give the same answer -- that is the whole point.
+    for ordering in (sorted(names), sorted(names, reverse=True)):
+        best = _best_cache_file(TEXTCACHE, ordering)
+        assert best.get("relpath", "").endswith("D2045.pdf"), (
+            f"expected the fuller D2045 document, got {best.get('relpath')!r}")
+    assert _best_cache_file(TEXTCACHE, []) == {}, "no files must not crash"
+    print("PASS: _best_cache_file picks the fuller document regardless of listing order")
+
+
 if __name__ == "__main__":
     test_merge_preserves_unrelated_existing_note()
     test_merge_appends_ingestion_note()
@@ -107,4 +130,5 @@ if __name__ == "__main__":
     test_merge_clears_when_ingestion_now_clean()
     test_known_county_name_typo_correction()
     test_ingest_one_raises_clear_error_on_unresolved_county()
+    test_best_cache_file_prefers_the_fuller_document()
     print("\nall ingest_probe smoke tests passed")

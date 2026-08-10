@@ -109,7 +109,15 @@ def iter_candidates(session, covids: list[str]):
         text_files = [f for f in os.listdir(TEXTCACHE) if f.startswith(f"{covid}_")]
         doc_text = pages = ocr_flag = vocab_score = None
         if text_files:
-            cached = json.load(open(os.path.join(TEXTCACHE, text_files[0]), encoding="utf-8"))
+            # 19 of the 1,056 cached covenants have MORE THAN ONE cache file,
+            # and this used to take text_files[0] -- whichever os.listdir
+            # happened to return first, i.e. filesystem order. For covid 4497
+            # that is a coin flip between 4497_D2045 (54,005 chars over 14
+            # pages, a real document) and 4497_D20638 (4,691 chars over 26
+            # pages, 180 chars/page of nothing). Pick by yield instead, the
+            # same principle prefer_fuller_cache already applies ACROSS cache
+            # directories, now applied WITHIN one.
+            cached = _best_cache_file(TEXTCACHE, text_files)
             doc_text = cached.get("text")
             pages = cached.get("pages")
             ocr_flag = cached.get("ocr")
@@ -185,6 +193,31 @@ def iter_candidates(session, covids: list[str]):
             ocr=ocr_flag, vocab_score=vocab_score,
             needs_review=bool(reasons), review_reason="; ".join(all_notes) if all_notes else None,
         )
+
+
+def _best_cache_file(cache_dir: str, filenames: list[str]) -> dict:
+    """The fullest of several cache files for one covid, measured as document
+    body characters per page (app/ingestion/text_extract.assess's own yield
+    measure, so a file that is all vendor page-stamps counts as empty rather
+    than as text). Falls back to raw length when a file reports no page count.
+
+    Single-file covids -- the overwhelming majority -- take the same path and
+    get the same answer, so this is not a special case bolted on.
+    """
+    from app.ingestion.text_extract import assess
+
+    best, best_yield = None, -1.0
+    for name in sorted(filenames):
+        try:
+            with open(os.path.join(cache_dir, name), encoding="utf-8") as f:
+                cached = json.load(f)
+        except (OSError, ValueError):
+            continue
+        a = assess(cached.get("text") or "", cached.get("pages") or 0)
+        score = a["chars_per_page"] if cached.get("pages") else float(a["content_chars"])
+        if score > best_yield:
+            best, best_yield = cached, score
+    return best if best is not None else {}
 
 
 def get_deed_text(session, covid: int, legal_description_raw: str | None = None) -> str:
