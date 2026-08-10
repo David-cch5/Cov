@@ -39,6 +39,7 @@ from datetime import date
 from sqlalchemy import text
 
 RELEASE_TYPES = ("termination", "buyout")
+EFFECTS = ("prospective", "void_ab_initio")
 SCOPES = ("covenant", "partial")
 
 # Which exemption a release produces. Kept distinct rather than collapsed into
@@ -54,18 +55,33 @@ def record_release(
     recording_instrument: str | None = None, recording_date: date | None = None,
     consideration_amount: float | None = None, notes: str | None = None,
     source_id: int | None = None, retroactive_basis: str | None = None,
+    effect: str = "prospective", execution_date: date | None = None,
+    acknowledgement_required: bool = False, acknowledged_date: date | None = None,
+    no_intervening_conveyance_affidavit: bool = False,
+    terminates_instrument: str | None = None,
+    referenced_instruments: list[str] | None = None,
+    terminated_under: str | None = None,
 ) -> dict:
     """Record a termination or buyout. `parcels` is [(county_fips, apn), ...]
     and is required for scope='partial'.
 
-    EFFECTIVE DATE FOLLOWS THE RECORDING DATE. Per these covenants' own terms a
-    termination takes effect after it is recorded -- it does not reach back. So
-    effective_date defaults to recording_date, and an effective_date EARLIER than
-    the recording date is refused unless the caller supplies retroactive_basis
-    quoting the instrument language that permits it. The exception exists because
-    the answer does depend on the instrument's own wording; requiring the quote
-    keeps a retroactive release a deliberate, evidenced act rather than a typo
-    that silently voids fees already owed.
+    TWO EFFECTS, BOTH REAL AND BOTH RECORDED (see migration 0038):
+
+      effect='prospective'     ends the obligation from effective_date forward.
+                               effective_date defaults to recording_date, per
+                               these covenants' own terms, and cannot precede it.
+      effect='void_ab_initio'  the covenant is void "as if it had never been
+                               recorded" -- it reaches back to inception, so
+                               effective_date is not what governs and every
+                               transfer is released.
+
+    A void_ab_initio release is licensed by the sworn statement these instruments
+    carry that nothing was conveyed since the covenant was filed -- no intervening
+    conveyance, so no accrued fee to void. Pass
+    no_intervening_conveyance_affidavit=True when the instrument contains it.
+    Without it, release_for_transfer still reports the release but marks
+    needs_review, because voiding a fee that was actually collected is not
+    something to do silently.
 
     A partial release naming no parcels is refused rather than written: it would
     read as releasing nothing, or as releasing everything, depending on which
@@ -81,34 +97,59 @@ def record_release(
         raise ValueError("a covenant-wide release cannot also name individual parcels -- "
                          "use scope='partial' if only some land is released")
 
+    if effect not in EFFECTS:
+        raise ValueError(f"effect must be one of {EFFECTS}, got {effect!r}")
+    if effect == "void_ab_initio" and not (no_intervening_conveyance_affidavit or retroactive_basis):
+        raise ValueError(
+            "a void_ab_initio release reaches back to the covenant's inception, so it needs "
+            "either no_intervening_conveyance_affidavit=True (the sworn statement these "
+            "instruments carry that nothing was conveyed since filing, which is what makes "
+            "reaching back safe) or retroactive_basis quoting the language relied on"
+        )
+
     if effective_date is None:
         if recording_date is None:
             raise ValueError("a release needs either an effective_date or a recording_date "
                              "to derive one from -- it cannot take effect on no date at all")
         effective_date = recording_date
-    if recording_date is not None and effective_date < recording_date:
-        if not retroactive_basis:
-            raise ValueError(
-                f"effective_date {effective_date} precedes recording_date {recording_date}. "
-                f"These covenants terminate prospectively, so this needs retroactive_basis "
-                f"quoting the instrument language that makes it reach back -- otherwise fees "
-                f"already owed would be voided by what is probably a transcription error"
-            )
-        notes = f"RETROACTIVE, basis: {retroactive_basis}" + (f" | {notes}" if notes else "")
+    # Reaching back has exactly ONE expression: effect='void_ab_initio'. A
+    # "prospective" release dated before its own recording is a contradiction, not
+    # a variant, and the schema refuses it too (migration 0038's CHECK) -- so there
+    # is no second path here that could disagree with the database.
+    if effect == "prospective" and recording_date is not None and effective_date < recording_date:
+        raise ValueError(
+            f"effective_date {effective_date} precedes recording_date {recording_date} on a "
+            f"PROSPECTIVE release. If the instrument really reaches back, record it as "
+            f"effect='void_ab_initio'; if it does not, this date is wrong. Fees already owed "
+            f"must not be voided by an unexplained date"
+        )
+    if retroactive_basis:
+        notes = f"RETROACTIVE BASIS: {retroactive_basis}" + (f" | {notes}" if notes else "")
 
     release_id = session.execute(
         text("""
             INSERT INTO covenant_release (covid, release_type, scope, effective_date,
                                           recording_instrument, recording_date,
-                                          consideration_amount, notes, source_id)
+                                          consideration_amount, notes, source_id,
+                                          effect, execution_date, acknowledgement_required,
+                                          acknowledged_date,
+                                          no_intervening_conveyance_affidavit,
+                                          terminates_instrument, referenced_instruments,
+                                          terminated_under)
             VALUES (:covid, :release_type, :scope, :effective_date, :instrument,
-                    :recording_date, :consideration, :notes, :source_id)
+                    :recording_date, :consideration, :notes, :source_id,
+                    :effect, :execution_date, :ack_required, :ack_date, :affidavit,
+                    :terminates, :referenced, :under)
             RETURNING release_id
         """),
         {"covid": covid, "release_type": release_type, "scope": scope,
          "effective_date": effective_date, "instrument": recording_instrument,
          "recording_date": recording_date, "consideration": consideration_amount,
-         "notes": notes, "source_id": source_id},
+         "notes": notes, "source_id": source_id, "effect": effect,
+         "execution_date": execution_date, "ack_required": acknowledgement_required,
+         "ack_date": acknowledged_date, "affidavit": no_intervening_conveyance_affidavit,
+         "terminates": terminates_instrument, "referenced": referenced_instruments,
+         "under": terminated_under},
     ).scalar()
 
     for county_fips, apn in (parcels or []):
@@ -120,7 +161,7 @@ def record_release(
             {"release_id": release_id, "county_fips": county_fips, "apn": apn},
         )
     return {"release_id": release_id, "covid": covid, "release_type": release_type,
-            "scope": scope, "effective_date": effective_date,
+            "scope": scope, "effect": effect, "effective_date": effective_date,
             "parcels": len(parcels or [])}
 
 
@@ -146,11 +187,14 @@ def release_for_transfer(session, covid: int, county_fips: str, apn: str,
     """
     row = session.execute(
         text("""
-            SELECT r.release_id, r.release_type, r.scope, r.effective_date,
-                   r.recording_instrument, r.consideration_amount
+            SELECT r.release_id, r.release_type, r.scope, r.effect, r.effective_date,
+                   r.recording_instrument, r.consideration_amount,
+                   r.acknowledgement_required, r.acknowledged_date,
+                   r.no_intervening_conveyance_affidavit
             FROM covenant_release r
             WHERE r.covid = :covid
-              AND r.effective_date <= :recording_date
+              -- void_ab_initio reaches the covenant's whole life, so no date test
+              AND (r.effect = 'void_ab_initio' OR r.effective_date <= :recording_date)
               AND (r.scope = 'covenant'
                    OR EXISTS (SELECT 1 FROM covenant_release_parcel p
                               WHERE p.release_id = r.release_id
@@ -163,12 +207,35 @@ def release_for_transfer(session, covid: int, county_fips: str, apn: str,
     ).mappings().first()
     if row is None:
         return None
-    same_day = row["effective_date"] == recording_date
+    void_ab_initio = row["effect"] == "void_ab_initio"
+    # Same-day only arises for a prospective release; a void one does not turn on
+    # the date at all.
+    same_day = (not void_ab_initio) and row["effective_date"] == recording_date
+
+    # Two things make a release report but not silently apply. A retroactive
+    # release lacking the sworn no-conveyance statement may be voiding a fee that
+    # was really collected. And a termination that is only "fully effective" once
+    # the Trustee acknowledges it is not effective while that acknowledgement is
+    # unexecuted -- the Williamson County instrument on hand is in exactly that
+    # state, blank day and no signature.
+    unsworn_retroactive = void_ab_initio and not row["no_intervening_conveyance_affidavit"]
+    acknowledgement_pending = bool(row["acknowledgement_required"]) and row["acknowledged_date"] is None
+
+    reasons = []
+    if same_day:
+        reasons.append("transfer recorded the same day as the release -- recording sequence decides")
+    if unsworn_retroactive:
+        reasons.append("void_ab_initio without the sworn no-intervening-conveyance statement")
+    if acknowledgement_pending:
+        reasons.append("acknowledgement required by the instrument is unexecuted")
+
     return {**dict(row),
             "exemption_category": EXEMPTION_FOR_TYPE[row["release_type"]],
+            "void_ab_initio": void_ab_initio,
             "same_day": same_day,
-            "needs_review": same_day,
-            "releases_transfer": not same_day}
+            "needs_review": bool(reasons),
+            "review_reasons": reasons,
+            "releases_transfer": not reasons}
 
 
 def released_parcels(session, covid: int, as_of: date | None = None) -> dict:
@@ -228,7 +295,10 @@ def apply_releases_to_transfers(session, covid: int) -> dict:
               AND t.exemption_category IS NULL
               AND t.superseded_at IS NULL
               AND r.covid = t.covid
-              AND r.effective_date < t.recording_date   -- strictly after; see release_for_transfer
+              AND (r.effect = 'void_ab_initio'
+                   OR r.effective_date < t.recording_date)  -- strictly after; see release_for_transfer
+              AND (r.effect = 'prospective' OR r.no_intervening_conveyance_affidavit)
+              AND (NOT r.acknowledgement_required OR r.acknowledged_date IS NOT NULL)
               AND (r.scope = 'covenant'
                    OR EXISTS (SELECT 1 FROM covenant_release_parcel p
                               WHERE p.release_id = r.release_id

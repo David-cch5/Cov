@@ -266,10 +266,11 @@ def test_fee_compute_honours_a_release_recorded_after_the_fact() -> None:
 def test_effective_date_defaults_to_recording_and_refuses_to_reach_back() -> None:
     """Per these covenants a termination is effective after the date it is
     recorded, so effective_date is derived from recording_date rather than
-    supplied independently. An earlier effective date would void fees already
-    owed, so it is refused unless the caller quotes the instrument language that
-    permits it -- the answer does depend on the wording, but a retroactive
-    release has to be a deliberate, evidenced act rather than a typo."""
+    supplied independently. An earlier effective date on a PROSPECTIVE release is
+    a contradiction and is refused outright: an instrument that really reaches
+    back is recorded as effect='void_ab_initio', which has its own evidence
+    requirement. One expression for reaching back, so the code and migration
+    0038's CHECK constraint cannot disagree."""
     try:
         with get_session() as session:
             _setup(session)
@@ -283,16 +284,115 @@ def test_effective_date_defaults_to_recording_and_refuses_to_reach_back() -> Non
                                effective_date=date(2019, 1, 1))
                 raise AssertionError("expected a ValueError for a retroactive effective date")
             except ValueError as exc:
-                assert "retroactive_basis" in str(exc), exc
+                assert "void_ab_initio" in str(exc), exc
 
+            # Reaching back is expressed as effect='void_ab_initio', never as a
+            # prospective release with an earlier date -- one expression, so the
+            # code and the schema CHECK cannot disagree.
             back = record_release(session, covid=COVID, release_type="termination",
-                                  scope="covenant", recording_date=date(2020, 6, 1),
-                                  effective_date=date(2019, 1, 1),
-                                  retroactive_basis="instrument recites it is effective nunc pro tunc")
-            assert back["effective_date"] == date(2019, 1, 1), back
+                                  scope="covenant", effect="void_ab_initio",
+                                  recording_date=date(2020, 6, 1),
+                                  no_intervening_conveyance_affidavit=True)
+            assert back["effect"] == "void_ab_initio", back
             session.rollback()
-        print("PASS: effective_date defaults to the recording date; reaching back needs a "
-              "quoted basis and is otherwise refused")
+        print("PASS: effective_date defaults to the recording date; a prospective release "
+              "cannot predate its own recording -- reaching back is void_ab_initio")
+    finally:
+        with get_session() as session:
+            _teardown(session); session.commit()
+
+
+def test_void_ab_initio_release_reaches_the_covenants_whole_life() -> None:
+    """Read from a real recorded instrument -- Transylvania County NC 2010004621,
+    French Broad Place LLC: "The Instrument shall be terminated and declared to be
+    null and void, IN THE SAME MANNER AS IF IT HAD NEVER BEEN RECORDED ... has
+    never constituted a lawful restriction upon the property."
+
+    That reaches back to inception, so even a transfer recorded BEFORE the
+    termination is released -- the opposite of the prospective form, and both are
+    real. What licenses it is the sworn statement in the same instrument that
+    nothing was conveyed since the covenant was filed, so there is no accrued fee
+    to void."""
+    try:
+        with get_session() as session:
+            _setup(session)
+            record_release(
+                session, covid=COVID, release_type="termination", scope="covenant",
+                effect="void_ab_initio", recording_date=date(2010, 9, 16),
+                execution_date=date(2010, 9, 10),
+                no_intervening_conveyance_affidavit=True,
+                terminates_instrument="Book 529 Page 410",
+                terminated_under="Paragraph 25",
+                recording_instrument="2010004621")
+            session.commit()
+            before = release_for_transfer(session, COVID, COUNTY, APN_A, date(2019, 3, 1))
+        assert before is not None and before["void_ab_initio"] is True, before
+        assert before["releases_transfer"] is True, before   # reaches back
+        assert before["needs_review"] is False, before       # affidavit present
+        print("PASS: a void-ab-initio release reaches transfers predating it, on the strength "
+              "of the sworn no-conveyance statement")
+    finally:
+        with get_session() as session:
+            _teardown(session); session.commit()
+
+
+def test_retroactive_without_the_affidavit_reports_but_does_not_apply() -> None:
+    """Reaching back without the sworn statement may be voiding a fee that was
+    genuinely collected, so the release is reported and flagged rather than
+    applied. Recording it needs the language quoted instead."""
+    try:
+        with get_session() as session:
+            _setup(session)
+            try:
+                record_release(session, covid=COVID, release_type="termination",
+                               scope="covenant", effect="void_ab_initio",
+                               recording_date=date(2010, 9, 16))
+                raise AssertionError("expected a ValueError with neither affidavit nor basis")
+            except ValueError as exc:
+                assert "no_intervening_conveyance_affidavit" in str(exc), exc
+
+            record_release(session, covid=COVID, release_type="termination",
+                           scope="covenant", effect="void_ab_initio",
+                           recording_date=date(2010, 9, 16),
+                           retroactive_basis='"null and void ... as if it had never been recorded"')
+            session.commit()
+            got = release_for_transfer(session, COVID, COUNTY, APN_A, date(2019, 3, 1))
+        assert got["releases_transfer"] is False, got
+        assert got["needs_review"] is True, got
+        assert any("sworn" in r for r in got["review_reasons"]), got
+        print("PASS: retroactive without the sworn statement is reported and flagged, not applied")
+    finally:
+        with get_session() as session:
+            _teardown(session); session.commit()
+
+
+def test_unexecuted_acknowledgement_is_not_an_effective_termination() -> None:
+    """The Williamson County instrument (2019003560) is only "fully effective" once
+    the Trustee acknowledges it, and in the copy on hand that acknowledgement is
+    UNEXECUTED -- blank day, no signature. A pending acknowledgement must not read
+    as an effective termination."""
+    try:
+        with get_session() as session:
+            _setup(session)
+            record_release(session, covid=COVID, release_type="termination",
+                           scope="covenant", recording_date=date(2019, 1, 15),
+                           execution_date=date(2019, 1, 3),
+                           acknowledgement_required=True, acknowledged_date=None,
+                           recording_instrument="2019003560",
+                           terminates_instrument="2009082853",
+                           referenced_instruments=["2012005120", "2015005262", "2018004487"],
+                           terminated_under="Paragraph 25")
+            session.commit()
+            pending = release_for_transfer(session, COVID, COUNTY, APN_A, date(2021, 3, 1))
+            session.execute(text("UPDATE covenant_release SET acknowledged_date = :d "
+                                 "WHERE covid = :c"), {"d": date(2019, 1, 20), "c": COVID})
+            session.commit()
+            signed = release_for_transfer(session, COVID, COUNTY, APN_A, date(2021, 3, 1))
+        assert pending["releases_transfer"] is False and pending["needs_review"] is True, pending
+        assert any("acknowledgement" in r for r in pending["review_reasons"]), pending
+        assert signed["releases_transfer"] is True, signed
+        print("PASS: an unexecuted acknowledgement is not an effective termination; signing it "
+              "makes the release apply")
     finally:
         with get_session() as session:
             _teardown(session); session.commit()
@@ -307,4 +407,7 @@ if __name__ == "__main__":
     test_earliest_effective_release_wins()
     test_fee_compute_honours_a_release_recorded_after_the_fact()
     test_effective_date_defaults_to_recording_and_refuses_to_reach_back()
+    test_void_ab_initio_release_reaches_the_covenants_whole_life()
+    test_retroactive_without_the_affidavit_reports_but_does_not_apply()
+    test_unexecuted_acknowledgement_is_not_an_effective_termination()
     print("\nall covenant-release tests passed")
