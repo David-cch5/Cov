@@ -37,6 +37,30 @@ NGS_DATASHEET_URL = "https://geodesy.noaa.gov/cgi-bin/ds_mark.prl"
 # never as an answer.
 NGS_BOUNDS_RESULT_CAP = 500
 
+
+class NgsUnanswered(Exception):
+    """The bounds search did not give a usable answer about the monuments asked
+    for -- as distinct from answering that they are not there.
+
+    Its own exception type because the difference decides money. A deed reciting
+    a tie to a named NGS monument is evidence that monument exists nearby, so
+    "the service told us nothing" must never be read as "there is no tie here"
+    and used to fall through to app/gis/anchor_resolver.py's paid LLM tiers. A
+    free, published, survey-grade answer being briefly unavailable is a reason
+    to come back later, not a reason to spend ~$45-50 of Opus escalation on a
+    question NGS would have answered for nothing.
+    """
+
+
+class NgsServiceEmpty(NgsUnanswered):
+    """Returned no marks at all. Transient: retry later, unchanged."""
+
+
+class NgsResultTruncated(NgsUnanswered):
+    """Hit the silent result cap, so the answer is incomplete. NOT transient --
+    retrying the same oversized bbox returns the same truncated set. The search
+    area has to shrink, which is a fix, not a wait."""
+
 # NGS datasheet State Plane zone codes -> EPSG (NAD83, US survey feet).
 # Deliberately keyed on the datasheet's own spelling so the mapping is checkable
 # against the sheet rather than inferred from the county.
@@ -164,8 +188,29 @@ def find_monuments(designations, bbox: dict, timeout: int = 45) -> dict:
             condition=sheet.get("condition") or mark.get("condition"),
         )
     missing = wanted - set(found)
+    if missing and not marks:
+        # The mirror image of the truncation guard below, and the more expensive
+        # direction to get wrong. A deed reciting "a National Geodetic Survey
+        # monument stamped X bears <bearing> <distance>" is evidence the monument
+        # exists in this area; an empty result set therefore means the service
+        # did not answer, NOT that the monument is absent. Reported as an
+        # outage so app/gis/anchor_resolver.py's NGS tier fails loudly instead of
+        # concluding "no tie available" and falling through to the paid LLM
+        # tiers -- spending real money because a free, authoritative service was
+        # briefly down.
+        #
+        # Confirmed real, not hypothetical: on 2026-08-10 /api/nde/bounds
+        # answered HTTP 200 with [] for every bounding box tried, including
+        # dense control areas (downtown Houston, Washington DC) that certainly
+        # contain published marks.
+        raise NgsServiceEmpty(
+            f"NGS bounds search returned NO marks at all for bbox {bbox} while looking for "
+            f"{sorted(missing)}. An area a deed ties to is not empty of published monuments, "
+            f"so this is the service failing to answer rather than evidence the monument is "
+            f"missing -- retry later; do not treat it as 'no NGS tie available'."
+        )
     if missing and len(marks) >= NGS_BOUNDS_RESULT_CAP:
-        raise ValueError(
+        raise NgsResultTruncated(
             f"NGS bounds search hit its {NGS_BOUNDS_RESULT_CAP}-result cap and did not return "
             f"{sorted(missing)} -- the result set is truncated, so this is not evidence the "
             f"monument does not exist. Narrow the bbox and search again."

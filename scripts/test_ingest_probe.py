@@ -1,4 +1,4 @@
-"""Smoke test for scripts/ingest_probe.py's re-run safety.
+"""Smoke test for app/ingestion/ingest.py's re-run safety.
 
 Real incident this guards against: re-running ingest_one() on an
 already-progressed covenant (GIS-classified, chain-walked) silently wiped
@@ -19,7 +19,7 @@ sys.path.insert(0, ".")
 
 from app.db.session import get_session
 from app.ingestion.walk import CovenantCandidate, _KNOWN_COUNTY_NAME_TYPOS
-from scripts.ingest_probe import _merge_ingestion_note, ingest_one
+from app.ingestion.ingest import _merge_ingestion_note, ingest_one
 
 
 def test_merge_preserves_unrelated_existing_note() -> None:

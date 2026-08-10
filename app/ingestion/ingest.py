@@ -1,0 +1,341 @@
+"""Ingestion: turn a candidate covenant document into covenant-table rows.
+
+Moved here from scripts/ingest_probe.py, unchanged in behaviour. It had to
+leave scripts/ because the app itself now needs to call it: a covenant dropped
+into the watched folder is ingested by a queued pipeline stage
+(app/pipeline/), and a stage cannot import from a probe script.
+
+The corpus-shaped entry point stays where it was. iter_candidates reads
+_pilot/covid_index.csv and _textcache_final and yields CovenantCandidate; that
+is right for the 1,056-document corpus and wrong for a single dropped file,
+which has no index row and no cached text. Both feed the same ingest_one by
+building the same CovenantCandidate, so there is one ingestion path rather
+than two that drift.
+"""
+import os
+from datetime import date
+
+from sqlalchemy import text
+
+from app.db.repository import (
+    upsert_contact, upsert_covenant, upsert_covenant_beneficiary, upsert_covenant_document,
+    upsert_covenant_trustee, insert_source,
+)
+from app.db.review_notes import merge_tagged_note
+from app.ingestion.ocr_escalation import (
+    MAX_PAGES_WITHOUT_APPROVAL, VOCAB_SCORE_THRESHOLD, escalate_to_vision_ocr,
+    merge_escalated_pages,
+)
+from app.ingestion.walk import PROJECT_ROOT
+from app.parsing.template_fields import extract_fields
+from app.recorder.diagnose import maybe_flag_missing_exhibit
+
+
+_DO_NOT_REGRESS_STATUSES = {"gis_classified", "reconciled", "title_in_progress", "done", "needs_review"}
+
+
+def _merge_ingestion_note(existing_reason: str | None, ingestion_note: str | None) -> str:
+    """Ingestion is meant to be re-runnable (this file's own docstring:
+    "idempotent + resumable"), but a bare status/review_reason overwrite on
+    every run isn't actually idempotent once OTHER pipeline stages
+    (GIS classification, chain-of-title) have added their own notes to the
+    same covenant -- confirmed the hard way: re-running ingest_one() on an
+    already-progressed covid 2497 silently wiped its "RE-VERIFIED" acreage-
+    reconciliation note. Same "tagged note, safely replaceable, never
+    touches other stages' notes" pattern as app/title/chain.py's
+    _update_covenant_gap_notes: only ingestion's own tagged section gets
+    replaced here, whatever else is in review_reason is left untouched."""
+    note = (f"INGESTION-STAGE (automated, {date.today().isoformat()}): {ingestion_note}"
+            if ingestion_note else None)
+    # Was a greedy `.*$`, which deleted every note appended after this one --
+    # see app/db/review_notes.py.
+    return merge_tagged_note(existing_reason, "INGESTION-STAGE", note)
+
+_OCR_CONFIDENCE_REASON_PREFIXES = ("no OCR vocab score computed", "low OCR vocab score")
+
+
+def _strip_ocr_confidence_reason(review_reason: str | None) -> str | None:
+    """Removes just the OCR-confidence-gate reason(s) from a combined
+    review_reason string, leaving any other reason (county unresolved,
+    template not identified, etc.) untouched -- used after a vision-OCR
+    escalation successfully resolves the confidence concern, so a stale
+    "low OCR vocab score (0.11)" note doesn't linger once the text it
+    describes has been replaced."""
+    if not review_reason:
+        return review_reason
+    kept = [p for p in (part.strip() for part in review_reason.split(";"))
+            if p and not p.startswith(_OCR_CONFIDENCE_REASON_PREFIXES)]
+    return "; ".join(kept) if kept else None
+
+
+def escalate_ocr_confidence(candidates: list, max_pages: int = MAX_PAGES_WITHOUT_APPROVAL) -> None:
+    """Vision-OCR escalation (CLAUDE.md's OCR policy, tier 3) -- mutates
+    each candidate in place when resolved. Only for candidates whose text
+    already exists but is missing/low-confidence (app/ingestion/walk.py's
+    own iter_candidates has already applied the free fuller-cache fallback
+    to every candidate by this point; escalate_to_vision_ocr does NOT retry
+    that, so this only ever spends budget on genuinely still-unresolved
+    cases). Shared budget across the whole call -- capped at max_pages
+    total Fable page-transcriptions, small and explicit so this can run
+    without separate approval each time; anything beyond the cap is left
+    exactly as iter_candidates found it, still flagged needs_review."""
+    remaining = max_pages
+    for c in candidates:
+        if not c.relpath:
+            continue
+        # A candidate whose text came from app/ingestion/text_extract.py has
+        # already been judged, by yield rather than by vocabulary, and that
+        # verdict governs. Falling through to the vocab_score test below would
+        # ask the wrong question of the wrong scale: legibility sits at
+        # 0.43-0.99 on readable documents, so every dropped file would look
+        # low-confidence and buy Fable pages it does not need. Deliberately
+        # checked before the vocab_score branch and never combined with it.
+        if getattr(c, "text_usable", None) is not None:
+            if c.text_usable:
+                continue
+        elif not (c.text is not None and
+                  (c.vocab_score is None or c.vocab_score < VOCAB_SCORE_THRESHOLD)):
+            continue
+        pdf_path = os.path.join(PROJECT_ROOT, c.relpath)
+        if not os.path.exists(pdf_path):
+            continue
+
+        result = escalate_to_vision_ocr(str(c.covid), pdf_path, remaining)
+        remaining -= result.get("pages_escalated", 0)
+
+        if not result["resolved"]:
+            if result["capped"]:
+                print(f"  OCR escalation (covid {c.covid}): {result['reason']}")
+            continue
+
+        print(f"  OCR escalation (covid {c.covid}): resolved via {result['resolved_via']}"
+              + (f", {result['pages_escalated']} page(s)" if result["pages_escalated"] else " (cached)"))
+        # Merge, never substitute: escalation transcribes SOME pages, and the rest
+        # of the document -- where the recording stamp, declarant and stated
+        # acreage live -- must survive it. If the pages cannot be aligned the
+        # original text is kept and the escalation is reported as unmerged
+        # rather than allowed to replace the document with a fragment.
+        merged_text, merged = merge_escalated_pages(c.text, result.get("page_texts") or {},
+                                              result.get("total_pages"))
+        if merged:
+            c.text = merged_text
+        elif not result.get("partial"):
+            # A whole-document escalation IS the document -- nothing to merge into.
+            # Gated on `partial`, not on page_texts being absent: a cache written
+            # before per-page text was stored is still partial, and substituting it
+            # would reintroduce exactly the bug this replaced.
+            c.text = result["text"]
+        else:
+            print(f"  OCR escalation (covid {c.covid}): pages could not be aligned to the "
+                  f"cached text -- keeping the original transcription")
+        c.vocab_score = result.get("min_confidence")
+        if c.vocab_score is not None and c.vocab_score >= VOCAB_SCORE_THRESHOLD:
+            c.review_reason = _strip_ocr_confidence_reason(c.review_reason)
+            c.needs_review = bool(c.review_reason)
+        else:
+            # still not confident even after vision OCR -- a genuinely bad scan, not
+            # something to force through; replace the stale Tesseract-based reason with
+            # one reflecting what was actually tried.
+            other_reasons = _strip_ocr_confidence_reason(c.review_reason)
+            new_reason = f"low confidence ({c.vocab_score}) even after vision-OCR escalation"
+            c.review_reason = f"{other_reasons}; {new_reason}" if other_reasons else new_reason
+            c.needs_review = True
+
+
+def ingest_one(session, c) -> None:
+    # Fetched BEFORE anything else writes to this row: the whole point is to see the
+    # state any LATER pipeline stage (GIS classification, chain-of-title) left this
+    # covenant in, so nothing below can clobber it -- see _merge_ingestion_note's
+    # docstring for the real incident (a bare overwrite here once silently wiped a
+    # prior acreage-reconciliation note on a re-run of this exact function).
+    existing = session.execute(
+        text("SELECT status, review_reason FROM covenant WHERE covid = :covid"), {"covid": c.covid},
+    ).fetchone()
+
+    if existing is None and c.county_fips is None:
+        # covenant.county_fips is NOT NULL -- confirmed real (covid 4123): a candidate
+        # whose county genuinely can't be resolved would otherwise crash here with a raw
+        # NotNullViolation instead of a clear, review-queue-style message. Nothing
+        # meaningful can be recorded without a county anyway (every downstream table is
+        # county_fips-keyed), so this is surfaced via run()'s own failed-list reporting
+        # rather than forcing a broken row or silently reporting a false "succeeded."
+        raise RuntimeError(f"cannot record covid {c.covid}: {c.review_reason}")
+
+    if existing is None:
+        # covenant row must exist first -- covenant_document.covid is a FK to it. Only
+        # done for a covid never seen before; an existing row is left alone here and
+        # updated properly (merged, not overwritten) further down.
+        upsert_covenant(
+            session, covid=c.covid, county_fips=c.county_fips, declarant_raw=None,
+            declarant_contact_id=None, fee_percent=None, term_description=None,
+            recording_instrument=None, recording_date=None, book=None, page=None,
+            template_version_id=c.template_version_id if c.template_version_id and
+                c.template_version_id.startswith("V") else None,
+            stated_acreage=None, legal_description_raw=None,
+            legal_description_type=None, exemptions_raw=None, fee_due_days=None,
+            status="needs_review" if c.needs_review else "ingested",
+            review_reason=_merge_ingestion_note(None, c.review_reason), source_id=None,
+        )
+
+    if c.relpath:
+        doc_source_id = insert_source(
+            session, source_type="textcache_ocr", reference=c.relpath,
+            confidence=c.vocab_score,
+        )
+        upsert_covenant_document(
+            session, relpath=c.relpath, covid=c.covid, doc_type="original",
+            pages=c.pages, ocr_engine="tesseract", vocab_score=c.vocab_score,
+            confidence=c.vocab_score, source_id=doc_source_id,
+        )
+
+    if c.needs_review:
+        print(f"  needs_review: {c.review_reason}")
+        if existing is not None:
+            # a re-run that still can't get past the walk-step check (bad OCR, no
+            # template match) -- merge its note in rather than leave the row exactly
+            # as some earlier, possibly stale run last left it.
+            merged = _merge_ingestion_note(existing.review_reason, c.review_reason)
+            if existing.status not in _DO_NOT_REGRESS_STATUSES or existing.status == "needs_review":
+                session.execute(
+                    text("UPDATE covenant SET status = 'needs_review', review_reason = :r, "
+                         "updated_at = now() WHERE covid = :covid"),
+                    {"r": merged or None, "covid": c.covid},
+                )
+        return
+
+    if c.review_reason:
+        # A non-blocking note from candidate discovery (e.g. no template match) --
+        # surfaced here so it's visible in run output, but deliberately NOT folded
+        # into the DB review_reason/status logic below, which is reserved for
+        # actual problems found during or after this extraction attempt itself.
+        print(f"  note: {c.review_reason}")
+    fields = extract_fields(c.text, c.template_version_id)
+    print(f"  extracted: declarant={fields.get('declarant_name')!r} "
+          f"fee%={fields.get('fee_percent')} confidence={fields.get('confidence')}")
+    if fields.get("extraction_notes"):
+        print(f"  extraction_notes: {fields['extraction_notes']}")
+
+    extraction_source_id = insert_source(
+        session, source_type="textcache_ocr", reference=c.relpath,
+        engine="claude-sonnet-5", confidence=fields.get("confidence"),
+    )
+
+    declarant_contact_id = None
+    if fields.get("declarant_name"):
+        declarant_contact_id = upsert_contact(
+            session, name_raw=fields["declarant_name"],
+            mailing_address=fields.get("declarant_address"),
+            contact_type=fields.get("declarant_type"),
+            source_id=extraction_source_id,
+        )
+
+    status = "parsed"
+    review_reason = None
+    confidence = fields.get("confidence") or 0
+    if confidence < 0.7:
+        status = "needs_review"
+        review_reason = f"low extraction confidence ({confidence})"
+
+    # Trustee/Beneficiaries: every covenant's own text names these (fees are paid TO the
+    # Trustee, for the Beneficiaries, per each template's own AMOUNT DUE section) but
+    # covenant_trustee/covenant_beneficiary have existed since 0001_initial_schema with
+    # nothing populating them. effective_date is temporal-keyed (see
+    # upsert_covenant_trustee's docstring) -- the covenant's own recording_date, since
+    # this is the trustee/beneficiary structure as of the original Declaration.
+    effective_date = fields.get("recording_date")
+    if fields.get("trustee_name"):
+        if effective_date:
+            trustee_contact_id = upsert_contact(
+                session, name_raw=fields["trustee_name"], mailing_address=fields.get("trustee_address"),
+                source_id=extraction_source_id,
+            )
+            upsert_covenant_trustee(
+                session, covid=c.covid, effective_date=effective_date,
+                contact_id=trustee_contact_id, source_id=extraction_source_id,
+            )
+        else:
+            print(f"  trustee named ({fields['trustee_name']!r}) but no recording_date extracted -- "
+                  f"can't set covenant_trustee's effective_date, skipped")
+
+    beneficiaries = fields.get("beneficiaries") or []
+    if beneficiaries:
+        if effective_date:
+            seq, total_pct = 0, 0.0
+            for b in beneficiaries:
+                pct = b.get("percentage_interest")
+                if pct is None:
+                    continue  # named but percentage illegible/not stated -- never guess it
+                seq += 1
+                total_pct += pct
+                beneficiary_contact_id = upsert_contact(
+                    session, name_raw=b["name"], mailing_address=b.get("address"),
+                    source_id=extraction_source_id,
+                )
+                upsert_covenant_beneficiary(
+                    session, covid=c.covid, beneficiary_seq=seq, effective_date=effective_date,
+                    contact_id=beneficiary_contact_id, percentage_interest=pct,
+                    source_id=extraction_source_id,
+                )
+            # a 1% band allows for ordinary rounding in the recited percentages themselves,
+            # not a substitute for exact-match verification.
+            if seq < len(beneficiaries) or abs(total_pct - 100.0) > 1.0:
+                status = "needs_review"
+                note = (f"beneficiary percentages recorded sum to {total_pct:.1f}% across {seq} of "
+                        f"{len(beneficiaries)} named beneficiaries -- list is likely incomplete "
+                        f"(OCR/extraction limitation), do not treat as exhaustive")
+                review_reason = f"{review_reason}; {note}" if review_reason else note
+                print(f"  beneficiary check: {note}")
+        else:
+            print(f"  {len(beneficiaries)} beneficiaries named but no recording_date extracted -- "
+                  f"can't set covenant_beneficiary's effective_date, skipped")
+
+    if fields.get("legal_description_type") == "unknown":
+        # The exact signature of "Exhibit A referenced but missing/blank" this
+        # project hit repeatedly (Ellis covid 8386, Kerr covid 7768) -- worth
+        # an automated first look via the county recorder portal rather than
+        # waiting for a human to notice and escalate manually, the way those
+        # two were originally caught.
+        status = "needs_review"
+        base_reason = review_reason or "legal description type could not be determined from the extracted text"
+        note = maybe_flag_missing_exhibit(
+            session, covid=c.covid, county_fips=c.county_fips,
+            declarant_name=fields.get("declarant_name"),
+            book=fields.get("book"), page=fields.get("page"),
+            recording_instrument=fields.get("recording_instrument"),
+            local_pages=c.pages,
+        )
+        review_reason = f"{base_reason}; {note}" if note else base_reason
+        if note:
+            print(f"  recorder check: {note}")
+
+    # `existing` was fetched at the very top of this function, before anything in this
+    # call had a chance to touch the row -- merge ingestion's own tagged note into it
+    # rather than overwrite; status only advances forward, never regresses a covenant
+    # that's already progressed past ingestion's own view, unless ingestion itself
+    # found a fresh problem just now.
+    merged_review_reason = _merge_ingestion_note(existing.review_reason if existing else None, review_reason)
+    if review_reason:
+        final_status = "needs_review"
+    elif existing and existing.status in _DO_NOT_REGRESS_STATUSES:
+        final_status = existing.status
+    else:
+        final_status = status
+
+    upsert_covenant(
+        session, covid=c.covid, county_fips=c.county_fips,
+        declarant_raw=fields.get("declarant_name"),
+        declarant_contact_id=declarant_contact_id,
+        fee_percent=fields.get("fee_percent"),
+        term_description=fields.get("term_description"),
+        recording_instrument=fields.get("recording_instrument"),
+        recording_date=fields.get("recording_date"),
+        book=fields.get("book"), page=fields.get("page"),
+        template_version_id=c.template_version_id,
+        stated_acreage=fields.get("stated_acreage"),
+        legal_description_raw=fields.get("legal_description_raw"),
+        legal_description_type=fields.get("legal_description_type"),
+        exemptions_raw=fields.get("exemptions_raw"),
+        fee_due_days=fields.get("fee_due_days"),
+        status=final_status, review_reason=merged_review_reason or None,
+        source_id=extraction_source_id,
+    )

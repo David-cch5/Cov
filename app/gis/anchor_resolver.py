@@ -31,7 +31,7 @@ from app.db.review_notes import merge_tagged_note
 from app.gis.classifier import COUNTY_ADAPTERS, classify_metes_and_bounds_tract
 from app.ingestion.walk import get_deed_text
 from app.gis.geocode_anchor import resolve_metes_bounds_approximate
-from app.gis.ngs import find_monuments
+from app.gis.ngs import NgsUnanswered, find_monuments
 from app.gis.state_plane_anchor import (
     EPSG_BY_TX_ZONE,
     anchor_by_ngs_monument_tie,
@@ -182,10 +182,20 @@ def _try_ngs_monument_tie(session, county_fips: str, deed_text: str, courses: li
         if not monuments:
             return None
         placed = anchor_by_ngs_monument_tie(walk_traverse(courses)["vertices"], pob_ties, monuments)
+    except NgsUnanswered:
+        # NOT the same as "no tie here", and the difference decides money. This
+        # deed names an NGS monument, so a free, published, survey-grade answer
+        # exists; NGS merely failed to hand it over. Falling through would walk
+        # down the tiers to Opus and Fable and spend ~$45-50 answering a question
+        # NGS answers for nothing -- so this propagates instead, and the queue
+        # retries the covenant later with the tier still available.
+        raise
     except Exception as exc:                  # noqa: BLE001
-        # A NGS outage or an unresolvable tie is a reason to fall through to the
-        # next tier, never to crash the covenant's whole resolution attempt.
-        print(f"  [anchor_resolver] NGS monument tier unavailable: {type(exc).__name__}: {exc}", flush=True)
+        # Anything else -- an unresolvable tie, a datasheet that will not parse --
+        # is a genuine "this tier cannot place it", and falling through to the
+        # next tier is right.
+        print(f"  [anchor_resolver] NGS monument tier cannot place this tract: "
+              f"{type(exc).__name__}: {exc}", flush=True)
         return None
 
     zone_error = placed.get("zone_check_ft")

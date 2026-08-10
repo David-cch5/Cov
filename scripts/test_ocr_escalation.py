@@ -27,7 +27,7 @@ from app.ingestion.ocr_escalation import (
     escalate_to_vision_ocr, merge_escalated_pages, prefer_fuller_cache,
     resolve_low_confidence_covenant, resolve_low_confidence_covenants,
 )
-from scripts.ingest_probe import _strip_ocr_confidence_reason
+from app.ingestion.ingest import _strip_ocr_confidence_reason
 
 
 def test_prefer_fuller_cache_finds_real_truncation() -> None:
@@ -167,6 +167,63 @@ def test_merge_refuses_when_pages_cannot_be_aligned() -> None:
     print("PASS: an unalignable merge returns the original text, never a fragment")
 
 
+def test_yield_assessed_text_does_not_buy_vision_pages() -> None:
+    """The two quality measures must not be crossed. Text acquired by
+    app/ingestion/text_extract.py is judged on YIELD (chars of body per page),
+    and its legibility score sits anywhere from 0.43 to 0.99 on documents that
+    are perfectly readable. Compared against VOCAB_SCORE_THRESHOLD (0.85), a
+    healthy dropped document would look low-confidence and buy Fable
+    transcriptions for nothing -- real money, every time a file is dropped.
+
+    So text_usable governs when it is set, and the vocab_score path is left
+    exactly as it was for the corpus.
+    """
+    import glob
+    import os
+
+    import app.ingestion.ingest as ingest_module
+    from app.ingestion.walk import PROJECT_ROOT, CovenantCandidate
+
+    # A real, existing PDF: escalate_ocr_confidence checks the file is present
+    # before spending anything, so a made-up path would skip for the wrong
+    # reason and the test would pass without exercising the gate at all.
+    real = next((os.path.relpath(m, PROJECT_ROOT)
+                 for c in ("3346", "2088", "4440")
+                 for m in glob.glob(os.path.join(PROJECT_ROOT, c, "*.pdf"))), None)
+    if real is None:
+        print("SKIP: no corpus PDF available")
+        return
+
+    calls = []
+    original = ingest_module.escalate_to_vision_ocr
+    ingest_module.escalate_to_vision_ocr = lambda *a, **k: (
+        calls.append(a) or {"resolved": False, "capped": False, "pages_escalated": 0,
+                            "reason": "stub", "text": "", "partial": False})
+    try:
+        # Readable by yield, low legibility -- must NOT escalate.
+        usable = CovenantCandidate(
+            covid=999001, relpath=real, state_name="TEXAS",
+            county_name="MONTGOMERY", county_fips="48339", template_version_id=None,
+            template_confidence=None, text="body " * 2000, pages=10, ocr=True,
+            vocab_score=None, legibility=0.43, text_usable=True)
+        ingest_module.escalate_ocr_confidence([usable], max_pages=5)
+        assert not calls, f"a yield-usable document must not be escalated, got {len(calls)} call(s)"
+        assert usable.text.startswith("body "), "its text must be left alone"
+
+        # Judged unusable by yield -- escalation IS warranted.
+        unusable = CovenantCandidate(
+            covid=999002, relpath=real, state_name="TEXAS",
+            county_name="MONTGOMERY", county_fips="48339", template_version_id=None,
+            template_confidence=None, text="Page 1 Of 13", pages=13, ocr=True,
+            vocab_score=None, legibility=1.0, text_usable=False)
+        ingest_module.escalate_ocr_confidence([unusable], max_pages=5)
+        assert len(calls) == 1, f"a yield-unusable document must escalate, got {len(calls)}"
+    finally:
+        ingest_module.escalate_to_vision_ocr = original
+    print("PASS: yield-assessed text governs escalation -- a readable low-legibility document "
+          "buys no vision pages, an empty high-legibility one does")
+
+
 if __name__ == "__main__":
     test_prefer_fuller_cache_finds_real_truncation()
     test_prefer_fuller_cache_no_false_positive()
@@ -178,4 +235,5 @@ if __name__ == "__main__":
     test_escalate_ocr_confidence_resolved_covid_3428()
     test_escalation_merges_pages_instead_of_replacing_the_document()
     test_merge_refuses_when_pages_cannot_be_aligned()
+    test_yield_assessed_text_does_not_buy_vision_pages()
     print("\nall ocr_escalation smoke tests passed")

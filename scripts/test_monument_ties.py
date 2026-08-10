@@ -180,6 +180,89 @@ def test_live_ngs_lookup_places_all_six_carve_outs() -> None:
     print(f"PASS: live NGS -> all {placed} covid 5838 carve-outs placed and verified")
 
 
+def test_service_not_answering_is_not_evidence_of_no_monument() -> None:
+    """Two ways NGS can fail to answer, both of which used to look exactly like
+    "there is no monument here" -- and that misreading is expensive. A deed that
+    recites a tie to a named NGS monument is itself evidence the monument exists
+    nearby, so an unusable answer must never send the covenant down to
+    anchor_resolver's paid Opus/Fable tiers to buy what NGS publishes for free.
+
+    Tested with a stubbed transport rather than by waiting for an outage. The
+    empty case is real: on 2026-08-10 /api/nde/bounds answered HTTP 200 with []
+    for every bbox tried, including dense control areas.
+    """
+    from app.gis import ngs as ngs_module
+    from app.gis.ngs import (
+        NGS_BOUNDS_RESULT_CAP, NgsResultTruncated, NgsServiceEmpty, NgsUnanswered,
+        find_monuments,
+    )
+
+    bbox = {"min_lat": 27.70, "max_lat": 27.90, "min_lon": -97.16, "max_lon": -97.00}
+
+    class _Resp:
+        def __init__(self, payload): self._payload = payload
+        def raise_for_status(self): pass
+        def json(self): return self._payload
+
+    original = ngs_module.requests.get
+    try:
+        # 1. Nothing at all -> transient, retry.
+        ngs_module.requests.get = lambda *a, **k: _Resp([])
+        try:
+            find_monuments({"SF-010"}, bbox)
+        except NgsServiceEmpty as e:
+            assert "NO marks at all" in str(e), str(e)
+            assert "do not treat it as" in str(e), "must say how NOT to read it"
+        else:
+            raise AssertionError("an empty result set must raise, not report the monument missing")
+
+        # 2. Capped -> incomplete, and retrying the same bbox will not help.
+        ngs_module.requests.get = lambda *a, **k: _Resp(
+            [{"name": f"OTHER {i}", "pid": f"XX{i:04d}"} for i in range(NGS_BOUNDS_RESULT_CAP)])
+        try:
+            find_monuments({"SF-010"}, bbox)
+        except NgsResultTruncated as e:
+            assert "truncated" in str(e), str(e)
+        else:
+            raise AssertionError("a capped result set must raise")
+
+        # Both are one family, so a caller can decline to escalate on either.
+        assert issubclass(NgsServiceEmpty, NgsUnanswered)
+        assert issubclass(NgsResultTruncated, NgsUnanswered)
+
+        # 3. A genuine "not in this area" -- marks came back, ours is not among
+        #    them, nowhere near the cap -- is a real answer and must NOT raise.
+        ngs_module.requests.get = lambda *a, **k: _Resp(
+            [{"name": "SOMETHING ELSE", "pid": "AA0001"}])
+        assert find_monuments({"SF-010"}, bbox) == {}, (
+            "a real, complete answer of 'not here' must return empty, not raise")
+    finally:
+        ngs_module.requests.get = original
+    print("PASS: an unanswered NGS search raises (empty=retry, capped=fix the bbox) while a "
+          "genuine 'not in this area' still returns empty")
+
+
+def test_anchor_resolver_does_not_buy_what_ngs_gives_free() -> None:
+    """The consequence, at the tier that spends money: an NGS outage must
+    propagate out of the NGS tier rather than returning None and letting the
+    resolver walk down to the paid LLM tiers."""
+    import inspect
+
+    from app.gis import anchor_resolver
+
+    src = inspect.getsource(anchor_resolver._try_ngs_monument_tie)
+    assert "except NgsUnanswered" in src, (
+        "the NGS tier must distinguish an unanswered search from 'cannot place'")
+    ngs_clause = src.index("except NgsUnanswered")
+    broad_clause = src.index("except Exception")
+    assert ngs_clause < broad_clause, (
+        "the NgsUnanswered clause must come BEFORE the broad handler, or the broad "
+        "one swallows it and the fall-through to paid tiers returns")
+    assert "raise" in src[ngs_clause:broad_clause], "it must re-raise, not return None"
+    print("PASS: anchor_resolver re-raises an unanswered NGS search instead of "
+          "falling through to the paid tiers")
+
+
 if __name__ == "__main__":
     test_designation_normalisation_keeps_distinct_marks_distinct()
     test_datasheet_parsing_reads_the_grid_line()
@@ -188,5 +271,7 @@ if __name__ == "__main__":
     test_cross_check_confirms_a_sound_pair()
     test_cross_check_isolates_the_quadrant_error_rather_than_just_failing()
     test_cross_check_refuses_an_unresolvable_disagreement()
+    test_service_not_answering_is_not_evidence_of_no_monument()
+    test_anchor_resolver_does_not_buy_what_ngs_gives_free()
     test_live_ngs_lookup_places_all_six_carve_outs()
     print("\nall monument-tie tests passed")

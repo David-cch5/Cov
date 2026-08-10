@@ -46,6 +46,18 @@ class CovenantCandidate:
     needs_review: bool = False
     review_reason: Optional[str] = None
 
+    # Set by app/ingestion/text_extract.py's assessment when text was acquired
+    # here rather than read from the corpus. Deliberately NOT folded into
+    # vocab_score: the two are different measures on different scales (pearson
+    # r=0.25), and legibility runs 0.43-0.99 on documents that are perfectly
+    # readable, so comparing it against VOCAB_SCORE_THRESHOLD would escalate
+    # healthy documents to paid vision OCR. See text_extract's module docstring.
+    legibility: Optional[float] = None
+    # None = not assessed, fall back to the vocab_score gate (the corpus path,
+    # unchanged). True/False = the yield gate has already ruled, and its verdict
+    # governs whether escalation is warranted.
+    text_usable: Optional[bool] = None
+
 
 def _load_covid_index() -> dict:
     idx = {}
