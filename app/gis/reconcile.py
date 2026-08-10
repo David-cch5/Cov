@@ -125,6 +125,14 @@ def reconcile_tract(session, covid: int, tract_no: int = 1) -> dict:
                 "reason": (f"covid {covid} has {row.tract_count} tracts, so the covenant's own "
                            f"stated acreage is not this tract's -- set tract.stated_acreage from "
                            f"tract {tract_no}'s own deed text to reconcile it")}
+    elif classified is None:
+        # A current_parcel_match tract whose parcel census has not been written
+        # yet has nothing to compare. Reported not-checkable rather than crashing
+        # on float(None) -- confirmed real on covid 5839 tract 2, freshly created
+        # from a parcel match before its census row existed.
+        return {"checked": False,
+                "reason": (f"covid {covid} tract {tract_no} has no classified_acreage yet -- "
+                           f"its parcel census must be written before it can be reconciled")}
     elif stated is None:
         status = "reconciled"
         unaccounted = None
