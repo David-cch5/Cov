@@ -38,6 +38,7 @@ from datetime import date, timedelta
 from sqlalchemy import text
 
 from app.db.repository import insert_source, upsert_fee_collection
+from app.title.release import release_for_transfer
 
 
 def _clear_stale_fee_collection(session, county_fips: str, instrument_number: str,
@@ -85,6 +86,21 @@ def compute_fee_for_transfer(session, county_fips: str, instrument_number: str,
     if row.exemption_category is not None and not row.review_flag:
         _clear_stale_fee_collection(session, county_fips, instrument_number, recording_date, parcel_apn)
         return {"fee_owed": False, "reason": f"confirmed exempt ({row.exemption_category})"}
+
+    # A covenant terminated or bought out as to this land owes nothing on a
+    # transfer recorded on or after the release took effect. Checked here as well
+    # as through transfer.exemption_category so a release recorded AFTER the
+    # transfer was already classified still takes effect, without needing every
+    # transfer re-walked first. Nothing before the effective date is touched: a
+    # fee owed then was owed, and stays owed.
+    released = release_for_transfer(session, row.covid, county_fips, parcel_apn, recording_date)
+    if released is not None:
+        _clear_stale_fee_collection(session, county_fips, instrument_number, recording_date, parcel_apn)
+        detail = released["recording_instrument"] or f"release {released['release_id']}"
+        return {"fee_owed": False,
+                "reason": (f"{released['release_type']} effective "
+                           f"{released['effective_date']} ({detail}) -- "
+                           f"{released['exemption_category']}")}
 
     fee_percent = row.fee_percent
     fee_percent_source = "covenant's own extracted fee_percent"
