@@ -39,6 +39,11 @@ from datetime import date
 from sqlalchemy import text
 
 RELEASE_TYPES = ("termination", "buyout")
+# Every covenant ingested is valid as of today. A termination found in the public
+# records is a DOCUMENT until someone adjudicates it -- some are invalid, and an
+# invalid one is answered by recording a rescission, not by treating the covenant
+# as over. So nothing releases on a pending or invalid release; see migration 0040.
+VALIDITY_STATUSES = ("pending_review", "valid", "invalid")
 EFFECTS = ("prospective", "void_ab_initio")
 SCOPES = ("covenant", "partial")
 
@@ -62,9 +67,17 @@ def record_release(
     terminates_instrument: str | None = None,
     referenced_instruments: list[str] | None = None,
     terminated_under: str | None = None,
+    validity_status: str = "pending_review", validity_note: str | None = None,
 ) -> dict:
     """Record a termination or buyout. `parcels` is [(county_fips, apn), ...]
     and is required for scope='partial'.
+
+    DEFAULTS TO validity_status='pending_review', AND THAT IS THE POINT. A
+    termination found in the public records is a downloaded document, not a
+    release: every covenant ingested here is valid as of today, and some
+    terminations on record are invalid. Nothing follows from a pending release --
+    no fee exemption, no settlement, no skip-research -- so capturing one is
+    always safe. Pass validity_status='valid' only after adjudication.
 
     TWO EFFECTS, BOTH REAL AND BOTH RECORDED (see migration 0038):
 
@@ -88,6 +101,9 @@ def record_release(
     read as releasing nothing, or as releasing everything, depending on which
     query happened to look at it, and neither is a thing anyone meant.
     """
+    if validity_status not in VALIDITY_STATUSES:
+        raise ValueError(f"validity_status must be one of {VALIDITY_STATUSES}, "
+                         f"got {validity_status!r}")
     if release_type not in RELEASE_TYPES:
         raise ValueError(f"release_type must be one of {RELEASE_TYPES}, got {release_type!r}")
     if scope not in SCOPES:
@@ -144,11 +160,14 @@ def record_release(
                                           no_intervening_conveyance_affidavit,
                                           terminates_instrument, referenced_instruments,
                                           terminated_under, settles_prior_fees,
-                                          settlement_note)
+                                          settlement_note, validity_status,
+                                          validity_note, adjudicated_at)
             VALUES (:covid, :release_type, :scope, :effective_date, :instrument,
                     :recording_date, :consideration, :notes, :source_id,
                     :effect, :execution_date, :ack_required, :ack_date, :affidavit,
-                    :terminates, :referenced, :under, :settles, :settlement_note)
+                    :terminates, :referenced, :under, :settles, :settlement_note,
+                    :validity_status, :validity_note,
+                    CASE WHEN :validity_status = 'pending_review' THEN NULL ELSE now() END)
             RETURNING release_id
         """),
         {"covid": covid, "release_type": release_type, "scope": scope,
@@ -159,7 +178,8 @@ def record_release(
          "ack_date": acknowledged_date, "affidavit": no_intervening_conveyance_affidavit,
          "terminates": terminates_instrument, "referenced": referenced_instruments,
          "under": terminated_under, "settles": settles_prior_fees,
-         "settlement_note": settlement_note},
+         "settlement_note": settlement_note, "validity_status": validity_status,
+         "validity_note": validity_note},
     ).scalar()
 
     for county_fips, apn in (parcels or []):
@@ -172,7 +192,7 @@ def record_release(
         )
     return {"release_id": release_id, "covid": covid, "release_type": release_type,
             "scope": scope, "effect": effect, "effective_date": effective_date,
-            "parcels": len(parcels or [])}
+            "validity_status": validity_status, "parcels": len(parcels or [])}
 
 
 def release_for_transfer(session, covid: int, county_fips: str, apn: str,
@@ -203,6 +223,8 @@ def release_for_transfer(session, covid: int, county_fips: str, apn: str,
                    r.no_intervening_conveyance_affidavit
             FROM covenant_release r
             WHERE r.covid = :covid
+              -- a pending or invalid release asserts nothing (migration 0040)
+              AND r.validity_status = 'valid'
               -- void_ab_initio reaches the covenant's whole life, so no date test
               AND (r.effect = 'void_ab_initio' OR r.effective_date <= :recording_date)
               AND (r.scope = 'covenant'
@@ -266,12 +288,19 @@ def settle_prior_fees(session, release_id: int) -> dict:
     cannot be inferred from the instrument's existence.
     """
     release = session.execute(
-        text("""SELECT release_id, covid, release_type, settles_prior_fees, effective_date, scope
+        text("""SELECT release_id, covid, release_type, settles_prior_fees, effective_date,
+                       scope, validity_status
                 FROM covenant_release WHERE release_id = :rid"""),
         {"rid": release_id},
     ).mappings().first()
     if release is None:
         raise ValueError(f"no covenant_release {release_id}")
+    if release["validity_status"] != "valid":
+        raise ValueError(
+            f"release {release_id} is {release['validity_status']} -- only an adjudicated-valid "
+            f"release settles anything. A found instrument settles no fees until someone "
+            f"decides it is effective"
+        )
     if release["release_type"] != "buyout" or not release["settles_prior_fees"]:
         raise ValueError(
             f"release {release_id} is a {release['release_type']} with "
@@ -347,6 +376,7 @@ def termination_fee_conflicts(session, covid: int) -> list[dict]:
                                   AND fc.recording_date = t.recording_date
                                   AND fc.parcel_apn = t.parcel_apn
             WHERE r.covid = :covid AND r.release_type = 'termination'
+              AND r.validity_status = 'valid'
               AND t.recording_date < r.effective_date
               AND (r.scope = 'covenant'
                    OR EXISTS (SELECT 1 FROM covenant_release_parcel p
@@ -387,6 +417,7 @@ def is_fully_released(session, covid: int, as_of: date | None = None) -> dict | 
                    no_intervening_conveyance_affidavit
             FROM covenant_release
             WHERE covid = :covid AND scope = 'covenant'
+              AND validity_status = 'valid'
               AND (:as_of IS NULL OR effective_date <= :as_of)
               AND (NOT acknowledgement_required OR acknowledged_date IS NOT NULL)
               AND (effect = 'prospective' OR no_intervening_conveyance_affidavit)
@@ -455,6 +486,7 @@ def apply_releases_to_transfers(session, covid: int) -> dict:
               AND t.exemption_category IS NULL
               AND t.superseded_at IS NULL
               AND r.covid = t.covid
+              AND r.validity_status = 'valid'
               AND (r.effect = 'void_ab_initio'
                    OR r.effective_date < t.recording_date)  -- strictly after; see release_for_transfer
               AND (r.effect = 'prospective' OR r.no_intervening_conveyance_affidavit)

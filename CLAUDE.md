@@ -56,9 +56,24 @@ exactly the length of the one course the parser had dropped. Chase the discrepan
 before accepting or approximating anything.
 
 
-## Terminated / released covenants are HISTORIC — record, don't research
-A covenant fully released (terminated or bought out, `scope='covenant'`) is worth keeping on
-the record — that record is how anyone later shows the land WAS encumbered and no longer is —
+## Every ingested covenant is VALID as of today
+A termination found in the public records does **not** change that. Some recorded terminations
+are invalid, and an invalid one is answered by recording a **rescission** that voids it — not by
+treating the covenant as over. So finding one is a document-acquisition event:
+1. **Find** — download the instrument and record it. `record_release` defaults to
+   `validity_status='pending_review'`, and a pending release asserts **nothing**: no fee
+   exemption, no settlement, no historic/skip-research. Capturing one is always safe.
+2. **Adjudicate** — a separate, human-led process decides valid or invalid.
+3. **Act** — if valid, the covenant is released. If invalid, generate and record a rescission
+   (`rescission_instrument`; a CHECK refuses one on a release not held invalid).
+
+Never mark a discovered termination valid as a side effect of finding it. Had the default gone
+the other way, a termination later held invalid would have silently stopped collection on a live
+covenant in the meantime — the expensive direction to be wrong in.
+
+## A release adjudicated VALID makes the covenant historic — record, don't research
+A covenant fully released (terminated or bought out, `scope='covenant'`, **and**
+`validity_status='valid'`) is worth keeping on the record — that record is how anyone later shows the land WAS encumbered and no longer is —
 but it is **not worth researching**. No chain-of-title walk, no GIS anchoring, no LLM
 escalation: each costs real money to establish facts about an obligation that no longer exists.
 `app/title/release.py`'s `is_fully_released` is the check, and

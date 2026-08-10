@@ -99,7 +99,7 @@ def test_release_exempts_only_transfers_on_or_after_its_effective_date() -> None
     try:
         with get_session() as session:
             _setup(session)
-            record_release(session, covid=COVID, release_type="termination",
+            record_release(session, covid=COVID, release_type="termination", validity_status="valid",
                            effective_date=EFFECTIVE, scope="partial",
                            parcels=[(COUNTY, APN_A)],
                            recording_instrument="TERM-2020-001")
@@ -130,7 +130,7 @@ def test_partial_release_leaves_other_parcels_encumbered() -> None:
     try:
         with get_session() as session:
             _setup(session)
-            record_release(session, covid=COVID, release_type="buyout",
+            record_release(session, covid=COVID, release_type="buyout", validity_status="valid",
                            effective_date=EFFECTIVE, scope="partial",
                            parcels=[(COUNTY, APN_A)], consideration_amount=25000)
             session.commit()
@@ -157,7 +157,7 @@ def test_applying_releases_never_overwrites_an_existing_exemption() -> None:
                                     exemption_basis = 'pre-existing finding'
                 WHERE covid = :c AND instrument_number = 'AFTER-REL'
             """), {"c": COVID})
-            record_release(session, covid=COVID, release_type="termination",
+            record_release(session, covid=COVID, release_type="termination", validity_status="valid",
                            effective_date=EFFECTIVE, scope="covenant")
             result = apply_releases_to_transfers(session, COVID)
             session.commit()
@@ -179,7 +179,7 @@ def test_covenant_wide_release_covers_every_parcel() -> None:
     try:
         with get_session() as session:
             _setup(session)
-            record_release(session, covid=COVID, release_type="termination",
+            record_release(session, covid=COVID, release_type="termination", validity_status="valid",
                            effective_date=EFFECTIVE, scope="covenant")
             session.commit()
             for apn in (APN_A, APN_B):
@@ -218,10 +218,10 @@ def test_earliest_effective_release_wins() -> None:
     try:
         with get_session() as session:
             _setup(session)
-            record_release(session, covid=COVID, release_type="buyout",
+            record_release(session, covid=COVID, release_type="buyout", validity_status="valid",
                            effective_date=date(2022, 1, 1), scope="partial",
                            parcels=[(COUNTY, APN_A)])
-            record_release(session, covid=COVID, release_type="termination",
+            record_release(session, covid=COVID, release_type="termination", validity_status="valid",
                            effective_date=EFFECTIVE, scope="partial",
                            parcels=[(COUNTY, APN_A)])
             session.commit()
@@ -245,7 +245,7 @@ def test_fee_compute_honours_a_release_recorded_after_the_fact() -> None:
     try:
         with get_session() as session:
             _setup(session)
-            record_release(session, covid=COVID, release_type="buyout",
+            record_release(session, covid=COVID, release_type="buyout", validity_status="valid",
                            effective_date=EFFECTIVE, scope="partial",
                            parcels=[(COUNTY, APN_A)], consideration_amount=25000,
                            recording_instrument="BUYOUT-2020-7")
@@ -277,12 +277,12 @@ def test_effective_date_defaults_to_recording_and_refuses_to_reach_back() -> Non
     try:
         with get_session() as session:
             _setup(session)
-            got = record_release(session, covid=COVID, release_type="termination",
+            got = record_release(session, covid=COVID, release_type="termination", validity_status="valid",
                                  scope="covenant", recording_date=date(2020, 6, 1))
             assert got["effective_date"] == date(2020, 6, 1), got
 
             try:
-                record_release(session, covid=COVID, release_type="termination",
+                record_release(session, covid=COVID, release_type="termination", validity_status="valid",
                                scope="covenant", recording_date=date(2020, 6, 1),
                                effective_date=date(2019, 1, 1))
                 raise AssertionError("expected a ValueError for a retroactive effective date")
@@ -292,7 +292,7 @@ def test_effective_date_defaults_to_recording_and_refuses_to_reach_back() -> Non
             # Reaching back is expressed as effect='void_ab_initio', never as a
             # prospective release with an earlier date -- one expression, so the
             # code and the schema CHECK cannot disagree.
-            back = record_release(session, covid=COVID, release_type="termination",
+            back = record_release(session, covid=COVID, release_type="termination", validity_status="valid",
                                   scope="covenant", effect="void_ab_initio",
                                   recording_date=date(2020, 6, 1),
                                   no_intervening_conveyance_affidavit=True)
@@ -320,7 +320,7 @@ def test_void_ab_initio_release_reaches_the_covenants_whole_life() -> None:
         with get_session() as session:
             _setup(session)
             record_release(
-                session, covid=COVID, release_type="termination", scope="covenant",
+                session, covid=COVID, release_type="termination", validity_status="valid", scope="covenant",
                 effect="void_ab_initio", recording_date=date(2010, 9, 16),
                 execution_date=date(2010, 9, 10),
                 no_intervening_conveyance_affidavit=True,
@@ -347,14 +347,14 @@ def test_retroactive_without_the_affidavit_reports_but_does_not_apply() -> None:
         with get_session() as session:
             _setup(session)
             try:
-                record_release(session, covid=COVID, release_type="termination",
+                record_release(session, covid=COVID, release_type="termination", validity_status="valid",
                                scope="covenant", effect="void_ab_initio",
                                recording_date=date(2010, 9, 16))
                 raise AssertionError("expected a ValueError with neither affidavit nor basis")
             except ValueError as exc:
                 assert "no_intervening_conveyance_affidavit" in str(exc), exc
 
-            record_release(session, covid=COVID, release_type="termination",
+            record_release(session, covid=COVID, release_type="termination", validity_status="valid",
                            scope="covenant", effect="void_ab_initio",
                            recording_date=date(2010, 9, 16),
                            retroactive_basis='"null and void ... as if it had never been recorded"')
@@ -377,7 +377,7 @@ def test_unexecuted_acknowledgement_is_not_an_effective_termination() -> None:
     try:
         with get_session() as session:
             _setup(session)
-            record_release(session, covid=COVID, release_type="termination",
+            record_release(session, covid=COVID, release_type="termination", validity_status="valid",
                            scope="covenant", recording_date=date(2019, 1, 15),
                            execution_date=date(2019, 1, 3),
                            acknowledgement_required=True, acknowledged_date=None,
@@ -425,7 +425,7 @@ def test_buyout_settles_prior_fees_by_linking_not_deleting() -> None:
         with get_session() as session:
             _setup(session)
             _add_fee(session, "BEFORE-REL", date(2019, 3, 1))
-            got = record_release(session, covid=COVID, release_type="buyout",
+            got = record_release(session, covid=COVID, release_type="buyout", validity_status="valid",
                                  scope="covenant", recording_date=EFFECTIVE,
                                  consideration_amount=250000, settles_prior_fees=True,
                                  settlement_note="agreement recites the price includes "
@@ -461,14 +461,14 @@ def test_a_termination_cannot_settle_prior_fees_and_reports_them_instead() -> No
             _setup(session)
             _add_fee(session, "BEFORE-REL", date(2019, 3, 1))
             try:
-                record_release(session, covid=COVID, release_type="termination",
+                record_release(session, covid=COVID, release_type="termination", validity_status="valid",
                                scope="covenant", recording_date=EFFECTIVE,
                                settles_prior_fees=True)
                 raise AssertionError("expected a ValueError: a termination settles nothing")
             except ValueError as exc:
                 assert "only a buyout" in str(exc), exc
 
-            record_release(session, covid=COVID, release_type="termination",
+            record_release(session, covid=COVID, release_type="termination", validity_status="valid",
                            scope="covenant", recording_date=EFFECTIVE)
             session.commit()
             conflicts = termination_fee_conflicts(session, COVID)
@@ -492,7 +492,7 @@ def test_a_fee_with_payment_history_is_a_conflict_not_a_settlement() -> None:
         with get_session() as session:
             _setup(session)
             _add_fee(session, "BEFORE-REL", date(2019, 3, 1), invoiced=1000)
-            got = record_release(session, covid=COVID, release_type="buyout",
+            got = record_release(session, covid=COVID, release_type="buyout", validity_status="valid",
                                  scope="covenant", recording_date=EFFECTIVE,
                                  consideration_amount=250000, settles_prior_fees=True)
             result = settle_prior_fees(session, got["release_id"])
@@ -531,20 +531,20 @@ def test_a_fully_released_covenant_is_historic_not_research() -> None:
             assert is_fully_released(session, COVID) is None, "nothing released yet"
 
             # partial -- land still encumbered, so still worth working
-            record_release(session, covid=COVID, release_type="buyout", scope="partial",
+            record_release(session, covid=COVID, release_type="buyout", validity_status="valid", scope="partial",
                            parcels=[(COUNTY, APN_A)], recording_date=EFFECTIVE)
             session.commit()
             assert is_fully_released(session, COVID) is None, "a partial release is not historic"
 
             # covenant-wide but acknowledgement pending -- may still be live
-            record_release(session, covid=COVID, release_type="termination", scope="covenant",
+            record_release(session, covid=COVID, release_type="termination", validity_status="valid", scope="covenant",
                            recording_date=EFFECTIVE, acknowledgement_required=True,
                            acknowledged_date=None, recording_instrument="PENDING-ACK")
             session.commit()
             assert is_fully_released(session, COVID) is None, "a pending acknowledgement is not historic"
 
             # covenant-wide and effective
-            record_release(session, covid=COVID, release_type="termination", scope="covenant",
+            record_release(session, covid=COVID, release_type="termination", validity_status="valid", scope="covenant",
                            recording_date=EFFECTIVE, recording_instrument="TERM-FULL")
             session.commit()
             got = is_fully_released(session, COVID)
@@ -564,7 +564,7 @@ def test_anchor_resolution_skips_a_released_covenant_by_default() -> None:
     try:
         with get_session() as session:
             _setup(session)
-            record_release(session, covid=COVID, release_type="termination", scope="covenant",
+            record_release(session, covid=COVID, release_type="termination", validity_status="valid", scope="covenant",
                            recording_date=EFFECTIVE, recording_instrument="TERM-FULL")
             session.commit()
             got = resolve_metes_and_bounds_anchor(session, covid=COVID, tract_no=1)
@@ -573,6 +573,87 @@ def test_anchor_resolution_skips_a_released_covenant_by_default() -> None:
         assert "research_released=True" in got["reason"], got
         print("PASS: anchor resolution skips a released covenant before any paid tier, and "
               "names the override")
+    finally:
+        with get_session() as session:
+            _teardown(session); session.commit()
+
+
+def test_a_found_termination_asserts_nothing_until_adjudicated() -> None:
+    """The default, and the reason it is the default. Every covenant ingested here
+    is valid as of today, and some terminations on record are invalid -- answered by
+    recording a rescission, not by treating the covenant as over.
+
+    So a discovered termination is captured and NOTHING follows from it: no fee
+    exemption, no settlement, and it does not make the covenant historic. Marking it
+    valid is a separate, deliberate act. Were it the other way round, a termination
+    later held invalid would have silently stopped collection on a live covenant in
+    the meantime."""
+    try:
+        with get_session() as session:
+            _setup(session)
+            found = record_release(session, covid=COVID, release_type="termination",
+                                  scope="covenant", recording_date=EFFECTIVE,
+                                  recording_instrument="FOUND-IN-RECORDS")
+            session.commit()
+            assert found["validity_status"] == "pending_review", found
+
+            # nothing follows from it
+            assert release_for_transfer(session, COVID, COUNTY, APN_A, date(2021, 3, 1)) is None
+            assert is_fully_released(session, COVID) is None
+            assert apply_releases_to_transfers(session, COVID)["transfers_exempted"] == 0
+
+            # adjudicating it valid is what makes it operate
+            session.execute(text("UPDATE covenant_release SET validity_status = 'valid', "
+                                 "adjudicated_at = now() WHERE covid = :c"), {"c": COVID})
+            session.commit()
+            assert release_for_transfer(session, COVID, COUNTY, APN_A, date(2021, 3, 1)) is not None
+            assert is_fully_released(session, COVID) is not None
+        print("PASS: a found termination asserts nothing until adjudicated valid")
+    finally:
+        with get_session() as session:
+            _teardown(session); session.commit()
+
+
+def test_an_invalid_termination_releases_nothing_and_carries_its_rescission() -> None:
+    """A termination held invalid is answered by recording a rescission that voids
+    it. It never releases anything, and the rescission is stored against the
+    instrument it voids -- a rescission read without its termination says nothing.
+
+    The database also refuses a rescission on a release that is valid or still
+    pending, because either would be a contradiction."""
+    try:
+        with get_session() as session:
+            _setup(session)
+            record_release(session, covid=COVID, release_type="termination",
+                           scope="covenant", recording_date=EFFECTIVE,
+                           recording_instrument="BAD-TERM-2020",
+                           validity_status="invalid",
+                           validity_note="executed by a party with no authority to terminate")
+            session.execute(text("""
+                UPDATE covenant_release
+                SET rescission_instrument = 'RESCIND-2021-14',
+                    rescission_recording_date = :d
+                WHERE covid = :c
+            """), {"d": date(2021, 2, 1), "c": COVID})
+            session.commit()
+            assert release_for_transfer(session, COVID, COUNTY, APN_A, date(2021, 3, 1)) is None
+            assert is_fully_released(session, COVID) is None
+            row = session.execute(text("SELECT validity_status, rescission_instrument "
+                                       "FROM covenant_release WHERE covid = :c"),
+                                  {"c": COVID}).mappings().one()
+            assert row["rescission_instrument"] == "RESCIND-2021-14", dict(row)
+
+            # a rescission cannot attach to a release that is not invalid
+            try:
+                session.execute(text("UPDATE covenant_release SET validity_status = 'valid' "
+                                     "WHERE covid = :c"), {"c": COVID})
+                session.commit()
+                raise AssertionError("expected the CHECK to refuse a rescission on a valid release")
+            except Exception as exc:
+                session.rollback()
+                assert "rescission_only_when_invalid" in str(exc), exc
+        print("PASS: an invalid termination releases nothing, carries its rescission, and the "
+              "rescission cannot be attached to a valid release")
     finally:
         with get_session() as session:
             _teardown(session); session.commit()
@@ -595,4 +676,6 @@ if __name__ == "__main__":
     test_a_fee_with_payment_history_is_a_conflict_not_a_settlement()
     test_a_fully_released_covenant_is_historic_not_research()
     test_anchor_resolution_skips_a_released_covenant_by_default()
+    test_a_found_termination_asserts_nothing_until_adjudicated()
+    test_an_invalid_termination_releases_nothing_and_carries_its_rescission()
     print("\nall covenant-release tests passed")
