@@ -143,6 +143,45 @@ def _plat_row_identity(row: dict) -> str:
     return ""
 
 
+# A full document number, as opposed to a short plat file number. Only these are
+# safe to look up: Nueces' plat file numbers (46201, 55219, 30286) collide with
+# other book series, and looking up "46201" returns a BACKFILE OIL GAS LEASE.
+_FULL_DOC_NUMBER = re.compile(r"^(19|20)\d{2}\d{5,}$")
+
+
+def _row_section(base_url: str, county_fips: str, covid: int, row: dict) -> str | None:
+    """The section this index row plats, re-reading the document itself if the row
+    does not say.
+
+    THE RESULTS LIST TRUNCATES PARTY NAMES. Doc 2024040337 is the plat of PALMILLA
+    BEACH PUD UNIT 7 -- its GRANTOR reads exactly that when the document is fetched
+    on its own, and reads "PALMILLA BEACH PUD" inside a multi-row result list. The
+    unit, the only thing identifying which phase the filing platted, is what gets
+    cut. So a candidate row whose own text names no section is re-read by document
+    number before being dismissed; that one lookup is the difference between dating
+    143 parcels and reporting their plat as nonexistent.
+
+    Bounded: only for rows that lack a section, and only for full document numbers."""
+    section = parse_subdivision_and_section(_plat_row_identity(row))["section"]
+    if section is not None:
+        return section
+    doc = str(row.get("FILE NUMBER") or row.get("DOC NUMBER") or "").strip()
+    if not _FULL_DOC_NUMBER.match(doc):
+        return None
+    def _call():
+        with recorder_context() as context:
+            return publicsearch.search_by_document_number(context, base_url, doc)
+    try:
+        detail = run_with_job_queue(
+            _call, job_type="title_plat_doc_detail", county_fips=county_fips, covid=covid,
+            payload={"base_url": base_url, "doc_number": doc})
+    except Exception:
+        return None  # the row stays unidentified rather than guessed at
+    if not detail:
+        return None
+    return parse_subdivision_and_section(_plat_row_identity(detail))["section"]
+
+
 def _row_is_for(row: dict, query: str) -> bool:
     """Keep this index row for the subdivision we searched?
 
@@ -397,8 +436,7 @@ def resolve_plats_for_tract(session, covid: int, tract_no: int) -> dict:
                 payload={"base_url": base_url, "searched_as": phrasing,
                          "for_section": wanted_section})
             hits = [r for r in rows
-                    if parse_subdivision_and_section(_plat_row_identity(r))["section"]
-                    == wanted_section
+                    if _row_section(base_url, county_fips, covid, r) == wanted_section
                     and _parse_slash_date(r.get("RECORDED DATE")) is not None
                     and (r.get("FILE NUMBER") or r.get("DOC NUMBER"))]
             if not hits:
