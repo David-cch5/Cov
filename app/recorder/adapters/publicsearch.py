@@ -10,6 +10,31 @@ mapping each `<thead>` header text to its column index dynamically rather than
 assuming a fixed schema -- confirmed empty leading columns (checkbox/expand
 icons) exist in every county tested, so empty header cells are just dropped.
 
+RESULTS ARE PAGINATED, AND THIS MODULE READS PAGE ONE. Measured 2026-08-11: a
+Nueces search for "PALMILLA BEACH" reports 2,297 results and returns 50 rows. The
+page is addressable -- `&offset=50` on the /results URL returns the next 50,
+confirmed by a different leading document -- so the "~50-row result cap" described
+in app/title/chain.py is really page 1 of N. Every conclusion drawn from a result
+set of exactly 50 rows should be treated as truncated until it is paged; that is
+how a real unit-4A plat went unfound while an unrelated document was accepted in
+its place. Paging is NOT implemented here yet, deliberately: widening what
+search_by_name returns changes which documents a chain-of-title walk considers,
+and that deserves its own verified change rather than a footnote to this one.
+
+A SHORT PLAT NUMBER IS NOT A UNIQUE DOCUMENT NUMBER. Nueces plat rows carry file
+numbers like 46201, 55219, 30286, while its deeds carry 2022003773. Looking up
+"46201" with search_by_document_number returns a BACKFILE OIL GAS LEASE at
+BFIO/46/201 -- a different series that happens to share the digits. So a document
+number taken from a plat row must not be round-tripped through a
+document-number search and assumed to be the same instrument.
+
+THE SAME DOCUMENT READS DIFFERENTLY IN TWO DEPARTMENTS. Doc 2019037783 is
+"Subdivision- Name: PALMILLA BEACH PUD" in the Plats results and "Subdivision-
+Name: PALMILLA BEACH PUD ETAL Lot: 5A Block: 6 Unit: 1E" in Official Public
+Records. The unit -- the thing that identifies which filing platted which phase --
+is only in the second. Prefer the richer department when the question is "which
+phase did this plat create".
+
 No stable JSON API was found for this vendor after real reverse-engineering
 attempts (monkey-patching window.fetch and XMLHttpRequest.prototype.open both
 came up empty even though the DOM populates with real data) -- something in
