@@ -24,6 +24,8 @@ from app.db.session import get_session
 from app.gis.plat_link import (
     _sections_match,
     link_parcels_to_plats,
+    plat_row_matches_query,
+    plat_search_name,
     normalize_subdivision,
     parse_subdivision_and_section,
     plats_needed,
@@ -133,7 +135,7 @@ def test_matcher_agrees_with_the_independent_subdivision_plat_path() -> None:
     re-deriving those links here is a genuine cross-check, and a disagreement means
     one of the two paths is wrong -- which must fail loudly rather than silently
     overwrite, since these links carry formation dates."""
-    from app.gis.plat_link import _candidate_plats
+    from app.gis.plat_link import _candidate_plats, plat_matches_parcel
 
     with get_session() as session:
         rows = session.execute(text("""
@@ -149,9 +151,9 @@ def test_matcher_agrees_with_the_independent_subdivision_plat_path() -> None:
                 declined += 1  # plat reserves: linked by the other path, not by this one
                 continue
             plats.setdefault(r.county_fips, _candidate_plats(session, r.county_fips))
-            matches = [q for q in plats[r.county_fips]
-                       if parsed["subdivision"] == normalize_subdivision(q["subdivision_name"])
-                       and _sections_match(parsed["section"], q["section"])]
+            # The module's OWN matcher, not a copy of it: a duplicated comparison
+            # here went stale and reported 84 correct links as disagreements.
+            matches = [q for q in plats[r.county_fips] if plat_matches_parcel(parsed, q)]
             assert len(matches) == 1 and matches[0]["plat_id"] == r.plat_id, (
                 f"parcel {r.apn} ({r.county_fips}) {r.legal!r} is linked to plat "
                 f"{r.plat_id} but this matcher derives "
@@ -161,6 +163,47 @@ def test_matcher_agrees_with_the_independent_subdivision_plat_path() -> None:
     print(f"PASS: this matcher independently re-derives all {reproduced:,} plattable "
           f"links written by the subdivision-plat path, and declines {declined} plat "
           f"reserves")
+
+
+def test_collapsed_search_name_and_the_directional_filter() -> None:
+    """What to ASK a recorder for, and what to accept back.
+
+    Searching the CAD's own recited string found nothing at all for 630 Nueces and
+    85 Collin parcels whose plats were in the index the whole time -- Collin files
+    "HEIGHTS AT WESTRIDGE" as "HEIGHTS WESTRIDGE #3 MCKINNEY", connector dropped and
+    city appended."""
+    for recited, expected in [
+        ("PALMILLA BEACH PUD UNIT 4C .5472 ACS OUT OF BLK 10", "PALMILLA BEACH"),
+        ("PALMILLA BEACH .0186 ACS OUT OF BLK 3", "PALMILLA BEACH"),
+        ("HEIGHTS AT WESTRIDGE PHASE III", "HEIGHTS WESTRIDGE"),
+        ("THE RESERVE ON LAKE CONROE 01 PARTIAL REPLAT NO", "RESERVE ON LAKE CONROE"),
+        ("GLENEAGLES 04", "GLENEAGLES"),
+        ("WATERMARK 01 PHASE", "WATERMARK"),
+    ]:
+        assert plat_search_name(recited) == expected, (recited, plat_search_name(recited))
+    assert plat_search_name("A0494 - Walker Co Sch L, TRACT 1D-1") is None
+
+    # UNIT is Nueces' word for a phase, so it is the SECTION, not a detail boundary.
+    got = parse_subdivision_and_section("PALMILLA BEACH PUD UNIT 4C .5472 ACS OUT OF BLK 10")
+    assert (got["subdivision"], got["section"]) == ("PALMILLA BEACH PUD", "4C"), got
+
+    # The filter is directional: a row may EXTEND the query, never shorten it.
+    assert plat_row_matches_query("PALMILLA BEACH PUD", "PALMILLA BEACH")
+    assert plat_row_matches_query("HEIGHTS WESTRIDGE #3 MCKINNEY", "HEIGHTS WESTRIDGE")
+    assert plat_row_matches_query("STAR TRAIL #5 PROSPER", "STAR TRAIL")
+    assert not plat_row_matches_query("KIM BEACH LLC", "PALMILLA BEACH")
+    assert not plat_row_matches_query("EAGLES NEST WESTRIDGE #2", "HEIGHTS WESTRIDGE")
+    # The Canopies case, both ways. Two separate real plats: THE CANOPIES, and the
+    # Canopies Parkway & Woodward Boulevard at Timber Edge plat, which carries
+    # platted lots as well as the street dedication.
+    parkway = "CANOPIES PARKWAY & WOODWARD BOULEVARD AT TIMBER EDGE"
+    assert not plat_row_matches_query("THE CANOPIES", plat_search_name(parkway)), (
+        "the shorter subdivision must never answer a search for the longer plat")
+    assert plat_row_matches_query(parkway, plat_search_name(parkway))
+    assert plat_search_name(parkway) and "CANOPIES" in plat_search_name(parkway)
+    print(f"PASS: recited strings collapse to searchable names; a row may extend a "
+          f"query but never shorten it, so THE CANOPIES cannot answer for the "
+          f"Canopies Parkway plat")
 
 
 def test_dry_run_is_the_default_and_reports_what_it_would_do() -> None:
@@ -278,6 +321,7 @@ if __name__ == "__main__":
     test_names_must_match_exactly_not_as_a_subset()
     test_section_06b_is_read_and_canonicalised()
     test_worded_phases_are_read()
+    test_collapsed_search_name_and_the_directional_filter()
     test_matcher_agrees_with_the_independent_subdivision_plat_path()
     test_dry_run_is_the_default_and_reports_what_it_would_do()
     test_reported_count_equals_rows_actually_written()

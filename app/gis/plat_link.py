@@ -71,10 +71,17 @@ from sqlalchemy import text
 # _subdivisions_match from app/title/chain.py is deliberately NOT used here. It is
 # a keyword-SUBSET correlator, right for chain-of-title where a false positive
 # costs a wasted lookup -- and wrong for this, where a false positive writes a
-# formation date. It matched "CANOPIES PARKWAY & WOODWARD BOULEVARD AT TIMBER
-# EDGE", a street-dedication plat, to the subdivision "THE CANOPIES" purely
-# because one name's tokens are a subset of the other's. Assigning a date needs
-# the names to be the SAME name, not overlapping ones.
+# formation date. It matched "CANOPIES PARKWAY & WOODWARD BOULEVARD AT TIMBER EDGE"
+# to the subdivision "THE CANOPIES" purely because one name's tokens are a subset
+# of the other's. Assigning a date needs the names to be the SAME name, not
+# overlapping ones.
+#
+# The two ARE separate real plats, and the longer one is a real plat: the Canopies
+# Parkway & Woodward Boulevard at Timber Edge filing carries platted LOTS as well
+# as the street dedication (confirmed on instruction, 2026-08-11 -- an earlier
+# reading here dismissed it as a dedication that created no lots, which is why its
+# parcels went unlinked). So it must be searched for and linked to on its own name,
+# and must never collapse into THE CANOPIES.
 
 # Montgomery prefixes its legal description with an internal account code
 # ("S929300 - The Reserve On Lake Conroe 01, BLOCK 2, Lot 53"). Collin and Nueces
@@ -98,7 +105,19 @@ _NOT_A_LOT = re.compile(
     r"|ELEMENTARY|JUNIOR\s+HIGH|ISD\b|SCHOOL\s+SITE)\b", re.I)
 
 # Where the subdivision name ends and lot/block detail begins.
-_DETAIL = re.compile(r",|\bBLOCK\b|\bBLK\b|\bLOT[S]?\b|\bLT[S]?\b|\bUNIT\b", re.I)
+#
+# UNIT is NOT a boundary here, though it looks like one: in Nueces it is the word
+# for a phase, and its own plat index files "PALMILLA BEACH UNIT 1B". Cutting the
+# head at UNIT threw away the section for 595 parcels, which then matched nothing.
+# A section pattern below reads it instead.
+_DETAIL = re.compile(r",|\bBLOCK\b|\bBLK\b|\bLOT[S]?\b|\bLT[S]?\b", re.I)
+
+# A quantity carved out of a larger parcel, which a CAD writes into the middle of
+# its legal description: "PALMILLA BEACH .0186 ACS OUT OF BLK 3", "... 2175 SQFT
+# OUT OF BLK 10". Left in place it became part of the name and the recorder was
+# asked for a subdivision called "PALMILLA BEACH 0186 ACS OUT".
+_QUANTITY = re.compile(r"\s+[\d.,]+\s*(?:ACS|ACRES?|AC|SQ\s*FT|SQFT)\b.*$", re.I)
+_TRAILING_OUT_OF = re.compile(r"\s+OUT(\s+OF)?$", re.I)
 
 # A section/phase, however the county writes it. Checked in this order so
 # "PHASE 2A" wins over the bare-number rule.
@@ -122,6 +141,9 @@ _SECTION_PATTERNS = (
     # subdivision's sectionless plat row -- attaching one filing's date to 680
     # other filings' lots.
     re.compile(r"\s(\d{1,2}[A-Z]?)$", re.I),
+    # Nueces' UNIT, read as the section it is -- checked last so a county that
+    # writes both ("PALMILLA BEACH PUD UNIT 2") still prefers PHASE/SECTION.
+    re.compile(r"\bUNIT\s+(\d{1,3}[A-Z]?)\b", re.I),
 )
 
 _ROMAN = {"I": "1", "II": "2", "III": "3", "IV": "4", "V": "5", "VI": "6",
@@ -212,6 +234,7 @@ def parse_subdivision_and_section(legal: str | None) -> dict:
 
     head = _DETAIL.split(body, maxsplit=1)[0].strip()
     head = re.sub(r"\s+(PARTIAL\s+)?REPLAT.*$", "", head, flags=re.I).strip()
+    head = _TRAILING_OUT_OF.sub("", _QUANTITY.sub("", head)).strip()
     if not head:
         return {"plattable": False, "reason": f"no subdivision name in {legal[:48]!r}",
                 "subdivision": None, "section": None}
@@ -229,6 +252,95 @@ def parse_subdivision_and_section(legal: str | None) -> dict:
         return {"plattable": False, "reason": f"section but no subdivision in {legal[:48]!r}",
                 "subdivision": None, "section": section}
     return {"plattable": True, "reason": None, "subdivision": subdivision, "section": section}
+
+
+def plat_search_name(recited_legal: str | None) -> str | None:
+    """The name to ASK a recorder's plat index for, given what a CAD recited.
+
+    A CAD's own string is routinely not a name any plat index holds: "PALMILLA
+    BEACH PUD UNIT 4C 2175 SQFT OUT OF BLK 10" for a plat filed as PALMILLA BEACH,
+    "GLENEAGLES 04" for GLENEAGLES. Searching the recited string found nothing for
+    630 Nueces and 85 Collin parcels whose plats were sitting in the index all
+    along.
+
+    This is the same collapse parse_subdivision_and_section already does, exported
+    so app/gis/plat_tracking.py asks with it instead of growing a second parser.
+    A trailing PUD is dropped as well: Nueces' index carries the same subdivision
+    both ways ("PALMILLA BEACH" and "PALMILLA BEACH PUD"), so the shorter form is
+    the one that finds both.
+    """
+    parsed = parse_subdivision_and_section(recited_legal)
+    name = parsed["subdivision"]
+    if not name:
+        return None
+    name = re.sub(r"\s+(PUD|PLANNED\s+UNIT\s+DEVELOPMENT)$", "", name).strip() or name
+    # A trailing bare number belongs to the section, not the name: "WATERMARK 01"
+    # is Watermark section 1. Broadening the query this way is safe because
+    # plat_row_matches_query only accepts rows that EXTEND it -- "WATERMARK 01"
+    # still answers a search for "WATERMARK", while "WATERMARK" alone could never
+    # answer a search for something longer.
+    name = re.sub(r"\s+\d{1,2}[A-Z]?$", "", name).strip() or name
+    # Ask without the connectors the index drops ("HEIGHTS AT WESTRIDGE" ->
+    # "HEIGHTS WESTRIDGE"). plat_row_matches_query strips them from both sides, so
+    # a county that DOES index them still matches.
+    return " ".join(t for t in name.split() if t not in _CONNECTORS) or name
+
+
+# Connector words a plat index drops but a CAD keeps. Collin files the CAD's
+# "HEIGHTS AT WESTRIDGE" as "HEIGHTS WESTRIDGE #3 MCKINNEY" -- connector gone, city
+# appended -- so a search for the recited name found nothing for all 85 parcels.
+#
+# "ON" is deliberately NOT here. Montgomery's "THE RESERVE ON LAKE CONROE" is
+# indexed with it, and dropping it would leave a query whose tokens are no longer a
+# leading run of the row's, breaking a case that already works.
+_CONNECTORS = {"AT", "OF", "AND", "THE"}
+
+
+def _comparison_tokens(name: str) -> list[str]:
+    """Tokens for comparing two subdivision names, with connectors removed from
+    BOTH sides so the drop stays symmetric. Stripping them from the query alone
+    would make the query stop being a prefix of the row it is meant to match."""
+    return [t for t in normalize_subdivision(name or "").split() if t not in _CONNECTORS]
+
+
+def plat_row_matches_query(plat_row_name: str | None, query: str) -> bool:
+    """Is this index row's own subdivision name the one we searched for?
+
+    Directional on purpose: the ROW may extend the QUERY, never the reverse. A row
+    named "PALMILLA BEACH PUD" answers a search for "PALMILLA BEACH"; a row named
+    "CANOPIES" does NOT answer a search for "CANOPIES PARKWAY & WOODWARD BOULEVARD
+    AT TIMBER EDGE", even though its one token sits at the front of it.
+
+    That second case is why this is not symmetric. Both are real, separate plats in
+    Montgomery: THE CANOPIES, and the Canopies Parkway & Woodward Boulevard at
+    Timber Edge plat -- which is a VALID plat carrying platted lots as well as the
+    street dedication, not a dedication-only filing (corrected on instruction,
+    2026-08-11; an earlier reading here treated it as though it created nothing).
+    Letting the shorter name answer the longer query would date one plat's lots
+    from the other's filing."""
+    row_tokens = _comparison_tokens(plat_row_name)
+    query_tokens = _comparison_tokens(query)
+    if not row_tokens or not query_tokens:
+        return False
+    return row_tokens[:len(query_tokens)] == query_tokens
+
+
+def plat_matches_parcel(parsed: dict, plat_row: dict) -> bool:
+    """Does this held plat create the parcel that parsed to `parsed`?
+
+    The single definition of the match, exported so nothing else re-implements it.
+    It was duplicated in scripts/test_plat_link.py's cross-check, and the copy went
+    stale the moment the real one learned to ignore connector words -- the test
+    then reported 84 correct links as disagreements. A checker that reimplements
+    what it checks is only testing that two copies were edited together.
+
+    Names compare with connectors removed from BOTH sides ("HEIGHTS AT WESTRIDGE"
+    is Collin's index's "HEIGHTS WESTRIDGE"), but by EQUALITY, never prefix or
+    subset: "CANOPIES" must not equal "CANOPIES PARKWAY & WOODWARD BOULEVARD AT
+    TIMBER EDGE", which is a separate real plat with its own lots."""
+    return (_comparison_tokens(parsed["subdivision"])
+            == _comparison_tokens(plat_row["subdivision_name"])
+            and _sections_match(parsed["section"], plat_row["section"]))
 
 
 def _candidate_plats(session, county_fips: str) -> list[dict]:
@@ -300,8 +412,7 @@ def link_parcels_to_plats(session, county_fips: str | None = None,
             plats_by_county[r.county_fips] = _candidate_plats(session, r.county_fips)
 
         matches = [pl for pl in plats_by_county[r.county_fips]
-                   if parsed["subdivision"] == normalize_subdivision(pl["subdivision_name"])
-                   and _sections_match(parsed["section"], pl["section"])]
+                   if plat_matches_parcel(parsed, pl)]
         if not matches:
             no_plat_held += 1
             continue

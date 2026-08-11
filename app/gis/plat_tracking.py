@@ -24,6 +24,13 @@ from sqlalchemy import text
 
 from app.db.repository import insert_source, upsert_plat
 from app.gis.plat_parser import extract_phase_key_from_text, normalize_section, parse_plat_reference
+from app.gis.plat_link import (
+    _comparison_tokens,
+    parse_subdivision_and_section,
+    link_parcels_to_plats,
+    plat_row_matches_query,
+    plat_search_name,
+)
 from app.queue.job_queue import run_with_job_queue
 from app.recorder.adapters import publicsearch
 from app.recorder.session import recorder_context
@@ -38,6 +45,7 @@ from app.recorder.session import recorder_context
 # record subdivision plats before statehood; anything this old is the index
 # saying "unknown", and unknown belongs in the date column as NULL.
 _EARLIEST_PLAUSIBLE_PLAT_YEAR = 1850
+_PLACEHOLDER_DATES = {date(1800, 1, 1), date(1900, 1, 1), date(1899, 12, 31)}
 
 
 def _parse_slash_date(s: str | None):
@@ -45,7 +53,12 @@ def _parse_slash_date(s: str | None):
         parsed = datetime.strptime((s or "").strip(), "%m/%d/%Y").date()
     except ValueError:
         return None
-    return None if parsed.year < _EARLIEST_PLAUSIBLE_PLAT_YEAR else parsed
+    # Exact sentinels too, not just the year floor: Collin stamps 1900-01-01 on
+    # HEIGHTS WESTRIDGE #1, a subdivision platted in 2004. A sentinel that clears
+    # the floor still wins the earliest-date pick, which is the whole danger.
+    if parsed in _PLACEHOLDER_DATES or parsed.year < _EARLIEST_PLAUSIBLE_PLAT_YEAR:
+        return None
+    return parsed
 
 
 def _flag_plat_lookup_note(session, covid: int, tract_no: int, note: str) -> None:
@@ -77,6 +90,24 @@ def _flag_plat_lookup_note(session, covid: int, tract_no: int, note: str) -> Non
     )
 
 
+def _row_is_for(row: dict, query: str) -> bool:
+    """Keep this index row for the subdivision we searched?
+
+    A row that carries NO subdivision name is KEPT. Montgomery's Plats department
+    returns exactly that -- SECTION, dates and file numbers, no subdivision column
+    at all -- because the department search is itself the scoping: it was asked for
+    one subdivision and answers with that subdivision's filings. Requiring a name
+    to match discarded all 9 real GLENEAGLES plats.
+
+    A row that DOES carry a name must match it, which is what stops a broadened
+    query from dragging in a neighbour (see plat_row_matches_query).
+    """
+    name = row.get("SUBDIVISION") or row.get("LEGAL DESCRIPTION")
+    if not name or not str(name).strip() or str(name).strip().upper() in ("N/A", "NONE"):
+        return True
+    return plat_row_matches_query(name, query)
+
+
 def resolve_plats_for_tract(session, covid: int, tract_no: int) -> dict:
     """For every matched parcel in this tract not yet tied to a plat: parse
     its recited legal description (platted vs. still-raw abstract tract vs.
@@ -86,31 +117,32 @@ def resolve_plats_for_tract(session, covid: int, tract_no: int) -> dict:
     ambiguous description or an unresolved section is flagged on the
     covenant, not silently skipped or silently assumed.
 
-    KNOWN LIMIT, measured 2026-08-11 and not yet fixed: this searches the
-    recorder's plat index with the parcel's OWN RECITED subdivision string, and a
-    CAD's recited string is frequently not a name any plat index holds. It works
-    where the two happen to agree -- Denton linked 212 of 213 parcels, Montgomery
-    193 -- and fails wholesale where they don't:
+    ASKS FOR THE PLAT'S NAME, RECORDS UNDER THE PARCEL'S. A CAD's recited string
+    is frequently not a name any plat index holds, so searching it verbatim found
+    nothing at all for whole counties:
 
-        recited by the CAD                                 the real plat's name
+        recited by the CAD                                  searched as
         PALMILLA BEACH PUD UNIT 4C 2175 SQFT OUT OF BLK 10  PALMILLA BEACH
         HEIGHTS AT WESTRIDGE PHASE III                      HEIGHTS AT WESTRIDGE
-        SHERMAN CROSSING ADDITION BLK A                     SHERMAN CROSSING
         GLENEAGLES 04                                       GLENEAGLES
+        WATERMARK 01 PHASE                                  WATERMARK
 
-    Nueces' own index answers "PALMILLA BEACH" with 39 real plat rows, so the
-    plats are there and findable -- 630 Nueces and 85 Collin parcels are blocked
-    on the QUERY, not on the records. app/gis/plat_link.py already solves exactly
-    this (plats_needed's `search_name` collapses spelling variants to the token
-    prefix every spelling shares, and _sections_match canonicalises 01/1/06B/ONE
-    B), so the fix is to search that collapsed name here and let plat_link do the
-    matching -- not to write a second matcher.
+    The collapse is plat_link.plat_search_name, shared rather than reimplemented
+    here. Results are narrowed back with plat_link.plat_row_matches_query, which
+    accepts only rows that EXTEND the query -- so a broader search cannot drag in
+    a neighbouring subdivision, and THE CANOPIES can never answer a search for
+    the Canopies Parkway & Woodward Boulevard at Timber Edge plat (both are real
+    plats with real lots).
 
-    Until then, a failed search writes lookup_status='not_found', and because
-    `already_known` is keyed on the recited name that row SUPPRESSES the next
-    search for it. 33 such rows were written and deleted again by hand today.
-    Anything written by a name from the left column above is an artifact of the
-    query, never evidence that a plat does not exist."""
+    Plat rows are keyed on the collapsed name -- the plat's own identity -- and
+    parcel assignment is delegated to plat_link.link_parcels_to_plats rather than
+    re-implemented here.
+
+    A failed search still writes lookup_status='not_found', and because
+    `already_known` is keyed on the recited name, that row SUPPRESSES the next
+    search for it. So a 'not_found' written by an OLD verbatim-string search is an
+    artifact of the query rather than evidence -- 33 such rows were deleted by
+    hand on 2026-08-11. Delete, don't trust, any that predate this change."""
     row = session.execute(
         text("""
             SELECT c.county_fips, r.base_url
@@ -152,26 +184,51 @@ def resolve_plats_for_tract(session, covid: int, tract_no: int) -> dict:
         if ref.platted:
             platted_by_subdivision.setdefault(ref.subdivision_name, []).append(apn)
 
-    already_known = {
-        r.subdivision_name for r in session.execute(
-            text("""
-                SELECT DISTINCT subdivision_name FROM plat
-                WHERE county_fips = :cf AND subdivision_name = ANY(:names)
-            """),
-            {"cf": county_fips, "names": list(platted_by_subdivision)},
-        ).fetchall()
-    } if platted_by_subdivision else set()
-    to_search = sorted(set(platted_by_subdivision) - already_known)
+    # Searches are deduplicated by the QUERY, not by the recited string: four
+    # Collin spellings of one subdivision are one search, and asking four times
+    # wrote the same nine plats four times over.
+    queries: dict[str, list[str]] = {}
+    for recited in platted_by_subdivision:
+        queries.setdefault(plat_search_name(recited) or recited, []).append(recited)
+
+    # Compared on collapsed names as well, or a plat already held under its
+    # collapsed name would be re-searched on every single run.
+    held = {r.subdivision_name for r in session.execute(
+        text("SELECT DISTINCT subdivision_name FROM plat WHERE county_fips = :cf"),
+        {"cf": county_fips}).fetchall()}
+    held_tokens = {tuple(_comparison_tokens(name)) for name in held}
+    to_search = sorted(q for q in queries
+                       if tuple(_comparison_tokens(q)) not in held_tokens)
 
     plats_found, plats_not_found = 0, 0
-    for subdivision_name in to_search:
-        def _call(name=subdivision_name):
+    for query in to_search:
+        subdivision_name = query  # what a 'not_found' row is recorded against
+
+        def _search(name):
             with recorder_context() as context:
                 return publicsearch.search_plats_by_subdivision(context, base_url, name)
         rows = run_with_job_queue(
-            _call, job_type="title_plat_lookup", county_fips=county_fips, covid=covid,
-            payload={"base_url": base_url, "subdivision_name": subdivision_name},
+            lambda name=query: _search(name), job_type="title_plat_lookup",
+            county_fips=county_fips, covid=covid,
+            payload={"base_url": base_url, "subdivision_name": subdivision_name,
+                     "searched_as": query},
         )
+        # A LONGER NAME MAY SIMPLY NOT BE INDEXED. Montgomery answers "CANOPIES
+        # PARKWAY" with the two real Canopies Parkway & Woodward Boulevard at Timber
+        # Edge plats and answers the full name with nothing at all. So one retry on
+        # the first two words, and only when the full query found nothing -- never
+        # as the first attempt, because the shorter the query the more it can drag
+        # in.
+        if not rows and len(query.split()) > 2:
+            short = " ".join(query.split()[:2])
+            rows = run_with_job_queue(
+                lambda name=short: _search(name), job_type="title_plat_lookup",
+                county_fips=county_fips, covid=covid,
+                payload={"base_url": base_url, "subdivision_name": subdivision_name,
+                         "searched_as": short, "after_no_hit_for": query})
+            query = short if rows else query
+
+        rows = [r for r in rows if _row_is_for(r, query)]
         plat_source_id = insert_source(
             session, source_type="recorder_portal", reference=f"{base_url} (plats department)", confidence=None,
         )
@@ -200,6 +257,14 @@ def resolve_plats_for_tract(session, covid: int, tract_no: int) -> dict:
                 else extract_phase_key_from_text(r.get("GRANTOR"), r.get("GRANTEE"), r.get("LEGAL DESCRIPTION"))
             )
             if section is None:
+                # Nueces names the filing in the subdivision itself -- "PALMILLA
+                # BEACH UNIT 1B" -- and UNIT is its word for a phase, which
+                # extract_phase_key_from_text does not read. plat_link's parser
+                # does, and it is the same parser the parcel side is read with, so
+                # both ends of the match speak one vocabulary.
+                section = parse_subdivision_and_section(
+                    r.get("SUBDIVISION") or r.get("LEGAL DESCRIPTION"))["section"]
+            if section is None:
                 continue
             by_section.setdefault(section, []).append(r)
 
@@ -212,7 +277,15 @@ def resolve_plats_for_tract(session, covid: int, tract_no: int) -> dict:
             # could silently keep the LATER date instead.
             earliest = min(section_rows, key=lambda r: _parse_slash_date(r.get("RECORDED DATE")) or date.max)
             upsert_plat(
-                session, county_fips=county_fips, subdivision_name=subdivision_name,
+                # Keyed on the PLAT's own collapsed name, not the reciting parcel's
+                # string. Storing it under the recited name conflated two different
+                # things: Collin's index numbers its filings "#1..#8" while its CAD
+                # writes them "PHASE III", so searching four recited names wrote the
+                # same nine plats four times over, each copy carrying a name saying
+                # PHASE III and a section saying 7. plat_link matches names with
+                # connectors removed, which is what lets the CAD's "HEIGHTS AT
+                # WESTRIDGE" find the index's "HEIGHTS WESTRIDGE".
+                session, county_fips=county_fips, subdivision_name=query,
                 section=section, lookup_status="found",
                 recording_instrument=earliest.get("FILE NUMBER") or earliest.get("DOC NUMBER") or None,
                 recording_date=_parse_slash_date(earliest.get("RECORDED DATE")),
@@ -221,26 +294,28 @@ def resolve_plats_for_tract(session, covid: int, tract_no: int) -> dict:
             )
             plats_found += 1
 
-    assigned, unresolved = 0, []
-    for apn, ref in parsed.items():
-        if not ref.platted:
-            continue
-        plat_row = session.execute(
+    # ASSIGNMENT IS DELEGATED, not duplicated. plat_link.link_parcels_to_plats is
+    # the matcher that reads every section form this corpus uses (01/1/06B/ONE
+    # B/III) and compares names with connectors removed -- and it is checked
+    # against every link already on record. The exact-string lookup that used to
+    # live here could only match when the CAD and the index happened to spell the
+    # subdivision identically, which is exactly the failure this rewrite is about.
+    link_result = link_parcels_to_plats(session, county_fips=county_fips, covid=covid,
+                                        dry_run=False)
+    assigned = link_result["linked"]
+    unresolved = [
+        (r.apn, r.recited_legal_description, "")
+        for r in session.execute(
             text("""
-                SELECT plat_id FROM plat
-                WHERE county_fips = :cf AND subdivision_name = :name AND section = :section
-                  AND lookup_status = 'found'
-            """),
-            {"cf": county_fips, "name": ref.subdivision_name, "section": normalize_section(ref.section)},
-        ).fetchone()
-        if plat_row is None:
-            unresolved.append((apn, ref.subdivision_name, ref.section))
-            continue
-        session.execute(
-            text("UPDATE parcel SET plat_id = :plat_id WHERE county_fips = :cf AND apn = :apn"),
-            {"plat_id": plat_row.plat_id, "cf": county_fips, "apn": apn},
-        )
-        assigned += 1
+                SELECT DISTINCT p.apn, p.recited_legal_description
+                  FROM parcel_covenant pc
+                  JOIN parcel p ON p.county_fips = pc.county_fips AND p.apn = pc.apn
+                 WHERE pc.covid = :covid AND pc.tract_no = :tract_no
+                   AND p.plat_id IS NULL AND p.recited_legal_description IS NOT NULL
+            """), {"covid": covid, "tract_no": tract_no}).fetchall()
+        if parse_plat_reference(r.recited_legal_description) is not None
+        and parse_plat_reference(r.recited_legal_description).platted
+    ]
 
     notes = []
     if ambiguous_apns:

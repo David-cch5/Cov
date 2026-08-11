@@ -113,21 +113,25 @@ def _enrich_row_from_legal_description(row: dict) -> dict:
     SUBDIVISION field on either side to catch the mismatch. A no-op when the
     row already has any of these as native keys (e.g. Montgomery, Bexar) --
     never overrides a column the county's own table actually provides."""
-    if "SUBDIVISION" in row or "LOT" in row or "BLOCK" in row:
-        return row
     legal = row.get("LEGAL DESCRIPTION")
     if not legal:
         return row
     enriched = dict(row)
-    m = _LEGAL_DESC_NAME_RE.search(legal)
-    if m:
-        enriched["SUBDIVISION"] = m.group(1).strip().rstrip(",")
-    m = _LEGAL_DESC_LOT_RE.search(legal)
-    if m:
-        enriched["LOT"] = m.group(1).strip().rstrip(",")
-    m = _LEGAL_DESC_BLOCK_RE.search(legal)
-    if m:
-        enriched["BLOCK"] = m.group(1).strip().rstrip(",")
+    # PER FIELD, not all-or-nothing. Skipping every derivation when ANY of the three
+    # was already present meant Nueces -- whose results table carries LOT and BLOCK
+    # columns but NO subdivision column -- never got a SUBDIVISION at all, even
+    # though its own LEGAL DESCRIPTION says "Subdivision- Name: PALMILLA BEACH UNIT
+    # 1B". 39 real plat rows were then discarded as not matching the subdivision
+    # they were rows for. A column the county DOES provide is still never
+    # overridden; that is what the per-field check preserves.
+    for field, pattern in (("SUBDIVISION", _LEGAL_DESC_NAME_RE),
+                           ("LOT", _LEGAL_DESC_LOT_RE),
+                           ("BLOCK", _LEGAL_DESC_BLOCK_RE)):
+        if row.get(field):
+            continue
+        m = pattern.search(legal)
+        if m:
+            enriched[field] = m.group(1).strip().rstrip(",")
     return enriched
 
 
