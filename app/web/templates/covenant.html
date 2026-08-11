@@ -1,0 +1,86 @@
+{% extends "base.html" %}{% block title %}Covid {{ cov.covid }}{% endblock %}
+{% block crumbs %}<p class="crumbs"><a href="{{ url_for('home') }}">covenants</a> / covid {{ cov.covid }}</p>{% endblock %}
+{% block body %}
+<h1>Covid {{ cov.covid }} — {{ cov.county_name|title }} County, {{ cov.state_code }}</h1>
+<p class="sub">{{ cov.declarant_raw|dash }}</p>
+<div class="facts">
+  <div><span class="k">Status</span><span class="v">{{ cov.status }}</span></div>
+  <div><span class="k">Stated acreage</span><span class="v">{{ cov.stated_acreage|num(3) }}</span></div>
+  <div><span class="k">Fee</span><span class="v">{{ cov.fee_percent|dash }}%</span></div>
+  <div><span class="k">Recorded</span><span class="v">{{ cov.recording_date|dash }}</span></div>
+  <div><span class="k">Instrument</span><span class="v">{{ cov.recording_instrument|dash }}</span></div>
+  <div><span class="k">Legal type</span><span class="v">{{ cov.legal_description_type|dash }}</span></div>
+</div>
+
+{% if cov.review_reason %}
+<h2>Review notes</h2>
+<div class="card"><p class="note">{{ cov.review_reason }}</p></div>
+{% endif %}
+
+{% if cov.releases %}
+<h2>Releases</h2>
+<div class="tbl-wrap"><table>
+  <thead><tr><th>Type</th><th>Effect</th><th>Scope</th><th>Validity</th><th>Instrument</th>
+             <th>Recorded</th><th>Effective</th><th>Rescission</th></tr></thead>
+  <tbody>{% for r in cov.releases %}<tr>
+    <td>{{ r.release_type }}</td><td>{{ r.effect }}</td><td>{{ r.scope }}</td>
+    <td><span class="pill {{ 'bad' if r.validity_status=='valid' else 'warn' }}">{{ r.validity_status }}</span></td>
+    <td class="mono">{{ r.recording_instrument|dash }}</td><td>{{ r.recording_date|dash }}</td>
+    <td>{{ r.effective_date|dash }}</td><td class="mono">{{ r.rescission_instrument|dash }}</td>
+  </tr>{% endfor %}</tbody>
+</table></div>
+{% endif %}
+
+{% if cov.beneficiaries %}
+<h2>Beneficiaries</h2>
+<div class="tbl-wrap"><table>
+  <thead><tr><th class="num">#</th><th>Name</th><th class="num">Interest</th><th>Effective</th></tr></thead>
+  <tbody>{% for b in cov.beneficiaries %}<tr>
+    <td class="num">{{ b.beneficiary_seq }}</td><td>{{ b.name_raw|dash }}</td>
+    <td class="num">{{ b.percentage_interest|num(2) }}%</td><td>{{ b.effective_date|dash }}</td>
+  </tr>{% endfor %}</tbody>
+</table></div>
+{% endif %}
+
+<h2>Tracts</h2>
+{% for t in cov.tracts %}
+  <h3>Tract {{ t.tract_no }}
+    <span class="pill {{ 'good' if t.reconciliation_status=='reconciled' else 'warn' }}">{{ t.reconciliation_status|dash }}</span>
+    {% if not t.has_geometry %}<span class="pill bad">no geometry</span>{% endif %}
+  </h3>
+  <div class="facts">
+    <div><span class="k">Boundary method</span><span class="v">{{ t.boundary_resolution_method|dash }}</span></div>
+    <div><span class="k">Stated ac</span><span class="v">{{ t.stated_acreage|num(3) }}</span></div>
+    <div><span class="k">Traverse ac</span><span class="v">{{ t.geometry_acreage|num(3) }}</span></div>
+    <div><span class="k">Classified ac</span><span class="v">{{ t.classified_acreage|num(3) }}</span></div>
+    <div><span class="k">Unaccounted ac</span><span class="v">{{ t.unaccounted_acreage|num(3) }}</span></div>
+    <div><span class="k">Parcels</span><span class="v">{{ t.parcels }}</span></div>
+  </div>
+  {% set census = censuses[t.tract_no] %}
+  {% if census %}
+  <div class="tbl-wrap"><table>
+    <thead><tr>
+      <th>APN</th><th>Subdivision</th><th>Sec</th><th>Formed</th><th>By instrument</th>
+      <th>Owner</th><th class="num">Acres</th><th>Class</th><th class="num">Overlap</th>
+      <th class="num">Lineage</th><th>Excluded</th>
+    </tr></thead>
+    <tbody>{% for p in census %}<tr{% if p.was_excluded %} style="opacity:.6"{% endif %}>
+      <td class="mono"><a href="{{ url_for('parcel', county_fips=p.county_fips, apn=p.apn) }}">{{ p.apn }}</a></td>
+      <td>{{ p.subdivision_name|dash }}</td><td>{{ p.section|dash }}</td>
+      <td class="mono">{% if p.formed_date %}{{ p.formed_date }}{% else %}<span class="pill raw">no date</span>{% endif %}</td>
+      <td class="mono">{{ p.formed_by_instrument|dash }}</td>
+      <td>{{ (p.owner_name_raw or '—')[:26] }}</td>
+      <td class="num">{{ p.acreage|num(3) }}</td>
+      <td>{{ p.classification|dash }}</td>
+      <td class="num">{{ p.confidence|num(2) }}</td>
+      <td class="num">{{ p.parent_edges }}&uarr;{{ p.child_edges }}&darr;</td>
+      <td>{% if p.excluded_reason %}<span class="pill bad" title="{{ p.excluded_reason }}">excluded</span>{% else %}—{% endif %}</td>
+    </tr>{% endfor %}</tbody>
+  </table></div>
+  {% else %}
+  <div class="empty">No parcel census for this tract yet.</div>
+  {% endif %}
+{% else %}
+  <div class="empty">This covenant has no tract rows — its encumbered land has not been resolved.</div>
+{% endfor %}
+{% endblock %}

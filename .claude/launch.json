@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "records",
+      "runtimeExecutable": "/opt/anaconda3/envs/covenant_app/bin/python3",
+      "runtimeArgs": ["scripts/serve.py"],
+      "port": 8742
+    }
+  ]
+}

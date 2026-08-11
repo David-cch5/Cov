@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{% block title %}Covenant records{% endblock %}</title>
+<style>
+  /* Same paper/ink language as the covid 4440 artifacts -- one visual system for
+     one subject, rather than a second look for the same data. */
+  :root{
+    --paper:#f6f2e8; --paper-2:#efe8d8; --ink:#241f19; --ink-soft:#5a5147;
+    --accent:#1f6f6b; --rule:#d8cdb2; --rule-strong:#b9ab86;
+    --good:#3c5a42; --warn:#a3651f; --bad:#8f3a3a; --raw:#c9ad74;
+    --font-display:Georgia,"Times New Roman",serif;
+    --font-body:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    --font-mono:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{--paper:#181510;--paper-2:#211d17;--ink:#ece4d4;--ink-soft:#b4a890;
+          --accent:#4fb3ad;--rule:#3a3225;--rule-strong:#544a35;
+          --good:#6f9a72;--warn:#c08b45;--bad:#c97a7a;--raw:#a9895a}
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--paper);color:var(--ink);font-family:var(--font-body);
+       line-height:1.5;-webkit-font-smoothing:antialiased}
+  a{color:var(--accent)}
+  a:focus-visible,input:focus-visible,button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  .wrap{max-width:1180px;margin:0 auto;padding:1.5rem 1.5rem 4rem}
+  nav.top{display:flex;gap:1rem;align-items:center;border-bottom:2px solid var(--ink);
+          padding-bottom:.75rem;margin-bottom:1.5rem;flex-wrap:wrap}
+  nav.top .brand{font-family:var(--font-display);font-size:1.15rem}
+  nav.top form{margin-left:auto;display:flex;gap:.4rem}
+  nav.top input{font-family:var(--font-mono);font-size:.85rem;padding:.35rem .55rem;
+                border:1px solid var(--rule-strong);border-radius:4px;
+                background:var(--paper-2);color:var(--ink);min-width:15rem}
+  nav.top button{font-family:var(--font-mono);font-size:.8rem;background:var(--good);
+                 color:var(--paper-2);border:none;border-radius:4px;padding:.35rem .8rem;cursor:pointer}
+  .crumbs{font-family:var(--font-mono);font-size:.78rem;color:var(--ink-soft);margin-bottom:1rem}
+  h1{font-family:var(--font-display);font-weight:400;font-size:1.8rem;margin:0 0 .35rem;text-wrap:balance}
+  h2{font-family:var(--font-display);font-weight:400;font-size:1.25rem;margin:2rem 0 .5rem}
+  h3{font-family:var(--font-body);font-weight:600;font-size:.95rem;margin:1.25rem 0 .35rem}
+  .sub{color:var(--ink-soft);font-size:.9rem;margin:0 0 1rem;max-width:76ch}
+  .facts{display:flex;flex-wrap:wrap;gap:1.5rem;margin:1rem 0;font-family:var(--font-mono);font-size:.82rem}
+  .facts .k{display:block;color:var(--ink-soft);font-size:.68rem;text-transform:uppercase;letter-spacing:.08em}
+  .facts .v{display:block;font-size:.98rem;font-variant-numeric:tabular-nums}
+  table{width:100%;border-collapse:collapse;font-size:.82rem;margin-top:.5rem}
+  th,td{text-align:left;padding:.4rem .55rem;border-bottom:1px solid var(--rule);vertical-align:top}
+  th{font-family:var(--font-mono);font-size:.68rem;text-transform:uppercase;letter-spacing:.06em;
+     color:var(--ink-soft);font-weight:400;position:sticky;top:0;background:var(--paper)}
+  td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;font-family:var(--font-mono)}
+  td.mono{font-family:var(--font-mono);font-size:.78rem}
+  tbody tr:hover{background:var(--paper-2)}
+  .tbl-wrap{overflow-x:auto;border:1px solid var(--rule-strong);border-radius:6px;
+            background:var(--paper-2);max-height:32rem;overflow-y:auto}
+  .pill{display:inline-block;font-family:var(--font-mono);font-size:.68rem;padding:.1rem .4rem;
+        border-radius:3px;border:1px solid currentColor;white-space:nowrap}
+  .pill.good{color:var(--good)} .pill.warn{color:var(--warn)} .pill.bad{color:var(--bad)}
+  .pill.raw{color:var(--raw)}
+  .card{background:var(--paper-2);border:1px solid var(--rule-strong);border-radius:6px;
+        padding:.9rem 1rem;margin:.75rem 0}
+  .note{font-size:.8rem;color:var(--ink-soft);white-space:pre-wrap;word-break:break-word}
+  .empty{background:var(--paper-2);border:1px dashed var(--rule-strong);border-radius:6px;
+         padding:.9rem 1rem;font-size:.83rem;color:var(--ink-soft);margin:.75rem 0}
+  .empty b{color:var(--ink)}
+  footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
+         font-size:.75rem;color:var(--ink-soft)}
+</style>
+</head><body>
+<div class="wrap">
+  <nav class="top">
+    <span class="brand"><a href="{{ url_for('home') }}" style="text-decoration:none;color:inherit">Covenant records</a></span>
+    <form action="{{ url_for('search') }}" method="get" role="search">
+      <input name="q" value="{{ q|default('') }}" placeholder="covid, APN, owner, declarant" aria-label="Search">
+      <button type="submit">Search</button>
+    </form>
+  </nav>
+  {% block crumbs %}{% endblock %}
+  {% block body %}{% endblock %}
+  <footer>Read-only view of the local system of record. No route here writes.</footer>
+</div>
+</body></html>

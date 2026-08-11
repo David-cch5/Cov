@@ -1,0 +1,134 @@
+{% extends "base.html" %}{% block title %}Parcel {{ p.apn }}{% endblock %}
+{% block crumbs %}<p class="crumbs"><a href="{{ url_for('home') }}">covenants</a>
+  {% for c in p.covenants %}/ <a href="{{ url_for('covenant', covid=c.covid) }}">covid {{ c.covid }}</a>{% endfor %}
+  / parcel {{ p.apn }}</p>{% endblock %}
+{% block body %}
+<h1>Parcel {{ p.apn }}</h1>
+<p class="sub">{{ p.recited_legal_description|dash }}</p>
+<div class="facts">
+  <div><span class="k">County</span><span class="v">{{ p.county_name|title }}, {{ p.state_code }}</span></div>
+  <div><span class="k">Owner</span><span class="v">{{ p.owner_name_raw|dash }}</span></div>
+  <div><span class="k">Situs</span><span class="v">{{ p.situs_address|dash }}</span></div>
+  <div><span class="k">CAD acres</span><span class="v">{{ p.acreage|num(3) }}</span></div>
+  <div><span class="k">Geometry</span><span class="v">{{ p.geometry_sqft|num(0) }} sq ft</span></div>
+  <div><span class="k">Geometry vintage</span><span class="v">{{ p.geometry_vintage|dash }}</span></div>
+</div>
+
+<h2>Formation</h2>
+{% if p.formed_date %}
+<div class="card">
+  <div class="facts" style="margin:0">
+    <div><span class="k">Formed</span><span class="v">{{ p.formed_date }}</span></div>
+    <div><span class="k">By instrument</span><span class="v">{{ p.formed_by_instrument }}</span></div>
+    <div><span class="k">Evidence</span><span class="v">{{ p.formation_source }}</span></div>
+    {% if p.subdivision_name %}<div><span class="k">Plat</span>
+      <span class="v">{{ p.subdivision_name }}{% if p.section %} Sec {{ p.section }}{% endif %}</span></div>{% endif %}
+    {% if p.book_volume_page %}<div><span class="k">Vol/Page</span><span class="v">{{ p.book_volume_page }}</span></div>{% endif %}
+    {% if p.abstract_name %}<div><span class="k">Abstract</span><span class="v">{{ p.abstract_name }}</span></div>{% endif %}
+  </div>
+</div>
+{% else %}
+<div class="empty"><b>No recorded formation date.</b> This parcel has no plat this project could
+  locate — typically a raw abstract-survey tract with no formation event to read. It is left
+  blank rather than filled from a first-seen date or an appraisal year.</div>
+{% endif %}
+
+<h2>Encumbering covenants</h2>
+{% if p.covenants %}
+<div class="tbl-wrap"><table>
+  <thead><tr><th>Covid</th><th class="num">Tract</th><th>Declarant</th><th>Covenant status</th>
+             <th>Classification</th><th class="num">Overlap</th><th>Excluded from census</th></tr></thead>
+  <tbody>{% for c in p.covenants %}<tr{% if c.was_excluded %} style="opacity:.6"{% endif %}>
+    <td class="mono"><a href="{{ url_for('covenant', covid=c.covid) }}">{{ c.covid }}</a></td>
+    <td class="num">{{ c.tract_no }}</td>
+    <td>{{ (c.declarant_raw or '—')[:34] }}</td>
+    <td><span class="pill {{ 'good' if c.status in ('reconciled','done') else 'warn' }}">{{ c.status }}</span></td>
+    <td>{{ c.classification|dash }}</td>
+    <td class="num">{{ c.confidence|num(2) }}</td>
+    <td>{% if c.excluded_reason %}<span class="pill bad" title="{{ c.excluded_reason }}">yes</span>{% else %}—{% endif %}</td>
+  </tr>{% endfor %}</tbody>
+</table></div>
+{% else %}
+<div class="empty">This parcel is not in any covenant's census.</div>
+{% endif %}
+
+<h2>Lineage</h2>
+<h3>Ancestors — the land this parcel came from</h3>
+{% if p.ancestors %}
+<div class="tbl-wrap"><table>
+  <thead><tr><th class="num">Depth</th><th>APN</th><th>Type</th><th>Instrument</th><th>Effective</th>
+             <th>Owner</th><th class="num">Acres</th><th>Legal</th></tr></thead>
+  <tbody>{% for a in p.ancestors %}<tr>
+    <td class="num">{{ a.depth }}</td>
+    <td class="mono"><a href="{{ url_for('parcel', county_fips=a.county_fips, apn=a.apn) }}">{{ a.apn }}</a></td>
+    <td>{{ a.lineage_type }}</td><td class="mono">{{ a.split_instrument_number|dash }}</td>
+    <td>{{ a.effective_date|dash }}</td><td>{{ (a.owner_name_raw or '—')[:24] }}</td>
+    <td class="num">{{ a.acreage|num(3) }}</td><td>{{ (a.recited_legal_description or '—')[:44] }}</td>
+  </tr>{% endfor %}</tbody>
+</table></div>
+{% else %}
+<div class="empty"><b>No recorded ancestor edges.</b>
+  {% if p.formed_date %}The plat that formed this parcel on {{ p.formed_date }}
+  ({{ p.formed_by_instrument }}) is its earliest recorded event.{% endif %}
+  Intermediate generations need a parent parcel identity, which cannot be derived from a single
+  current parcel snapshot — today's raw tract is the residual of the pre-plat land, not provably
+  the parent account. Reading the deed or replat that split it is what would add the edge.</div>
+{% endif %}
+
+<h3>Descendants — what came out of this parcel</h3>
+{% if p.descendants %}
+<div class="tbl-wrap"><table>
+  <thead><tr><th class="num">Depth</th><th>APN</th><th>Type</th><th>Instrument</th><th>Effective</th>
+             <th>Formed</th><th class="num">Acres</th><th>Legal</th></tr></thead>
+  <tbody>{% for d in p.descendants %}<tr>
+    <td class="num">{{ d.depth }}</td>
+    <td class="mono"><a href="{{ url_for('parcel', county_fips=d.county_fips, apn=d.apn) }}">{{ d.apn }}</a></td>
+    <td>{{ d.lineage_type }}</td><td class="mono">{{ d.split_instrument_number|dash }}</td>
+    <td>{{ d.effective_date|dash }}</td><td class="mono">{{ d.formed_date|dash }}</td>
+    <td class="num">{{ d.acreage|num(3) }}</td><td>{{ (d.recited_legal_description or '—')[:44] }}</td>
+  </tr>{% endfor %}</tbody>
+</table></div>
+{% else %}
+<div class="empty">No recorded descendant edges — nothing is recorded as having been split out of
+  this parcel.</div>
+{% endif %}
+
+<h2>Boundary history</h2>
+{% if p.history %}
+<div class="tbl-wrap"><table>
+  <thead><tr><th>Effective</th><th>Instrument</th><th>Observed</th><th>Change</th>
+             <th>Owner then</th><th class="num">Acres then</th><th class="num">Sq ft then</th><th>Source</th></tr></thead>
+  <tbody>{% for h in p.history %}<tr>
+    <td class="mono">{% if h.effective_date %}{{ h.effective_date }}{% else %}<span class="pill raw">unknown</span>{% endif %}</td>
+    <td class="mono">{{ h.instrument|dash }}</td>
+    <td class="mono">{{ h.captured_at.date() if h.captured_at else '—' }}</td>
+    <td>{{ h.change_reason }}</td><td>{{ (h.owner_name_raw or '—')[:24] }}</td>
+    <td class="num">{{ h.acreage|num(3) }}</td><td class="num">{{ h.geometry_sqft|num(0) }}</td>
+    <td class="note" style="max-width:22rem">{{ (h.source_reference or '—')[:120] }}</td>
+  </tr>{% endfor %}</tbody>
+</table></div>
+<p class="note"><b>Effective</b> is when the change happened on the ground, from the instrument
+  that caused it. <b>Observed</b> is when this project saw it — often the date a county
+  republished its parcel layer, which can be years later.</p>
+{% else %}
+<div class="empty">No boundary history recorded. Snapshots only exist from the first change
+  observed after versioning was switched on.</div>
+{% endif %}
+
+{% if p.transfers %}
+<h2>Transfers</h2>
+<div class="tbl-wrap"><table>
+  <thead><tr><th>Recorded</th><th>Instrument</th><th>Type</th><th>Grantor</th><th>Grantee</th>
+             <th class="num">Consideration</th><th>Exemption</th><th>Flags</th></tr></thead>
+  <tbody>{% for t in p.transfers %}<tr{% if t.superseded_at %} style="opacity:.55"{% endif %}>
+    <td class="mono">{{ t.recording_date|dash }}</td><td class="mono">{{ t.instrument_number|dash }}</td>
+    <td>{{ t.instrument_type|dash }}</td>
+    <td>{{ (t.grantor_raw or '—')[:26] }}</td><td>{{ (t.grantee_raw or '—')[:26] }}</td>
+    <td class="num">{{ t.consideration_amount|num(0) }}</td>
+    <td>{{ t.exemption_category|dash }}{% if t.exemption_basis %}<br><span class="note">{{ t.exemption_basis[:60] }}</span>{% endif %}</td>
+    <td>{% if t.review_flag %}<span class="pill warn">review</span>{% endif %}
+        {% if t.superseded_at %}<span class="pill raw">superseded</span>{% endif %}</td>
+  </tr>{% endfor %}</tbody>
+</table></div>
+{% endif %}
+{% endblock %}

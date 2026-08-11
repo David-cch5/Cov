@@ -1,0 +1,25 @@
+{% extends "base.html" %}{% block title %}Search “{{ q }}”{% endblock %}
+{% block crumbs %}<p class="crumbs"><a href="{{ url_for('home') }}">covenants</a> / search</p>{% endblock %}
+{% block body %}
+<h1>“{{ q }}”</h1>
+<h2>Covenants ({{ results.covenants|length }})</h2>
+{% if results.covenants %}
+<div class="tbl-wrap"><table>
+  <thead><tr><th>Covid</th><th>County</th><th>Status</th><th>Declarant</th></tr></thead>
+  <tbody>{% for c in results.covenants %}<tr>
+    <td class="mono"><a href="{{ url_for('covenant', covid=c.covid) }}">{{ c.covid }}</a></td>
+    <td>{{ c.county_name|title }}</td><td>{{ c.status }}</td><td>{{ (c.declarant_raw or '—')[:44] }}</td>
+  </tr>{% endfor %}</tbody>
+</table></div>
+{% else %}<div class="empty">No covenant matches.</div>{% endif %}
+<h2>Parcels ({{ results.parcels|length }})</h2>
+{% if results.parcels %}
+<div class="tbl-wrap"><table>
+  <thead><tr><th>APN</th><th>County</th><th>Owner</th><th>Situs</th></tr></thead>
+  <tbody>{% for p in results.parcels %}<tr>
+    <td class="mono"><a href="{{ url_for('parcel', county_fips=p.county_fips, apn=p.apn) }}">{{ p.apn }}</a></td>
+    <td>{{ p.county_name|title }}</td><td>{{ (p.owner_name_raw or '—')[:30] }}</td><td>{{ p.situs_address|dash }}</td>
+  </tr>{% endfor %}</tbody>
+</table></div>
+{% else %}<div class="empty">No parcel matches.</div>{% endif %}
+{% endblock %}

@@ -1,0 +1,53 @@
+{% extends "base.html" %}{% block title %}Covenants{% endblock %}
+{% block body %}
+<h1>Covenants</h1>
+<p class="sub">{{ covenants|length }} covenant{{ '' if covenants|length == 1 else 's' }} in the
+  system of record. Follow a covid through to its tracts, its parcel census, and from any
+  parcel back to every covenant that encumbers it.</p>
+
+<div class="card">
+  <h3 style="margin-top:0">Lineage evidence</h3>
+  <div class="facts">
+    <div><span class="k">Parcels with a recorded formation date</span>
+         <span class="v">{{ coverage.parcels_formed }} / {{ coverage.parcels_total }}</span></div>
+    <div><span class="k">parcel_lineage edges</span><span class="v">{{ coverage.edges }}</span></div>
+    <div><span class="k">History snapshots</span>
+         <span class="v">{{ coverage.history_rows }} ({{ coverage.history_dated }} with a dated instrument)</span></div>
+  </div>
+  {% if coverage.edges == 0 %}
+  <p class="note"><b>No parcel-to-parcel lineage edges are recorded yet.</b> A parcel's formation
+    plat is currently its earliest recorded event, so a lot traces back to the plat that created
+    it and to the covenant that encumbers it — but not through intermediate generations. Those
+    need parent identities that cannot be derived from a single current parcel snapshot: today's
+    raw tract is the RESIDUAL of the pre-plat land, not provably the parent account. Deriving one
+    anyway would fabricate title data, so the traversal is left honestly shallow until deed or
+    replat evidence is read.</p>
+  {% endif %}
+</div>
+
+<div class="tbl-wrap">
+<table>
+  <thead><tr>
+    <th>Covid</th><th>County</th><th>Status</th><th>Declarant</th>
+    <th class="num">Stated ac</th><th>Legal type</th>
+    <th class="num">Tracts</th><th class="num">Parcels</th><th>Reconciled</th><th>Release</th>
+  </tr></thead>
+  <tbody>
+  {% for c in covenants %}
+    <tr>
+      <td class="mono"><a href="{{ url_for('covenant', covid=c.covid) }}">{{ c.covid }}</a></td>
+      <td>{{ c.county_name|title }}, {{ c.state_code }}</td>
+      <td><span class="pill {{ 'good' if c.status in ('reconciled','done') else 'warn' }}">{{ c.status }}</span></td>
+      <td>{{ (c.declarant_raw or '—')[:38] }}</td>
+      <td class="num">{{ c.stated_acreage|num(2) }}</td>
+      <td class="mono">{{ c.legal_description_type|dash }}</td>
+      <td class="num">{{ c.tracts }}</td>
+      <td class="num">{{ c.parcels }}</td>
+      <td class="num">{{ c.reconciled_tracts }}/{{ c.tracts }}</td>
+      <td>{% if c.valid_releases %}<span class="pill bad">released</span>{% else %}—{% endif %}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endblock %}
