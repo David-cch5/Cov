@@ -18,6 +18,7 @@ table for free.
 
 Usage: python3 scripts/test_classifier.py
 """
+import json
 import sys
 from types import SimpleNamespace
 
@@ -673,6 +674,83 @@ def test_dallas_uses_current_geometry_not_the_2019_snapshot() -> None:
           f"43,155, attributes still joined from the 2019 layer (lot {ssm['lot']})")
 
 
+def test_superseded_parcel_geometry_is_kept_not_overwritten() -> None:
+    """A boundary that moved is evidence. Dallas's 2019 layer put 6,001 sq ft of
+    covid 4956's land in the neighbouring parcel; current CAD geometry assigns it
+    to the covenanted one. The DIFFERENCE records a 2017 conveyance reaching the
+    parcel fabric, and a covenant runs with the land -- so which land was
+    encumbered WHEN is the substance of the job. Overwriting in place destroyed
+    the only evidence the boundary had moved at all.
+    """
+    from app.db.session import get_session
+
+    with get_session() as session:
+        rows = list(session.execute(text("""
+            -- The ARCHIVAL 2019 snapshot specifically. A parcel can accumulate
+            -- several snapshots, so the one being compared has to be named rather
+            -- than left to row order.
+            SELECT h.apn, h.change_reason,
+                   round((ST_Area(h.geom::geography) * 10.763910417)::numeric, 0) AS then_sqft,
+                   round((ST_Area(p.geom::geography) * 10.763910417)::numeric, 0) AS now_sqft
+              FROM parcel_history h JOIN parcel p USING (county_fips, apn)
+             WHERE h.county_fips = '48113' AND h.change_reason = 'initial'
+             ORDER BY h.apn""")))
+        if not rows:
+            print("SKIP: no Dallas parcel history recorded")
+            return
+        by_apn = {r.apn: r for r in rows}
+        ssm = by_apn.get("24123500010140000")
+        conlon = by_apn.get("24049800010010100")
+        assert ssm and conlon, sorted(by_apn)
+        gained = int(ssm.now_sqft) - int(ssm.then_sqft)
+        lost = int(conlon.now_sqft) - int(conlon.then_sqft)
+        assert gained > 5000, f"the SSM parcel should have gained ~6,001 sq ft, got {gained:+,}"
+        assert abs(gained + lost) < 50, (
+            f"the move must be equal and opposite -- one parcel's gain is the other's loss; "
+            f"got {gained:+,} and {lost:+,}")
+        # And the current row says which layer it is holding.
+        vintage = session.execute(text(
+            "SELECT geometry_vintage FROM parcel WHERE county_fips='48113' "
+            "AND apn='24123500010140000'")).scalar()
+        assert vintage == "current", f"geometry_vintage must be recorded, got {vintage!r}"
+    print(f"PASS: the 2019 boundary is kept -- SSM {gained:+,} sq ft against Conlon {lost:+,}, "
+          f"equal and opposite; current row tagged vintage={vintage!r}")
+
+
+def test_unchanged_resync_writes_no_history() -> None:
+    """History records what happened to the LAND, not how often the pipeline ran.
+    The first version of this failed: parcel.acreage is numeric(12,3), so a stored
+    0.905 was compared against the next sync's unrounded 0.9045038901 and every
+    re-sync wrote a spurious row -- caught by watching the count go 3 -> 6.
+    """
+    from app.db.repository import upsert_parcel
+    from app.db.session import get_session
+
+    with get_session() as session:
+        row = session.execute(text("""
+            SELECT apn, owner_name_raw, situs_address, city, acreage,
+                   ST_AsGeoJSON(geom) AS gj, geometry_vintage, source_id
+              FROM parcel WHERE county_fips='48113' AND geom IS NOT NULL LIMIT 1""")).fetchone()
+        if row is None:
+            print("SKIP: no Dallas parcel to re-sync")
+            return
+        before = session.execute(text(
+            "SELECT count(*) FROM parcel_history WHERE county_fips='48113' AND apn=:a"),
+            {"a": row.apn}).scalar()
+        # Re-upsert byte-identical values, exactly as an unchanged re-sync would.
+        upsert_parcel(session, county_fips="48113", apn=row.apn,
+                      owner_name_raw=row.owner_name_raw, situs_address=row.situs_address,
+                      city=row.city, acreage=float(row.acreage) if row.acreage else None,
+                      geojson=json.loads(row.gj), source_id=row.source_id,
+                      geometry_vintage=row.geometry_vintage)
+        after = session.execute(text(
+            "SELECT count(*) FROM parcel_history WHERE county_fips='48113' AND apn=:a"),
+            {"a": row.apn}).scalar()
+    assert after == before, (
+        f"an unchanged re-sync must write no history, went {before} -> {after}")
+    print(f"PASS: an unchanged re-sync writes no history row ({before} stays {after})")
+
+
 if __name__ == "__main__":
     test_classify_wrong_boundary_method_raises()
     test_resolve_subdivision_plat_tract_per_tract_reference()
@@ -690,3 +768,5 @@ if __name__ == "__main__":
     test_negligible_overlap_live_covid_8245()
     print("\nall classifier smoke tests passed")
     test_dallas_uses_current_geometry_not_the_2019_snapshot()
+    test_superseded_parcel_geometry_is_kept_not_overwritten()
+    test_unchanged_resync_writes_no_history()

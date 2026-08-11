@@ -175,7 +175,91 @@ def upsert_covenant_document(session, relpath: str, covid: int, doc_type: str,
 def upsert_parcel(session, county_fips: str, apn: str, owner_name_raw: str | None,
                    situs_address: str | None, acreage: float | None, geojson: dict | None,
                    source_id: int | None, city: str | None = None, zip_code: str | None = None,
-                   recited_legal_description: str | None = None) -> None:
+                   recited_legal_description: str | None = None,
+                   geometry_vintage: str | None = None) -> None:
+    """Upsert a parcel, SNAPSHOTTING the outgoing row into parcel_history first
+    whenever geometry, acreage or owner actually changed.
+
+    A superseded boundary is evidence, not garbage. Dallas's 2019 layer put 6,001
+    sq ft of covid 4956's land in the neighbouring parcel; current CAD geometry
+    assigns it to the covenanted one. The DIFFERENCE is the record of a 2017
+    conveyance reaching the parcel fabric, and a covenant runs with the land -- so
+    which land was encumbered WHEN is the substance of the job, not metadata.
+    Overwriting in place destroyed the only evidence a boundary had moved at all.
+
+    Only real changes are recorded. An unchanged re-sync writes no history row, so
+    the table stays a record of what happened rather than a log of how often the
+    pipeline ran. Geometry equality is ST_OrderingEquals, deliberately strict:
+    ST_Equals treats a re-noded but spatially identical polygon as unchanged,
+    which is true geometrically and false as provenance -- the vertices came from
+    a different published layer and that is worth keeping.
+    """
+    # NEVER let older geometry overwrite current geometry. A multi-layer adapter
+    # falls back to its archival layer when the current one has no row for an
+    # account, and without this guard the parcel flaps between vintages on
+    # successive syncs -- each flap writing a 'replat' history row for a boundary
+    # that never moved, and leaving whichever ran last in charge of the answer.
+    # Observed exactly that on Dallas 24049800010010100 during a test run.
+    #
+    # An adapter that reports NO vintage is not "older": single-layer counties
+    # pass None and their one layer IS current. Only an explicit archival label
+    # loses to a stored 'current'.
+    if geometry_vintage not in (None, "current"):
+        stored_vintage = session.execute(
+            text("SELECT geometry_vintage FROM parcel WHERE county_fips = :c AND apn = :a"),
+            {"c": county_fips, "a": apn},
+        ).scalar()
+        if stored_vintage == "current":
+            geojson, acreage, geometry_vintage = None, None, stored_vintage
+
+    # Snapshot BEFORE the upsert, in the same transaction, so a crash cannot
+    # leave new geometry with no record of what it replaced.
+    session.execute(
+        text("""
+            INSERT INTO parcel_history (county_fips, apn, captured_at, owner_name_raw, acreage,
+                                        geom, change_reason, source_id)
+            SELECT p.county_fips, p.apn, now(), p.owner_name_raw, p.acreage, p.geom,
+                   -- change_reason is a CODED vocabulary from 0001_initial_schema
+                   -- (initial / replat / ownership_change / monitor_diff), not prose.
+                   -- Geometry moving is the strongest signal and wins: a boundary
+                   -- revision is what 'replat' names, whether the county reached it
+                   -- by an actual replat or by reflecting a conveyance in its fabric.
+                   -- The narrative belongs in the source row, which records exactly
+                   -- which published layer each snapshot came from.
+                   CASE
+                     WHEN (p.geom IS NULL) <> (:geojson IS NULL)
+                          OR (p.geom IS NOT NULL AND :geojson IS NOT NULL
+                              AND NOT ST_OrderingEquals(
+                                  p.geom, ST_SetSRID(ST_GeomFromGeoJSON(:geojson), 4326)))
+                       THEN 'replat'
+                     WHEN p.owner_name_raw IS DISTINCT FROM CAST(:owner_name_raw AS text)
+                       THEN 'ownership_change'
+                     ELSE 'monitor_diff'
+                   END AS change_reason,
+                   p.source_id
+              FROM parcel p
+             WHERE p.county_fips = :county_fips AND p.apn = :apn
+               AND (
+                    (p.geom IS NULL) <> (:geojson IS NULL)
+                 OR (p.geom IS NOT NULL AND :geojson IS NOT NULL
+                     AND NOT ST_OrderingEquals(p.geom,
+                             ST_SetSRID(ST_GeomFromGeoJSON(:geojson), 4326)))
+                 -- Compared at the COLUMN'S OWN SCALE. parcel.acreage is
+                 -- numeric(12,3), so storing 0.9045038901 keeps 0.905; comparing
+                 -- that against the next sync's unrounded 0.9045038901 is always
+                 -- "different" and every re-sync wrote a spurious history row.
+                 -- Caught by watching the row count go 3 -> 6 on an unchanged
+                 -- re-sync: history has to record what happened to the land, not
+                 -- how often the pipeline ran.
+                 OR p.acreage IS DISTINCT FROM CAST(:acreage AS numeric(12,3))
+                 OR p.owner_name_raw IS DISTINCT FROM CAST(:owner_name_raw AS text)
+               )
+            ON CONFLICT (county_fips, apn, captured_at) DO NOTHING
+        """),
+        {"county_fips": county_fips, "apn": apn, "acreage": acreage,
+         "owner_name_raw": owner_name_raw, "geometry_vintage": geometry_vintage,
+         "geojson": json.dumps(geojson) if geojson else None},
+    )
     # recited_legal_description is never overwritten with NULL on a later sync that
     # happens not to carry it (not every adapter/query passes it) -- COALESCE keeps
     # whatever was last actually known, same "don't regress a real fact to unknown"
@@ -183,19 +267,23 @@ def upsert_parcel(session, county_fips: str, apn: str, owner_name_raw: str | Non
     session.execute(
         text("""
             INSERT INTO parcel (county_fips, apn, owner_name_raw, situs_address, city, zip_code, acreage, geom,
-                                 recited_legal_description, last_synced_at, source_id)
+                                 recited_legal_description, geometry_vintage, last_synced_at, source_id)
             VALUES (
                 :county_fips, :apn, :owner_name_raw, :situs_address, :city, :zip_code, :acreage,
-                ST_SetSRID(ST_GeomFromGeoJSON(:geojson), 4326), :recited_legal_description, now(), :source_id
+                ST_SetSRID(ST_GeomFromGeoJSON(:geojson), 4326), :recited_legal_description,
+                :geometry_vintage, now(), :source_id
             )
             ON CONFLICT (county_fips, apn) DO UPDATE SET
                 owner_name_raw = EXCLUDED.owner_name_raw,
                 situs_address = EXCLUDED.situs_address,
                 city = EXCLUDED.city,
                 zip_code = EXCLUDED.zip_code,
-                acreage = EXCLUDED.acreage,
-                geom = EXCLUDED.geom,
+                -- COALESCE so a deliberate decline above (older vintage refused)
+                -- leaves the good values in place instead of nulling them.
+                acreage = COALESCE(EXCLUDED.acreage, parcel.acreage),
+                geom = COALESCE(EXCLUDED.geom, parcel.geom),
                 recited_legal_description = COALESCE(EXCLUDED.recited_legal_description, parcel.recited_legal_description),
+                geometry_vintage = COALESCE(EXCLUDED.geometry_vintage, parcel.geometry_vintage),
                 last_synced_at = now(),
                 source_id = EXCLUDED.source_id
         """),
@@ -204,6 +292,7 @@ def upsert_parcel(session, county_fips: str, apn: str, owner_name_raw: str | Non
             "situs_address": situs_address, "city": city, "zip_code": zip_code, "acreage": acreage,
             "geojson": json.dumps(geojson) if geojson else None, "source_id": source_id,
             "recited_legal_description": recited_legal_description,
+            "geometry_vintage": geometry_vintage,
         },
     )
 

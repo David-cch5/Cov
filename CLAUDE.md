@@ -84,6 +84,35 @@ deliberate override. Do the work only on specific instruction.
   no-conveyance statement) does NOT make it historic either: that is precisely the case where
   the covenant may still be live, so skipping research there would assume the answer.
 
+## A superseded parcel layer is EVIDENCE — keep it, don't replace it
+A covenant runs with the land, so which land was encumbered **when** is the substance of
+the job. When a county republishes its parcel fabric and a boundary moves, the difference
+between the old geometry and the new one is the record of a conveyance reaching the fabric —
+not a data-quality defect to overwrite. Confirmed real on covid 4956: Dallas's
+`Tax_Parcels_2019` put 6,001 sq ft in the neighbouring parcel; current CAD geometry assigns
+it to the covenanted one, reflecting a 2017 conveyance. On the stale geometry the covenant
+looked as though it encumbered someone else's land, and the neighbour looked partially
+encumbered. On current geometry the parcel matches the deed's stated acreage to **0.3 sq ft**.
+- `parcel` holds current geometry, tagged `geometry_vintage`; superseded geometry goes to
+  `parcel_history` (which existed unused since the initial schema), snapshotted by
+  `upsert_parcel` **only when geometry, acreage or owner actually changed** — history records
+  what happened to the land, not how often the pipeline ran. Compare at the column's own
+  scale: `acreage` is `numeric(12,3)`, and comparing a stored `0.905` against an incoming
+  unrounded `0.9045038…` made every re-sync look like a change.
+- A retired layer stays registered in `county_gis_registry.superseded_layers` and stays
+  queryable — it is still published, and Dallas is still **read** from the 2019 layer for
+  owner/legal/address, which the current geometry layer does not carry.
+- **Never let an older vintage overwrite `current`.** A multi-layer adapter falls back to its
+  archival layer when the current one has no row for an account, and without that guard the
+  parcel flaps between vintages, writing a `replat` history row each time for a boundary that
+  never moved. An adapter reporting NO vintage is not "older" — single-layer counties pass
+  none and their one layer is current.
+- `scripts/audit_gis_layer_vintage.py --record` audits every registered layer. As of
+  2026-08-11: 11 counties current, Dallas split (current geometry + 2019 attributes), and
+  **Travis `unverifiable`** — it publishes neither `editingInfo` nor any vintage field, so it
+  is reported as unverifiable rather than assumed current. Verify a Travis parcel against a
+  known figure before trusting acreage there.
+
 ## Non-negotiables
 - **Accuracy over completeness.** Every covenant passes a reconciliation check before it is
   considered done: classified acreage must reconcile with the covenant's stated acreage, and

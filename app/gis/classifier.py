@@ -148,6 +148,12 @@ def resolve_subdivision_plat_tract(session, covid: int, tract_no: int = 1) -> di
             situs_address=p["situs_address"], city=p.get("city"), zip_code=p.get("zip_code"),
             acreage=p["acreage"], geojson=p["geojson"], source_id=gis_source_id,
             recited_legal_description=p.get("recited_legal_description"),
+            # Adapters that read more than one published layer report which one
+            # this geometry came from (app/gis/adapters/dallas_tx.py does; most
+            # counties have a single current layer and report nothing). Passed
+            # through as provenance, and it is what triggers a parcel_history
+            # snapshot when a county's fabric moves under us.
+            geometry_vintage=p.get("geometry_vintage"),
         )
         apns.append(p["apn"])
 
@@ -276,6 +282,12 @@ def classify_metes_and_bounds_tract(session, covid: int, tract_no: int = 1) -> d
             situs_address=p["situs_address"], city=p.get("city"), zip_code=p.get("zip_code"),
             acreage=p["acreage"], geojson=p["geojson"], source_id=gis_source_id,
             recited_legal_description=p.get("recited_legal_description"),
+            # Adapters that read more than one published layer report which one
+            # this geometry came from (app/gis/adapters/dallas_tx.py does; most
+            # counties have a single current layer and report nothing). Passed
+            # through as provenance, and it is what triggers a parcel_history
+            # snapshot when a county's fabric moves under us.
+            geometry_vintage=p.get("geometry_vintage"),
         )
 
     # Confirmed real (covid 4440, a ~2500-candidate bounding box -- the first tract large
