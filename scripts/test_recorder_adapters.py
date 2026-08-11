@@ -19,19 +19,34 @@ sys.path.insert(0, ".")
 from app.recorder.diagnose import check_corpus_completeness
 from app.recorder.session import recorder_context
 from app.recorder.adapters import publicsearch
-from app.recorder.adapters.publicsearch import _enrich_row_from_legal_description
+from app.recorder.adapters.publicsearch import (
+    RecorderSearchUnanswered,
+    RecorderSearchUnavailable,
+    _enrich_row_from_legal_description,
+    _no_table_verdict,
+)
 
 
 def test_acclaim_ellis() -> None:
     """covid 8386: recorded instrument is 36 images/18 stamped pages; our
-    local PDF has 11. This is the exact finding that resolved the covenant."""
+    local PDF has 11. This is the exact finding that resolved the covenant.
+
+    Expects 18, not the 36 asserted when this test was written. Ellis's own
+    "Number Of Pages" field said 36 then and says 18 now -- it switched from
+    counting viewer IMAGES to counting stamped PAGES, and the viewer duplicates
+    every physical page across two consecutive image indices (see
+    acclaim.get_page_image_bytes). 18 is therefore the number this project had
+    already established by hand, verified against the live detail page on
+    2026-08-11, and the more meaningful one to assert. The finding it supports is
+    unchanged either way: 11 local pages against 18 recorded is a real gap."""
     result = check_corpus_completeness(
         local_pages=11, vendor="acclaim_harris_recording_solutions",
         base_url="https://ellisccktxpublicsearch.us",
         search_name="RED OAK COYOTE RIDGE", instrument_number="1019671",
     )
     assert result["checked"], result
-    assert result["recorder_pages"] == 36, result
+    assert result["recorder_pages"] == 18, result
+    assert result["missing_pages"] == 7, result
     assert result["corpus_gap_suspected"] is True, result
     print("PASS: acclaim (Ellis) ->", result)
 
@@ -63,13 +78,71 @@ def test_publicsearch_montgomery() -> None:
     """covid 4780: AVALON HARBOR II, LP's declaration, doc 2009089679 --
     confirms the adapter works unmodified against Montgomery's instance of
     the same GovOS PublicSearch product (the county the cost probe in
-    BUILD_SPEC.md Section 7 is built around)."""
-    with recorder_context() as context:
-        row = publicsearch.search_by_document_number(context, "https://montgomery.tx.publicsearch.us", "2009089679")
+    BUILD_SPEC.md Section 7 is built around).
+
+    A county-side outage is reported as a SKIP, not a pass and not a failure. On
+    2026-08-11 Montgomery's instance answered "Error While Running Search" to
+    every query, including a bare surname, while Nueces answered the identical
+    URL shape normally -- so the adapter was fine and the county was not. That
+    verdict is only available because the adapter now RAISES on the portal's own
+    error banner instead of returning an empty list, which would have arrived here
+    as "doc 2009089679 does not exist"."""
+    try:
+        with recorder_context() as context:
+            row = publicsearch.search_by_document_number(
+                context, "https://montgomery.tx.publicsearch.us", "2009089679")
+    except RecorderSearchUnanswered as e:
+        print(f"SKIP: publicsearch (Montgomery) -> the county's own portal is not "
+              f"answering searches, so this proves nothing about the adapter: {e}")
+        return
     assert row is not None, "expected to find doc 2009089679"
     assert row.get("DOC TYPE") == "DECLARATION", row
     assert row.get("GRANTOR") == "AVALON HARBOR LP", row
     print(f"PASS: publicsearch (Montgomery) -> found doc 2009089679, {row.get('DOC TYPE')}")
+
+
+def test_portal_error_is_not_read_as_an_empty_result() -> None:
+    """The distinction itself, without a network call: the same missing results
+    table means three different things, and only one of them is "no such
+    document". Before this, all three returned [] -- so a portal outage during a
+    chain walk would have been recorded as a parcel with no recorded documents."""
+    class FakePage:
+        def __init__(self, body): self._body = body
+        def inner_text(self, _sel): return self._body
+
+    assert _no_table_verdict(FakePage("SEARCH RESULTS\nNo Results Found\nEdit Search"),
+                             "https://x", "q") == []
+
+    for body, label in [
+        ("No Results Found\nError While Running Search:\nError with search query",
+         "the live Montgomery page (it says BOTH -- the error must win)"),
+        ("Error with search query", "the bare vendor error"),
+    ]:
+        try:
+            _no_table_verdict(FakePage(body), "https://x", "q")
+        except RecorderSearchUnavailable:
+            pass
+        else:
+            raise AssertionError(f"a portal error must not read as empty: {label}")
+
+    # An unrecognised page is also not evidence of absence.
+    try:
+        _no_table_verdict(FakePage("something else entirely"), "https://x", "q")
+    except RecorderSearchUnanswered:
+        pass
+    else:
+        raise AssertionError("an unrecognised page must not read as empty")
+
+    class DeadPage:
+        def inner_text(self, _sel): raise RuntimeError("page closed")
+    try:
+        _no_table_verdict(DeadPage(), "https://x", "q")
+    except RecorderSearchUnavailable:
+        pass
+    else:
+        raise AssertionError("an unreadable page must not read as empty")
+    print("PASS: only the vendor's own 'No Results Found' reads as an empty result; "
+          "an error, an unknown page and a dead page all raise")
 
 
 def test_enrich_row_from_legal_description() -> None:
@@ -120,5 +193,6 @@ if __name__ == "__main__":
     test_ava_fidlar_kerr()
     test_publicsearch_nueces()
     test_publicsearch_montgomery()
+    test_portal_error_is_not_read_as_an_empty_result()
     test_enrich_row_from_legal_description()
     print("\nall recorder adapter smoke tests passed")

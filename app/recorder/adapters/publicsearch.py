@@ -23,6 +23,65 @@ from playwright.sync_api import BrowserContext
 SEARCH_SCOPE_FULL_TEXT_ID = "withOcr"
 SEARCH_BOX_ID = "basicSearchInputBox"
 
+
+class RecorderSearchUnanswered(Exception):
+    """The portal did not give a usable answer about the documents asked for -- as
+    distinct from answering that there are none.
+
+    Its own exception type for the same reason app/gis/ngs.py has NgsUnanswered:
+    the two outcomes are identical on the page (no results table renders either
+    way) and opposite in meaning. "The portal is down" read as "this parcel has no
+    recorded documents" writes an absence of title into the record as though it
+    were a finding, and app/title/chain.py's walk would proceed to conclude a
+    chain from nothing.
+
+    Raising instead reaches app/queue/job_queue.py's run_with_job_queue, which
+    every caller of this module already goes through: retried across a ~76s
+    window, then recorded as a durable job_queue row a human can see. A county's
+    portal being briefly unavailable is a reason to come back later, never a fact
+    about the land."""
+
+
+class RecorderSearchUnavailable(RecorderSearchUnanswered):
+    """The portal itself reported an error running the search. Transient: retry.
+
+    Confirmed live on 2026-08-11 -- montgomery.tx.publicsearch.us answered
+    "Error While Running Search: Error with search query" to EVERY query,
+    including a bare common surname, while nueces.tx.publicsearch.us answered the
+    identical URL shape normally. Not the date range (every range from 1600 to a
+    single 2009 year errored alike), not a bot gate, and not this adapter: the
+    county's own instance was failing server-side."""
+
+
+# The portal's own error banner. Matched on the vendor's wording rather than on
+# "no table rendered", because a genuine no-results page renders no table either
+# -- which is exactly why the two were indistinguishable before.
+_PORTAL_ERROR = re.compile(r"Error While Running Search|Error with search query", re.I)
+_NO_RESULTS = re.compile(r"No Results Found", re.I)
+
+
+def _no_table_verdict(page, base_url: str, query: str) -> list[dict]:
+    """Decide what a missing results table MEANS, and return [] only for a real
+    empty result. Raises RecorderSearchUnavailable when the portal said it failed."""
+    try:
+        body = page.inner_text("body")
+    except Exception:  # page went away; treat as unavailable, not as "no documents"
+        raise RecorderSearchUnavailable(
+            f"{base_url}: no results table and the page could not be read "
+            f"(query {query!r})") from None
+    if _PORTAL_ERROR.search(body):
+        raise RecorderSearchUnavailable(
+            f"{base_url}: the portal reported an error running the search for "
+            f"{query!r} -- not an answer that no such document exists")
+    if _NO_RESULTS.search(body):
+        return []
+    # Neither the vendor's "no results" wording nor its error wording. Could be a
+    # layout change, could be a slow render. Either way this adapter cannot say
+    # the county holds no matching document, so it does not say so.
+    raise RecorderSearchUnanswered(
+        f"{base_url}: search for {query!r} returned no results table and no "
+        f"recognisable message -- the page may have changed")
+
 # Some counties on this vendor (confirmed: Collin) expose no dedicated
 # SUBDIVISION/LOT/BLOCK columns in the results table at all -- every row jams
 # them into one free-text "LEGAL DESCRIPTION" field instead, e.g.
@@ -92,7 +151,10 @@ def search_by_name(context: BrowserContext, base_url: str, query: str, full_text
         try:
             page.wait_for_selector("table", timeout=20000)
         except Exception:
-            return []  # "No Results Found" -- no table renders at all
+            # No table. That is EITHER a real empty result or the portal failing,
+            # and the difference decides whether a chain walk records "no
+            # documents" as a fact -- so it is not guessed here.
+            return _no_table_verdict(page, base_url, query)
         page.wait_for_timeout(500)  # table exists before all rows finish populating
         return _parse_results_table(page)
     finally:
@@ -140,7 +202,9 @@ def search_plats_by_subdivision(context: BrowserContext, base_url: str, subdivis
         try:
             page.wait_for_selector("table", timeout=20000)
         except Exception:
-            return []  # "No Results Found" -- no plat found under this name, not an error
+            # Same distinction as search_by_name: a missing plat and a broken
+            # portal look alike, and only one of them means "no plat exists".
+            return _no_table_verdict(page, base_url, subdivision_name)
         page.wait_for_timeout(500)
         return _parse_results_table(page)
     finally:
