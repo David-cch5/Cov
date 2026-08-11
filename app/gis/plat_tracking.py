@@ -212,17 +212,27 @@ def resolve_plats_for_tract(session, covid: int, tract_no: int) -> dict:
         else:
             parsed[p.apn] = ref
 
-    platted_by_subdivision: dict[str, list[str]] = {}
-    for apn, ref in parsed.items():
-        if ref.platted:
-            platted_by_subdivision.setdefault(ref.subdivision_name, []).append(apn)
-
-    # Searches are deduplicated by the QUERY, not by the recited string: four
-    # Collin spellings of one subdivision are one search, and asking four times
-    # wrote the same nine plats four times over.
+    # THE SEARCH SET COMES FROM THE RECITATION, through the same parser that does
+    # the matching. It used to come from parse_plat_reference's derived
+    # subdivision_name, which is a chain of shape-anchored regexes fitted to
+    # Montgomery's CAD -- it rewrote "PALMILLA BEACH P.U.D. UNIT 7 BLK 2 LOT 9" to
+    # "PALMILLA BEACH BLK 2" and returned nothing at all for shapes it did not
+    # recognise. Whole subdivisions inside a tract were therefore never searched:
+    # SUNFLOWER BEACH, LAGUNA ISLES, LA JOYA DE ISLAND MOORINGS and four
+    # condominium projects, ~200 parcels, silently absent from the worklist rather
+    # than reported as unfound.
+    #
+    # One parser for searching and matching is the point. Two parsers drift, and
+    # when they do the failure is invisible: the search asks for a name the matcher
+    # will never produce, so nothing matches and nothing looks broken.
     queries: dict[str, list[str]] = {}
-    for recited in platted_by_subdivision:
-        queries.setdefault(plat_search_name(recited) or recited, []).append(recited)
+    for p in parcels:
+        own = parse_subdivision_and_section(p.recited_legal_description)
+        if not own["plattable"]:
+            continue
+        query = plat_search_name(p.recited_legal_description)
+        if query:
+            queries.setdefault(query, []).append(p.apn)
 
     # Compared on collapsed names as well, or a plat already held under its
     # collapsed name would be re-searched on every single run.

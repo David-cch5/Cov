@@ -138,7 +138,11 @@ _SECTION_PATTERNS = (
     # The colon matters: this vendor titles a plat "PALMILLA BEACH P U D Unit: 6A",
     # and requiring whitespace after UNIT read no section there -- so every
     # unit-specific search found its plat and then discarded it.
-    re.compile(r"\bUNIT\s*:?\s*(\d{1,3}[A-Z]?)\b", re.I),
+    # "UNIT IH" is OCR for UNIT 1H -- 11 Nueces parcels recite it, and this project
+    # already holds the real 1H plat (recorded 2013-06-28). CLAUDE.md's rule for this
+    # corpus is to treat a near-miss as the same feature until GIS proves otherwise,
+    # and a leading capital I where a digit belongs is the commonest such slip.
+    re.compile(r"\bUNIT\s*:?\s*((?:\d{1,3}|I)[A-Z]?)\b", re.I),
     # Montgomery's trailing section, which carries a letter suffix far more often
     # than not: "Harrington Trails 06B", "05B", "4A". Without the optional letter
     # this read no section at all, and a sectionless parcel then matched the
@@ -165,6 +169,13 @@ def _section_token(raw: str) -> str:
     parcel reports should read the same whichever county recited it.
     """
     value = raw.strip().upper()
+    # "IH" -> "1H": a leading I standing in for 1, ahead of the roman lookup, which
+    # would otherwise leave it alone (I is roman for 1 but IH is not roman at all).
+    # I, V and X are excluded from the second position or this would eat real roman
+    # numerals: IV is 4 and IX is 9, not "1V" and "1X".
+    m = re.fullmatch(r"I([A-HJ-UWYZ])", value)
+    if m:
+        return f"1{m.group(1)}"
     if value in _ROMAN:
         return _ROMAN[value]
     parts = value.split()
@@ -440,6 +451,29 @@ def plat_matches_parcel(parsed: dict, plat_row: dict) -> bool:
     return _sections_match(parsed["section"], plat_row["section"])
 
 
+def choose_plats_for_parcel(parsed: dict, candidates: list[dict]) -> list[dict]:
+    """Every held plat that could have created this parcel, narrowed by specificity.
+
+    Returns a list so the caller can still refuse an ambiguity: one row means one
+    answer, several means the question is genuinely open and no link is written.
+
+    THE MORE SPECIFIC FILING WINS, and that is a rule rather than a guess. A parcel
+    can match both the plat that created its PHASE and a later replat that names its
+    own LOT -- Nueces parcel 528941, "PALMILLA BEACH UNIT 1B BLK 6 LOT 31A1", matches
+    unit 1B (platted 2014-04-02) and the replat of lot 31A1 block 6 (2018-12-11), and
+    "31A1" is itself a replat designation. Both statements are true; only the one
+    naming the lot answers when THIS parcel came into existence. Two lot-specific
+    rows matching one parcel remains an ambiguity and is still refused.
+
+    The selection lives here, once, because scripts/test_plat_link.py cross-checks
+    every link against it -- and a checker holding its own copy of the rule has twice
+    this session reported correct links as disagreements the moment the real rule
+    moved."""
+    matches = [pl for pl in candidates if plat_matches_parcel(parsed, pl)]
+    lot_specific = [pl for pl in matches if (pl.get("lot") or "")]
+    return lot_specific or matches
+
+
 def _candidate_plats(session, county_fips: str) -> list[dict]:
     rows = session.execute(text("""
         SELECT plat_id, subdivision_name, section, lot, block,
@@ -509,8 +543,7 @@ def link_parcels_to_plats(session, county_fips: str | None = None,
         if r.county_fips not in plats_by_county:
             plats_by_county[r.county_fips] = _candidate_plats(session, r.county_fips)
 
-        matches = [pl for pl in plats_by_county[r.county_fips]
-                   if plat_matches_parcel(parsed, pl)]
+        matches = choose_plats_for_parcel(parsed, plats_by_county[r.county_fips])
         if not matches:
             no_plat_held += 1
             continue

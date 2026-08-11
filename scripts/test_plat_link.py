@@ -138,7 +138,7 @@ def test_matcher_agrees_with_the_independent_subdivision_plat_path() -> None:
     re-deriving those links here is a genuine cross-check, and a disagreement means
     one of the two paths is wrong -- which must fail loudly rather than silently
     overwrite, since these links carry formation dates."""
-    from app.gis.plat_link import _candidate_plats, plat_matches_parcel
+    from app.gis.plat_link import _candidate_plats, choose_plats_for_parcel
 
     with get_session() as session:
         rows = session.execute(text("""
@@ -154,9 +154,12 @@ def test_matcher_agrees_with_the_independent_subdivision_plat_path() -> None:
                 declined += 1  # plat reserves: linked by the other path, not by this one
                 continue
             plats.setdefault(r.county_fips, _candidate_plats(session, r.county_fips))
-            # The module's OWN matcher, not a copy of it: a duplicated comparison
-            # here went stale and reported 84 correct links as disagreements.
-            matches = [q for q in plats[r.county_fips] if plat_matches_parcel(parsed, q)]
+            # The module's OWN selection, not a copy of it. A duplicated comparison
+            # here went stale twice today -- once when the real matcher learned to
+            # ignore connector words, once when it learned that a lot-specific replat
+            # outranks a phase plat -- and both times this reported correct links as
+            # disagreements.
+            matches = choose_plats_for_parcel(parsed, plats[r.county_fips])
             assert len(matches) == 1 and matches[0]["plat_id"] == r.plat_id, (
                 f"parcel {r.apn} ({r.county_fips}) {r.legal!r} is linked to plat "
                 f"{r.plat_id} but this matcher derives "
@@ -235,6 +238,33 @@ def test_a_plat_that_created_one_lot_is_matched_by_that_lot() -> None:
         "lot": None, "block": None, "lots": [], "indeterminate": False}
     print("PASS: a single-lot replat matches its own lot+block; a lot range, an "
           "'ET AL' and an 'N/A' are all refused")
+
+
+def test_the_more_specific_filing_wins() -> None:
+    """A parcel can match both the plat that created its PHASE and a later replat
+    naming its own LOT. Both are true; only one says when THIS parcel came into
+    existence. Confirmed real on Nueces parcel 528941, "PALMILLA BEACH UNIT 1B BLK 6
+    LOT 31A1": unit 1B was platted 2014-04-02, and lot 31A1 of block 6 was replatted
+    2018-12-11 -- and "31A1" is itself a replat designation."""
+    parcel = parse_subdivision_and_section("PALMILLA BEACH UNIT 1B BLK 6 LOT 31A1")
+    phase = {"plat_id": 1, "subdivision_name": "PALMILLA BEACH", "section": "1B",
+             "lot": "", "block": ""}
+    lot_replat = {"plat_id": 2, "subdivision_name": "PALMILLA BEACH", "section": "",
+                  "lot": "31A1", "block": "6"}
+    assert plat_matches_parcel(parcel, phase) and plat_matches_parcel(parcel, lot_replat)
+
+    with get_session() as session:
+        row = session.execute(text("""
+            SELECT p.plat_id, pl.lot, pl.recording_date FROM parcel p
+              JOIN plat pl ON pl.plat_id = p.plat_id
+             WHERE p.county_fips = '48355' AND p.apn = '528941'
+        """)).fetchone()
+    assert row is not None and row.lot == "31A1", (
+        f"parcel 528941 must be dated by the filing naming its own lot, got {row}")
+    assert str(row.recording_date) == "2018-12-11", row
+    print(f"PASS: a lot-specific replat outranks the phase plat -- parcel 528941 dated "
+          f"{row.recording_date} by the filing that names lot {row.lot}, not by its "
+          f"phase's 2014 plat")
 
 
 def test_a_condominium_unit_is_not_a_phase() -> None:
@@ -385,6 +415,7 @@ if __name__ == "__main__":
     test_collapsed_search_name_and_the_directional_filter()
     test_a_plat_that_created_one_lot_is_matched_by_that_lot()
     test_a_condominium_unit_is_not_a_phase()
+    test_the_more_specific_filing_wins()
     test_matcher_agrees_with_the_independent_subdivision_plat_path()
     test_dry_run_is_the_default_and_reports_what_it_would_do()
     test_reported_count_equals_rows_actually_written()
