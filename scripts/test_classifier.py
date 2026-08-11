@@ -639,6 +639,40 @@ def test_negligible_overlap_live_covid_8245() -> None:
           f"square-centimetre touches as negligible_overlap_parcels ({neg})")
 
 
+def test_dallas_uses_current_geometry_not_the_2019_snapshot() -> None:
+    """The 2019 Dallas layer is not merely old, it is wrong about boundaries that
+    have since moved, by enough to change an answer. On covid 4956's own parcels
+    the two layers disagree by +/-6,001 sq ft, swapped between neighbours:
+
+        parcel                      2019 AREA_FEET   current   delta
+        24123500010140000 (SSM)             37,154    43,155   +6,001
+        24049800010010100 (CONLON)          45,401    39,400   -6,001
+
+    On the 2019 geometry the deed's tract overhung the neighbour by 0.1381 ac and
+    the covenant looked as though it encumbered someone else's land. On current
+    geometry the parcel measures 43,154.6 sq ft against the deed's stated 43,154.9
+    -- 0.3 sq ft -- and the overlap with the neighbour is 14 sq ft.
+    """
+    from app.gis.adapters.dallas_tx import iter_parcels
+
+    rows = {r["apn"]: r for r in iter_parcels(
+        where="ACCT IN ('24123500010140000','24049800010010100')")}
+    if not rows:
+        print("SKIP: Dallas parcel services unreachable")
+        return
+    ssm = rows.get("24123500010140000")
+    assert ssm, sorted(rows)
+    assert ssm["geometry_vintage"] == "current", (
+        f"geometry must come from the current layer, got {ssm['geometry_vintage']!r}")
+    sqft = ssm["acreage"] * 43560
+    assert abs(sqft - 43154.9) < 50, (
+        f"current geometry must match the deed's stated 43,154.9 sq ft, got {sqft:,.0f}")
+    assert "METROPOLITAN COMMERCIAL PARK" in (ssm["recited_legal_description"] or ""), ssm
+    assert ssm["lot"] == "14", ssm["lot"]
+    print(f"PASS: Dallas parcel geometry is current -- {sqft:,.0f} sq ft against the deed's "
+          f"43,155, attributes still joined from the 2019 layer (lot {ssm['lot']})")
+
+
 if __name__ == "__main__":
     test_classify_wrong_boundary_method_raises()
     test_resolve_subdivision_plat_tract_per_tract_reference()
@@ -655,3 +689,4 @@ if __name__ == "__main__":
     test_detect_negligible_overlap_parcels()
     test_negligible_overlap_live_covid_8245()
     print("\nall classifier smoke tests passed")
+    test_dallas_uses_current_geometry_not_the_2019_snapshot()

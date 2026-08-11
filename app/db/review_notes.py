@@ -109,15 +109,26 @@ def merge_tagged_note(review_reason: str | None, tag: str, note: str | None = No
 RECORD_ONLY_TAGS = (
     "ANCHOR RESOLVED",
     "RE-VERIFIED",
+    # A SUMMARY of what the encumbered land is, and a record that a parcel was
+    # deliberately excluded. Both describe completed work by their own names.
+    "ENCUMBERED LAND SUMMARY",
+    "NON-TRACT PARCEL EXCLUSION",
 )
 
-# ENCUMBERED LAND SUMMARY is deliberately NOT here, though it started as a
-# summary and reads like one. On covid 4956 it was the natural place to record an
-# open question -- 0.1381 ac of the tract lying inside a parcel that may be
-# partially encumbered, unresolved until a plat is read -- and a tag that can
-# carry either a record or a concern has to count as a concern. Being wrong in
-# that direction leaves a covenant flagged for a human; being wrong the other way
-# marks encumbered land finished.
+# AN OPEN QUESTION MUST NOT BE HIDDEN INSIDE A SUMMARY. I put one there on covid
+# 4956 -- "this parcel may be partially encumbered, read the plat to settle it" --
+# under ENCUMBERED LAND SUMMARY, and then had to treat the whole tag as a concern
+# to stop it being ignored. That made every summarised covenant permanently
+# unfinishable, which is the wrong trade: a summary is provenance, and provenance
+# that blocks completion is not provenance.
+#
+# So the separation is by what a tag MEANS, not by what someone happened to write
+# under it. Records summarise or attest. Anything outstanding goes under a tag
+# that says so -- a stage tag (RECONCILIATION-STAGE, CLASSIFY_PARCELS-STAGE, which
+# the stage itself clears when the concern resolves), CHAIN-OF-TITLE GAP,
+# GEOMETRY DATA QUALITY, NEGLIGIBLE OVERLAP -- none of which are listed above, so
+# an unrecognised tag still counts as a concern and the safe direction stays the
+# default.
 
 
 def strip_record_only_notes(review_reason: str | None) -> str:
