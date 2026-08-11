@@ -123,6 +123,26 @@ def _sections_still_missing(session, county_fips: str,
     return list(wanted)
 
 
+def _plat_row_identity(row: dict) -> str:
+    """The text on an index row that names the subdivision it plats.
+
+    A PLAT is a dedication: its GRANTOR is the subdivision and its GRANTEE is
+    "PUBLIC". So for the filing that platted PALMILLA BEACH PUD UNIT 7 (doc
+    2024040337, recorded 2024-11-25) the index carries GRANTOR "PALMILLA BEACH PUD
+    UNIT 7", no subdivision column at all, and LEGAL DESCRIPTION "READ GENERAL
+    NOTES" -- a pointer to the plat sheet rather than a description.
+
+    Every filter here used to read SUBDIVISION and LEGAL DESCRIPTION only, so that
+    row looked nameless and was discarded, and this project then reported the plat
+    as not existing. GRANTOR is consulted last, so a county that populates a real
+    subdivision column still wins."""
+    for key in ("SUBDIVISION", "LEGAL DESCRIPTION", "GRANTOR"):
+        value = (row.get(key) or "").strip()
+        if value and value.upper() not in ("N/A", "NONE", "READ GENERAL NOTES"):
+            return value
+    return ""
+
+
 def _row_is_for(row: dict, query: str) -> bool:
     """Keep this index row for the subdivision we searched?
 
@@ -135,8 +155,8 @@ def _row_is_for(row: dict, query: str) -> bool:
     A row that DOES carry a name must match it, which is what stops a broadened
     query from dragging in a neighbour (see plat_row_matches_query).
     """
-    name = row.get("SUBDIVISION") or row.get("LEGAL DESCRIPTION")
-    if not name or not str(name).strip() or str(name).strip().upper() in ("N/A", "NONE"):
+    name = _plat_row_identity(row)
+    if not name:
         return True
     return plat_row_matches_query(name, query)
 
@@ -328,8 +348,7 @@ def resolve_plats_for_tract(session, covid: int, tract_no: int) -> dict:
                 # extract_phase_key_from_text does not read. plat_link's parser
                 # does, and it is the same parser the parcel side is read with, so
                 # both ends of the match speak one vocabulary.
-                section = parse_subdivision_and_section(
-                    r.get("SUBDIVISION") or r.get("LEGAL DESCRIPTION"))["section"]
+                section = parse_subdivision_and_section(_plat_row_identity(r))["section"]
             if section is None:
                 continue
             by_section.setdefault(section, []).append(r)
@@ -378,8 +397,7 @@ def resolve_plats_for_tract(session, covid: int, tract_no: int) -> dict:
                 payload={"base_url": base_url, "searched_as": phrasing,
                          "for_section": wanted_section})
             hits = [r for r in rows
-                    if parse_subdivision_and_section(
-                        r.get("SUBDIVISION") or r.get("LEGAL DESCRIPTION") or "")["section"]
+                    if parse_subdivision_and_section(_plat_row_identity(r))["section"]
                     == wanted_section
                     and _parse_slash_date(r.get("RECORDED DATE")) is not None
                     and (r.get("FILE NUMBER") or r.get("DOC NUMBER"))]

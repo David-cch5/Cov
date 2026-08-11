@@ -21,6 +21,7 @@ sys.path.insert(0, ".")
 from sqlalchemy import text
 
 from app.db.session import get_session
+from app.gis.plat_link import parse_subdivision_and_section
 from app.gis.plat_tracking import platting_timeline
 
 
@@ -96,6 +97,48 @@ def test_persisted_plat_resolution_covid_4440() -> None:
           "subdivisions correctly flagged rather than guessed")
 
 
+def test_a_plat_is_identified_by_its_grantor_when_nothing_else_names_it() -> None:
+    """A PLAT is a dedication to the public, so the index puts the subdivision in
+    GRANTOR, "PUBLIC" in GRANTEE, and often a pointer like "READ GENERAL NOTES"
+    where a legal description would go.
+
+    Confirmed on the real filing for PALMILLA BEACH PUD UNIT 7, doc 2024040337
+    recorded 2024-11-25. Every filter in this module used to read SUBDIVISION and
+    LEGAL DESCRIPTION only, so that row looked nameless, was discarded, and the plat
+    was reported as not existing -- while 143 parcels reciting unit 7 sat undated."""
+    from app.gis.plat_tracking import _plat_row_identity, _row_is_for
+
+    plat_row = {"DOC NUMBER": "2024040337", "DOC TYPE": "PLAT",
+                "GRANTOR": "PALMILLA BEACH PUD UNIT 7", "GRANTEE": "PUBLIC",
+                "LEGAL DESCRIPTION": "READ GENERAL NOTES", "RECORDED DATE": "11/25/2024"}
+    assert _plat_row_identity(plat_row) == "PALMILLA BEACH PUD UNIT 7"
+    assert _row_is_for(plat_row, "PALMILLA BEACH"), "it must survive the query filter"
+    parsed = parse_subdivision_and_section(_plat_row_identity(plat_row))
+    assert (parsed["subdivision"], parsed["section"]) == ("PALMILLA BEACH PUD", "7"), parsed
+
+    # A county that DOES populate a subdivision column still wins over GRANTOR.
+    assert _plat_row_identity({"SUBDIVISION": "STAR TRAIL #5 PROSPER",
+                               "GRANTOR": "SOME DEVELOPER LP"}) == "STAR TRAIL #5 PROSPER"
+    # And a pointer is not an identity.
+    assert _plat_row_identity({"LEGAL DESCRIPTION": "READ GENERAL NOTES"}) == ""
+    assert _plat_row_identity({"LEGAL DESCRIPTION": "N/A", "GRANTOR": "FOO RANCH UNIT 2"}) \
+        == "FOO RANCH UNIT 2"
+
+    with get_session() as session:
+        row = session.execute(text("""
+            SELECT pl.recording_instrument, pl.recording_date,
+                   count(p.apn) FILTER (WHERE p.plat_id = pl.plat_id) AS parcels
+              FROM plat pl LEFT JOIN parcel p ON p.plat_id = pl.plat_id
+             WHERE pl.county_fips = '48355' AND pl.section = '7'
+             GROUP BY 1, 2
+        """)).fetchone()
+    assert row is not None and row.recording_instrument == "2024040337", row
+    assert str(row.recording_date) == "2024-11-25", row
+    assert row.parcels >= 140, f"unit 7's own parcels should be dated by it, got {row.parcels}"
+    print(f"PASS: a plat found by its GRANTOR -- doc 2024040337 (2024-11-25) dates "
+          f"{row.parcels} unit-7 parcels that were reported unfindable")
+
+
 def test_platting_timeline_tract1_starts_with_harrington_2020() -> None:
     """Tract I's real timeline: raw at the covenant's own 2009 recording,
     completely untouched by any plat until Harrington Trails Section 1
@@ -142,6 +185,7 @@ def test_platting_timeline_tract2_starts_with_townsend_2022() -> None:
 
 if __name__ == "__main__":
     test_persisted_plat_resolution_covid_4440()
+    test_a_plat_is_identified_by_its_grantor_when_nothing_else_names_it()
     test_platting_timeline_tract1_starts_with_harrington_2020()
     test_platting_timeline_tract2_starts_with_townsend_2022()
     print("\nall plat_tracking smoke tests passed")
