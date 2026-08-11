@@ -122,19 +122,23 @@ _TRAILING_OUT_OF = re.compile(r"\s+OUT(\s+OF)?$", re.I)
 # A section/phase, however the county writes it. Checked in this order so
 # "PHASE 2A" wins over the bare-number rule.
 _SECTION_PATTERNS = (
-    re.compile(r"\b(?:PHASE|PH)\s*([0-9]+[A-Z]?|[IVX]+)\b", re.I),
+    re.compile(r"\b(?:PHASE|PH)\s*:?\s*([0-9]+[A-Z]?|[IVX]+)\b", re.I),
     # Collin spells its phases out -- "STAR TRAIL PHASE ONE B" is section 1B, and
     # Collin's own plat rows call it "1B". 1,085 parcels across Collin and Denton
     # write a section this way, and reading none of them is the exact setup for the
     # sectionless-match overwrite. The trailing single letter is part of the
     # section, not the start of the next word: [A-Z]\b cannot match the W of WEST.
-    re.compile(r"\b(?:PHASE|PH|SECTION|SEC)\s+"
+    re.compile(r"\b(?:PHASE|PH|SECTION|SEC)\s*:?\s+"
                r"((?:ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE|TEN|ELEVEN|TWELVE)"
                r"(?:\s+[A-Z]\b)?)", re.I),
     # Roman numerals on this pattern too, not just on PHASE. "SECTION III" read as
     # NO section, and an unread section is precisely what let 680 lots match a
     # sectionless plat -- the two spellings must not have two different readers.
-    re.compile(r"\b(?:SECTION|SEC)\s*([0-9]+[A-Z]?|[IVX]+)\b", re.I),
+    re.compile(r"\b(?:SECTION|SEC)\s*:?\s*([0-9]+[A-Z]?|[IVX]+)\b", re.I),
+    # The colon matters: this vendor titles a plat "PALMILLA BEACH P U D Unit: 6A",
+    # and requiring whitespace after UNIT read no section there -- so every
+    # unit-specific search found its plat and then discarded it.
+    re.compile(r"\bUNIT\s*:?\s*(\d{1,3}[A-Z]?)\b", re.I),
     # Montgomery's trailing section, which carries a letter suffix far more often
     # than not: "Harrington Trails 06B", "05B", "4A". Without the optional letter
     # this read no section at all, and a sectionless parcel then matched the
@@ -143,7 +147,6 @@ _SECTION_PATTERNS = (
     re.compile(r"\s(\d{1,2}[A-Z]?)$", re.I),
     # Nueces' UNIT, read as the section it is -- checked last so a county that
     # writes both ("PALMILLA BEACH PUD UNIT 2") still prefers PHASE/SECTION.
-    re.compile(r"\bUNIT\s+(\d{1,3}[A-Z]?)\b", re.I),
 )
 
 _ROMAN = {"I": "1", "II": "2", "III": "3", "IV": "4", "V": "5", "VI": "6",
@@ -188,6 +191,9 @@ def normalize_subdivision(name: str) -> str:
     # "ST. JOHN" as "ST JOHN", because the space after the period is its own
     # character.
     out = out.replace(".", "")
+    # "P U D" is one designation spelled with spaces. Nueces writes all three of
+    # "PALMILLA BEACH P.U.D.", "PALMILLA BEACH PUD" and "PALMILLA BEACH P U D".
+    out = re.sub(r"\bP\s+U\s+D\b", "PUD", out, flags=re.I)
     out = re.sub(r"[,'&]", " ", out)
     out = re.sub(r"\s+", " ", out).strip()
     out = re.sub(r"\s+THE$", "", out)
@@ -212,7 +218,7 @@ def parse_subdivision_and_section(legal: str | None) -> dict:
     """
     if not legal or not legal.strip():
         return {"plattable": False, "reason": "no recited legal description",
-                "subdivision": None, "section": None}
+                "subdivision": None, "section": None, "legal": legal}
 
     # Abstract check BEFORE stripping the account code: Montgomery's own code
     # looks exactly like an abstract number ("A0494 - Walker Co Sch L"), so
@@ -240,6 +246,16 @@ def parse_subdivision_and_section(legal: str | None) -> dict:
                 "subdivision": None, "section": None}
 
     section = None
+    if _CONDOMINIUM.search(head):
+        # A condominium's unit is neither a section nor part of the name: the
+        # declaration and its plat cover the whole building, and every unit in it
+        # was created by that one filing. So the unit is dropped and the
+        # subdivision is left sectionless, which is what actually matches.
+        head = re.sub(r"\s*UNIT\s*:?\s*\S+.*$", "", head, flags=re.I).strip()
+        subdivision = normalize_subdivision(head)
+        return {"plattable": bool(subdivision), "reason": None if subdivision else
+                f"condominium with no name in {legal[:48]!r}",
+                "subdivision": subdivision or None, "section": None, "legal": legal}
     for pattern in _SECTION_PATTERNS:
         m = pattern.search(head)
         if m:
@@ -251,7 +267,8 @@ def parse_subdivision_and_section(legal: str | None) -> dict:
     if not subdivision:
         return {"plattable": False, "reason": f"section but no subdivision in {legal[:48]!r}",
                 "subdivision": None, "section": section}
-    return {"plattable": True, "reason": None, "subdivision": subdivision, "section": section}
+    return {"plattable": True, "reason": None, "subdivision": subdivision,
+            "section": section, "legal": legal}
 
 
 def plat_search_name(recited_legal: str | None) -> str | None:
@@ -295,12 +312,25 @@ def plat_search_name(recited_legal: str | None) -> str | None:
 # leading run of the row's, breaking a case that already works.
 _CONNECTORS = {"AT", "OF", "AND", "THE"}
 
+# A planned-unit-development designation is not part of the name: Nueces' own index
+# carries the same subdivision as "PALMILLA BEACH" and "PALMILLA BEACH PUD", and its
+# CAD recites "PALMILLA BEACH P.U.D.". Dropped from both sides of a comparison for
+# the same reason connectors are -- one side having it is not a different place.
+_DESIGNATIONS = {"PUD"}
+
+# In a CONDOMINIUM, "UNIT" is the individual unit -- the thing being owned -- not a
+# phase of the subdivision. Reading it as a section turned 34 Nueces condo units
+# into 34 pointless plat searches ("SEAGATE CONDOMINIUMS UNIT 305"), and a unit
+# number is not a filing anyone can look up.
+_CONDOMINIUM = re.compile(r"\bCONDOMINIUMS?\b|\bCONDOS?\b", re.I)
+
 
 def _comparison_tokens(name: str) -> list[str]:
     """Tokens for comparing two subdivision names, with connectors removed from
     BOTH sides so the drop stays symmetric. Stripping them from the query alone
     would make the query stop being a prefix of the row it is meant to match."""
-    return [t for t in normalize_subdivision(name or "").split() if t not in _CONNECTORS]
+    return [t for t in normalize_subdivision(name or "").split()
+            if t not in _CONNECTORS and t not in _DESIGNATIONS]
 
 
 def plat_row_matches_query(plat_row_name: str | None, query: str) -> bool:
@@ -325,6 +355,53 @@ def plat_row_matches_query(plat_row_name: str | None, query: str) -> bool:
     return row_tokens[:len(query_tokens)] == query_tokens
 
 
+# A parcel's own lot and block, as its CAD recites them. Nueces writes them plainly
+# ("PALMILLA BEACH P.U.D. UNIT 7 BLK 2 LOT 9") and its plat index names the lot each
+# replat created ("PALMILLA BEACH Lot: 14C Block: 3"), so the two can be matched
+# directly -- the only way to date a lot whose parcel recites a phase no plat covers.
+_LOT = re.compile(r"\bLOT[S]?\s+([A-Z0-9]+(?:-[A-Z0-9]+)?)\b", re.I)
+_BLOCK = re.compile(r"\b(?:BLOCK|BLK)\s+([A-Z0-9]+)\b", re.I)
+
+# "5A ET AL" and "1,2,3,4,5" name several lots without saying which. Expanding a
+# list is possible; guessing which lot "ET AL" includes is not, so a row saying it
+# is refused rather than matched to whichever lot happens to be asked about.
+_INDETERMINATE_LOT = re.compile(r"\bET\s*AL\b|\bETAL\b", re.I)
+
+
+def parse_lot_block(text_value: str | None) -> dict:
+    """Lot and block from a recited legal description or a plat index row."""
+    if not text_value:
+        return {"lot": None, "block": None, "lots": [], "indeterminate": False}
+    raw = str(text_value)
+    lot_m, block_m = _LOT.search(raw), _BLOCK.search(raw)
+    lot = lot_m.group(1).upper() if lot_m else None
+    block = block_m.group(1).upper() if block_m else None
+    # A vendor row states them as labelled fields rather than in prose.
+    if lot is None:
+        m = re.search(r"\bLot:\s*([^\s].*?)(?=\s+Block:|$)", raw, re.I)
+        lot = m.group(1).strip().upper() if m else None
+    if block is None:
+        m = re.search(r"\bBlock:\s*(\S+)", raw, re.I)
+        block = m.group(1).strip().upper() if m else None
+    # "N/A" is the vendor saying it has no lot, not a lot called N/A. It reached the
+    # plat table as one before this check existed.
+    for field in ("lot", "block"):
+        value = lot if field == "lot" else block
+        if value and value.strip().upper() in ("N/A", "NONE", "NA", "-"):
+            if field == "lot":
+                lot = None
+            else:
+                block = None
+    # "101A-601A" is a RANGE of lots, not one lot. Which lots it covers is a
+    # judgement about the plat, so it is refused rather than treated as lot
+    # "101A-601A" -- which matches no parcel and would look like a real record.
+    indeterminate = bool(lot and (_INDETERMINATE_LOT.search(lot) or "-" in lot))
+    lots = []
+    if lot and not indeterminate:
+        lots = [p.strip() for p in lot.split(",") if p.strip()]
+    return {"lot": lot, "block": block, "lots": lots, "indeterminate": indeterminate}
+
+
 def plat_matches_parcel(parsed: dict, plat_row: dict) -> bool:
     """Does this held plat create the parcel that parsed to `parsed`?
 
@@ -338,14 +415,35 @@ def plat_matches_parcel(parsed: dict, plat_row: dict) -> bool:
     is Collin's index's "HEIGHTS WESTRIDGE"), but by EQUALITY, never prefix or
     subset: "CANOPIES" must not equal "CANOPIES PARKWAY & WOODWARD BOULEVARD AT
     TIMBER EDGE", which is a separate real plat with its own lots."""
-    return (_comparison_tokens(parsed["subdivision"])
-            == _comparison_tokens(plat_row["subdivision_name"])
-            and _sections_match(parsed["section"], plat_row["section"]))
+    if (_comparison_tokens(parsed["subdivision"])
+            != _comparison_tokens(plat_row["subdivision_name"])):
+        return False
+
+    # A PLAT THAT NAMES ONE LOT IS MATCHED BY THAT LOT, not by a section it has
+    # none of. "PALMILLA BEACH Lot: 14C Block: 3" recorded 2018-06-12 is the
+    # instrument that created lot 14C of block 3 -- as real a formation event as a
+    # phase plat, and the only evidence available for a parcel whose own phase no
+    # phase-plat covers. Block is required with it: block numbering restarts per
+    # subdivision, so a bare "LOT 9" names several different parcels.
+    plat_lot, plat_block = (plat_row.get("lot") or ""), (plat_row.get("block") or "")
+    if plat_lot:
+        if not plat_block:
+            return False
+        own = parse_lot_block(parsed.get("legal"))
+        if not own["lot"] or not own["block"] or own["block"] != plat_block:
+            return False
+        listed = parse_lot_block(f"Lot: {plat_lot} Block: {plat_block}")
+        if listed["indeterminate"]:
+            return False  # "5A ET AL" -- which lots is not stated
+        return own["lot"] in {l.upper() for l in listed["lots"]}
+
+    return _sections_match(parsed["section"], plat_row["section"])
 
 
 def _candidate_plats(session, county_fips: str) -> list[dict]:
     rows = session.execute(text("""
-        SELECT plat_id, subdivision_name, section, recording_date, recording_instrument
+        SELECT plat_id, subdivision_name, section, lot, block,
+               recording_date, recording_instrument
           FROM plat
          WHERE county_fips = :cf AND lookup_status = 'found'
            AND recording_date IS NOT NULL AND recording_instrument IS NOT NULL

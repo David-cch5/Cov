@@ -22,8 +22,11 @@ sys.path.insert(0, ".")
 
 from app.db.session import get_session
 from app.gis.plat_link import (
+    _comparison_tokens,
     _sections_match,
     link_parcels_to_plats,
+    parse_lot_block,
+    plat_matches_parcel,
     plat_row_matches_query,
     plat_search_name,
     normalize_subdivision,
@@ -206,6 +209,64 @@ def test_collapsed_search_name_and_the_directional_filter() -> None:
           f"Canopies Parkway plat")
 
 
+def test_a_plat_that_created_one_lot_is_matched_by_that_lot() -> None:
+    """Not every plat is a phase. A recorder's index carries filings that replatted
+    a SINGLE LOT ("PALMILLA BEACH Lot: 14C Block: 3", 2018-06-12), and for a parcel
+    whose own phase no phase-plat covers, that filing is the only evidence of when
+    it came into existence."""
+    parcel = parse_subdivision_and_section("PALMILLA BEACH P.U.D. UNIT 7 BLK 3 LOT 14C")
+    assert (parcel["subdivision"], parcel["section"]) == ("PALMILLA BEACH PUD", "7"), parcel
+
+    lot_plat = {"subdivision_name": "PALMILLA BEACH", "section": "", "lot": "14C", "block": "3"}
+    assert plat_matches_parcel(parcel, lot_plat), "its own lot and block must match"
+    # Block is required: block numbering restarts per subdivision, so lot 14C of
+    # block 9 is a different parcel entirely.
+    assert not plat_matches_parcel(parcel, {**lot_plat, "block": "9"})
+    assert not plat_matches_parcel(parcel, {**lot_plat, "block": ""})
+    # A multi-lot list matches only the lots it lists.
+    assert plat_matches_parcel(
+        parse_subdivision_and_section("PALMILLA BEACH BLK 1 LOT 5"),
+        {"subdivision_name": "PALMILLA BEACH", "section": "", "lot": "1,2,3,4,5", "block": "1"})
+    # "ET AL" and a lot RANGE state no single lot, so neither is matched to one.
+    for indeterminate in ("5A ET AL", "101A-601A"):
+        assert not plat_matches_parcel(parcel, {**lot_plat, "lot": indeterminate}), indeterminate
+    # "N/A" is the vendor saying it has no lot, not a lot named N/A.
+    assert parse_lot_block("Lot: N/A Block: N/A") == {
+        "lot": None, "block": None, "lots": [], "indeterminate": False}
+    print("PASS: a single-lot replat matches its own lot+block; a lot range, an "
+          "'ET AL' and an 'N/A' are all refused")
+
+
+def test_a_condominium_unit_is_not_a_phase() -> None:
+    """UNIT means two different things. In Nueces' PALMILLA BEACH it is the phase --
+    the index files "PALMILLA BEACH P U D Unit: 6A" -- but in a CONDOMINIUM it is the
+    individual unit being owned, and one declaration created all of them. Reading
+    condo units as phases turned 34 of them into 34 pointless plat searches."""
+    for legal, name in [
+        ("SEAGATE CONDOMINIUMS UNIT 305", "SEAGATE CONDOMINIUMS"),
+        ("PALMILLA BEACH CASITA CONDOMINIUMS UNIT 6", "PALMILLA BEACH CASITA CONDOMINIUMS"),
+        ("THE HIDEAWAY AT SUNFLOWER BEACH CONDOMINIUMS UNIT 14 PLUS 4.16 % INT IN COM AREA",
+         "HIDEAWAY AT SUNFLOWER BEACH CONDOMINIUMS"),
+    ]:
+        got = parse_subdivision_and_section(legal)
+        assert got["section"] is None, f"a condo unit is not a section: {got}"
+        assert got["subdivision"] == name, got
+        assert got["plattable"], got
+
+    # But a phase written as UNIT still reads as one, colon and all -- the vendor
+    # titles the plat "Unit: 6A" and requiring whitespace read no section, so every
+    # unit-specific search found its plat and then discarded it.
+    for legal, section in [("PALMILLA BEACH P U D Unit: 6A", "6A"),
+                           ("PALMILLA BEACH UNIT 1B", "1B"),
+                           ("PALMILLA BEACH P.U.D. UNIT 7 BLK 2 LOT 9", "7")]:
+        assert parse_subdivision_and_section(legal)["section"] == section, legal
+    # And the designation itself is not part of the name.
+    assert (_comparison_tokens("PALMILLA BEACH P.U.D.") == _comparison_tokens("PALMILLA BEACH PUD")
+            == _comparison_tokens("PALMILLA BEACH P U D") == _comparison_tokens("PALMILLA BEACH"))
+    print("PASS: a condominium's UNIT is dropped as a unit, a subdivision's UNIT reads "
+          "as its phase, and P.U.D./PUD/P U D are one place")
+
+
 def test_dry_run_is_the_default_and_reports_what_it_would_do() -> None:
     """A bulk mutation must be inspectable before it runs. This is the guard
     against repeating the unreviewed run that caused the overwrite."""
@@ -322,6 +383,8 @@ if __name__ == "__main__":
     test_section_06b_is_read_and_canonicalised()
     test_worded_phases_are_read()
     test_collapsed_search_name_and_the_directional_filter()
+    test_a_plat_that_created_one_lot_is_matched_by_that_lot()
+    test_a_condominium_unit_is_not_a_phase()
     test_matcher_agrees_with_the_independent_subdivision_plat_path()
     test_dry_run_is_the_default_and_reports_what_it_would_do()
     test_reported_count_equals_rows_actually_written()

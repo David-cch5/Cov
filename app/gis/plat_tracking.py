@@ -26,6 +26,7 @@ from app.db.repository import insert_source, upsert_plat
 from app.gis.plat_parser import extract_phase_key_from_text, normalize_section, parse_plat_reference
 from app.gis.plat_link import (
     _comparison_tokens,
+    parse_lot_block,
     parse_subdivision_and_section,
     link_parcels_to_plats,
     plat_row_matches_query,
@@ -88,6 +89,38 @@ def _flag_plat_lookup_note(session, covid: int, tract_no: int, note: str) -> Non
         text("UPDATE covenant SET status = :status, review_reason = :reason, updated_at = now() WHERE covid = :covid"),
         {"status": status, "reason": reason, "covid": covid},
     )
+
+
+def _sections_still_missing(session, county_fips: str,
+                            recited_legals: list[str]) -> list[tuple[str, str]]:
+    """(searchable name, section) pairs this tract needs and no held plat covers.
+
+    Reads the parcels' OWN RECITED legal descriptions, not parse_plat_reference's
+    output: that parser had already rewritten "PALMILLA BEACH P.U.D. UNIT 7 BLK 2
+    LOT 9" to "PALMILLA BEACH BLK 2", dropping the unit -- so this asked for nothing
+    at all and every unit went unsearched. The recitation is the evidence; a
+    derived field that has lost part of it is not.
+
+    Deduplicated, so one search per section however many lots recite it, and only
+    for sections that are actually named -- a parcel reciting no section at all has
+    nothing to search for and is left to the lot/block match instead."""
+    held = {(tuple(_comparison_tokens(r.subdivision_name)), (r.section or "").upper())
+            for r in session.execute(
+                text("SELECT subdivision_name, section FROM plat "
+                     "WHERE county_fips = :cf AND lookup_status = 'found'"),
+                {"cf": county_fips}).fetchall()}
+    wanted: dict[tuple[str, str], None] = {}
+    for legal in recited_legals:
+        own = parse_subdivision_and_section(legal)
+        if not own["plattable"]:
+            continue
+        query, section = plat_search_name(legal), own["section"]
+        if not query or not section:
+            continue
+        if (tuple(_comparison_tokens(query)), section.upper()) in held:
+            continue
+        wanted.setdefault((query, section), None)
+    return list(wanted)
 
 
 def _row_is_for(row: dict, query: str) -> bool:
@@ -201,12 +234,12 @@ def resolve_plats_for_tract(session, covid: int, tract_no: int) -> dict:
                        if tuple(_comparison_tokens(q)) not in held_tokens)
 
     plats_found, plats_not_found = 0, 0
+    def _search(name):
+        with recorder_context() as context:
+            return publicsearch.search_plats_by_subdivision(context, base_url, name)
+
     for query in to_search:
         subdivision_name = query  # what a 'not_found' row is recorded against
-
-        def _search(name):
-            with recorder_context() as context:
-                return publicsearch.search_plats_by_subdivision(context, base_url, name)
         rows = run_with_job_queue(
             lambda name=query: _search(name), job_type="title_plat_lookup",
             county_fips=county_fips, covid=covid,
@@ -250,6 +283,29 @@ def resolve_plats_for_tract(session, covid: int, tract_no: int) -> dict:
         # no phase-shaped text in any field) is skipped here, not guessed at -- it never
         # reaches a real parcel's own assignment lookup below since that's keyed on the
         # SAME extraction, so nothing is silently mismatched.
+        # A FILING THAT REPLATTED ONE LOT is keyed by that lot, not by a section it
+        # does not have. "PALMILLA BEACH Lot: 14C Block: 3" recorded 2018-06-12 is
+        # the instrument that created lot 14C of block 3, and for a subdivision
+        # whose parcels recite a phase no phase-plat covers, it is the only evidence
+        # there is. Recorded separately from the section rows below because a row
+        # naming several lots ("5A ET AL") states no single lot and is skipped by
+        # parse_lot_block rather than attached to whichever lot is asked about.
+        for r in rows:
+            lb = parse_lot_block(f'Lot: {r.get("LOT") or ""} Block: {r.get("BLOCK") or ""}')
+            if lb["indeterminate"] or not lb["block"] or len(lb["lots"]) != 1:
+                continue
+            recorded = _parse_slash_date(r.get("RECORDED DATE"))
+            instrument = r.get("FILE NUMBER") or r.get("DOC NUMBER")
+            if recorded is None or not instrument:
+                continue
+            upsert_plat(
+                session, county_fips=county_fips, subdivision_name=query, section="",
+                lot=lb["lots"][0], block=lb["block"], lookup_status="found",
+                recording_instrument=instrument, recording_date=recorded,
+                book_volume_page=r.get("VOL/BK/PG") or None,
+                abstract_name=r.get("ABSTRACT NAME") or None, source_id=plat_source_id)
+            plats_found += 1
+
         by_section: dict[str, list[dict]] = {}
         for r in rows:
             section = (
@@ -293,6 +349,47 @@ def resolve_plats_for_tract(session, covid: int, tract_no: int) -> dict:
                 source_id=plat_source_id,
             )
             plats_found += 1
+
+    # SECOND PASS: ASK FOR THE PHASE BY NAME. A subdivision-wide search answers with
+    # what the index returns for that name, and this vendor caps the result set --
+    # "PALMILLA BEACH" came back with units 1B through 1H and 2 while the parcels sit
+    # in units 1, 2A, 3B, 3C, 4A-4C, 5, 6A, 6B and 7. Searching "PALMILLA BEACH UNIT
+    # 6A" returns that unit's own plat ("PALMILLA BEACH P U D Unit: 6A", recorded
+    # 2022-11-09) immediately. So each section still unaccounted for gets one search
+    # of its own -- bounded by the number of distinct sections, not lots, and only
+    # for sections the broad search failed to cover.
+    for wanted_query, wanted_section in _sections_still_missing(
+            session, county_fips, [p.recited_legal_description for p in parcels]):
+        for phrasing in (f"{wanted_query} UNIT {wanted_section}",
+                          f"{wanted_query} {wanted_section}"):
+            rows = run_with_job_queue(
+                lambda name=phrasing: _search(name), job_type="title_plat_lookup",
+                county_fips=county_fips, covid=covid,
+                payload={"base_url": base_url, "searched_as": phrasing,
+                         "for_section": wanted_section})
+            hits = [r for r in rows
+                    if parse_subdivision_and_section(
+                        r.get("SUBDIVISION") or r.get("LEGAL DESCRIPTION") or "")["section"]
+                    == wanted_section
+                    and _parse_slash_date(r.get("RECORDED DATE")) is not None
+                    and (r.get("FILE NUMBER") or r.get("DOC NUMBER"))]
+            if not hits:
+                continue
+            # The section's OWN first filing, same rule as the main pass: a later
+            # amendment of an already-platted phase does not un-platt it.
+            first = min(hits, key=lambda r: _parse_slash_date(r.get("RECORDED DATE")))
+            upsert_plat(
+                session, county_fips=county_fips, subdivision_name=wanted_query,
+                section=wanted_section, lookup_status="found",
+                recording_instrument=first.get("FILE NUMBER") or first.get("DOC NUMBER"),
+                recording_date=_parse_slash_date(first.get("RECORDED DATE")),
+                book_volume_page=first.get("VOL/BK/PG") or None,
+                abstract_name=first.get("ABSTRACT NAME") or None,
+                source_id=insert_source(session, source_type="recorder_portal",
+                                        reference=f"{base_url} (plats, {phrasing})",
+                                        confidence=None))
+            plats_found += 1
+            break
 
     # ASSIGNMENT IS DELEGATED, not duplicated. plat_link.link_parcels_to_plats is
     # the matcher that reads every section form this corpus uses (01/1/06B/ONE

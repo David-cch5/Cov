@@ -299,21 +299,26 @@ def upsert_parcel(session, county_fips: str, apn: str, owner_name_raw: str | Non
 
 def upsert_plat(session, county_fips: str, subdivision_name: str, section: str,
                  lookup_status: str, recording_instrument: str | None, recording_date,
-                 book_volume_page: str | None, abstract_name: str | None, source_id: int | None) -> int:
-    """One row per real plat filing (a subdivision's own section/phase), or a
-    single lookup_status='not_found' row (section='') recording that a real
-    recorder-portal search was tried and came up empty -- so a later run
-    never re-searches a subdivision this project has already asked about.
-    Returns plat_id."""
+                 book_volume_page: str | None, abstract_name: str | None, source_id: int | None,
+                 lot: str = "", block: str = "") -> int:
+    """One row per real plat filing, or a single lookup_status='not_found' row
+    (section='') recording that a real recorder-portal search was tried and came up
+    empty -- so a later run never re-searches a subdivision this project has
+    already asked about. Returns plat_id.
+
+    A filing is identified EITHER by the section/phase it platted OR by the single
+    lot it replatted (lot + block, migration 0045). Both are real formation events;
+    a subdivision whose parcels recite a phase no phase-plat covers can only be
+    dated by the second kind."""
     row = session.execute(
         text("""
-            INSERT INTO plat (county_fips, subdivision_name, section, lookup_status,
-                               recording_instrument, recording_date, book_volume_page,
-                               abstract_name, source_id, updated_at)
-            VALUES (:county_fips, :subdivision_name, :section, :lookup_status,
-                    :recording_instrument, :recording_date, :book_volume_page,
-                    :abstract_name, :source_id, now())
-            ON CONFLICT (county_fips, subdivision_name, section) DO UPDATE SET
+            INSERT INTO plat (county_fips, subdivision_name, section, lot, block,
+                               lookup_status, recording_instrument, recording_date,
+                               book_volume_page, abstract_name, source_id, updated_at)
+            VALUES (:county_fips, :subdivision_name, :section, :lot, :block,
+                    :lookup_status, :recording_instrument, :recording_date,
+                    :book_volume_page, :abstract_name, :source_id, now())
+            ON CONFLICT (county_fips, subdivision_name, section, lot, block) DO UPDATE SET
                 lookup_status = EXCLUDED.lookup_status,
                 recording_instrument = EXCLUDED.recording_instrument,
                 recording_date = EXCLUDED.recording_date,
@@ -325,6 +330,7 @@ def upsert_plat(session, county_fips: str, subdivision_name: str, section: str,
         """),
         {
             "county_fips": county_fips, "subdivision_name": subdivision_name, "section": section,
+            "lot": lot or "", "block": block or "",
             "lookup_status": lookup_status, "recording_instrument": recording_instrument,
             "recording_date": recording_date, "book_volume_page": book_volume_page,
             "abstract_name": abstract_name, "source_id": source_id,
