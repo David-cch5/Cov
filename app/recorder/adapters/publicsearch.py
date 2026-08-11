@@ -84,6 +84,75 @@ class RecorderSearchUnavailable(RecorderSearchUnanswered):
 _PORTAL_ERROR = re.compile(r"Error While Running Search|Error with search query", re.I)
 _NO_RESULTS = re.compile(r"No Results Found", re.I)
 
+# The results page states its own total ("2,297 results"), which is the only way to
+# know a 50-row page is page 1 of many rather than the whole answer.
+_RESULT_TOTAL = re.compile(r"([\d,]+)\s+results?\b", re.I)
+
+# One page of this vendor's results. Confirmed live on Nueces and Montgomery.
+PAGE_SIZE = 50
+
+# How many rows a search returns before it stops paging. A ceiling rather than a
+# limit on what exists: 250 is five pages, enough that an ordinary subdivision or
+# party search completes, while a search matching thousands (a bank, a common
+# surname) stops instead of walking a county's server for an hour. Callers that
+# genuinely need everything raise it deliberately.
+DEFAULT_MAX_ROWS = 250
+
+
+def _reported_total(page) -> int | None:
+    try:
+        m = _RESULT_TOTAL.search(page.inner_text("body"))
+    except Exception:
+        return None
+    return int(m.group(1).replace(",", "")) if m else None
+
+
+def _with_offset(url: str, offset: int) -> str:
+    base = re.sub(r"[&?]offset=\d+", "", url)
+    joiner = "&" if "?" in base else "?"
+    return f"{base}{joiner}offset={offset}"
+
+
+def _collect_pages(page, base_url: str, query: str, max_rows: int) -> list[dict]:
+    """Page 1 is already rendered; walk the rest by offset.
+
+    THE 50-ROW "CAP" WAS PAGE ONE. This vendor returns 50 rows and reports its own
+    much larger total -- 2,297 for one Nueces subdivision -- and /results honours
+    &offset=50. Reading only the first page made every large search silently
+    incomplete, and app/title/chain.py built a whole hop-1 fallback strategy around
+    a cap that does not exist. Rows are deduplicated by document number because an
+    offset page can repeat a row when the underlying order shifts between requests.
+    """
+    rows = _parse_results_table(page)
+    total = _reported_total(page)
+    if total is not None and total <= len(rows):
+        return rows
+
+    by_doc = {r.get("DOC NUMBER") or f"_row{i}": r for i, r in enumerate(rows)}
+    results_url = page.url
+    offset = PAGE_SIZE
+    while len(by_doc) < min(max_rows, total or max_rows):
+        page.goto(_with_offset(results_url, offset), wait_until="domcontentloaded")
+        try:
+            page.wait_for_selector("table", timeout=20000)
+        except Exception:
+            break  # a page that does not render ends the walk; what was read stands
+        page.wait_for_timeout(500)
+        batch = _parse_results_table(page)
+        if not batch:
+            break
+        before = len(by_doc)
+        for i, r in enumerate(batch):
+            by_doc.setdefault(r.get("DOC NUMBER") or f"_off{offset}_{i}", r)
+        if len(by_doc) == before or len(batch) < PAGE_SIZE:
+            break  # nothing new, or the last page
+        offset += PAGE_SIZE
+    out = list(by_doc.values())[:max_rows]
+    if total is not None and total > len(out):
+        print(f"  [publicsearch] {base_url}: {query!r} matched {total:,} documents; "
+              f"read {len(out)} (max_rows={max_rows}) -- this result set is TRUNCATED")
+    return out
+
 
 def _no_table_verdict(page, base_url: str, query: str) -> list[dict]:
     """Decide what a missing results table MEANS, and return [] only for a real
@@ -160,12 +229,17 @@ def _enrich_row_from_legal_description(row: dict) -> dict:
     return enriched
 
 
-def search_by_name(context: BrowserContext, base_url: str, query: str, full_text_ocr: bool = True) -> list[dict]:
+def search_by_name(context: BrowserContext, base_url: str, query: str, full_text_ocr: bool = True,
+                    max_rows: int = DEFAULT_MAX_ROWS) -> list[dict]:
     """Quick-search by grantor/grantee/subdivision/doc-type/doc# text. With
     full_text_ocr=True this also searches the OCR'd body of every document
     (as a phrase, per the portal's own help text), not just indexed fields --
     the only way to find a covenant whose relevant text isn't in the index
-    (e.g. searching for an abstract code or a specific dollar figure)."""
+    (e.g. searching for an abstract code or a specific dollar figure).
+
+    PAGES THE RESULTS, up to max_rows, and says so loudly when it stops short of
+    the portal's own reported total. Reading page 1 alone is how a real plat went
+    unfound while this project reported it did not exist."""
     page = context.new_page()
     try:
         page.goto(base_url, wait_until="networkidle")
@@ -185,7 +259,7 @@ def search_by_name(context: BrowserContext, base_url: str, query: str, full_text
             # documents" as a fact -- so it is not guessed here.
             return _no_table_verdict(page, base_url, query)
         page.wait_for_timeout(500)  # table exists before all rows finish populating
-        return _parse_results_table(page)
+        return _collect_pages(page, base_url, query, max_rows)
     finally:
         page.close()
 
@@ -276,7 +350,7 @@ def _search_plats_in_default_department(page, base_url: str, subdivision_name: s
     except Exception:
         return _no_table_verdict(page, base_url, subdivision_name)
     page.wait_for_timeout(500)
-    return [r for r in _parse_results_table(page)
+    return [r for r in _collect_pages(page, base_url, subdivision_name, DEFAULT_MAX_ROWS)
             if (r.get("DOC TYPE") or "").strip().upper() in _PLAT_DOC_TYPES]
 
 

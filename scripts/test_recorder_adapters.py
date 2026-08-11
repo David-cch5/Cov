@@ -101,6 +101,34 @@ def test_publicsearch_montgomery() -> None:
     print(f"PASS: publicsearch (Montgomery) -> found doc 2009089679, {row.get('DOC TYPE')}")
 
 
+def test_results_are_paged_not_capped_at_one_page() -> None:
+    """The "~50-row cap" this project reasoned about for months is page 1 of N.
+    Nueces reports 2,298 documents for PALMILLA BEACH and serves them 50 at a time
+    via &offset=; reading only the first page is how a real plat went unfound while
+    this project reported it did not exist.
+
+    Checked without a network call for the URL mechanics, and with one live search
+    for the behaviour that matters: more than one page comes back, and every row is
+    a distinct document."""
+    from app.recorder.adapters.publicsearch import PAGE_SIZE, _with_offset
+
+    assert _with_offset("https://x/results?a=1", 50) == "https://x/results?a=1&offset=50"
+    assert _with_offset("https://x/results?a=1&offset=50", 100) == "https://x/results?a=1&offset=100"
+    assert _with_offset("https://x/results", 50) == "https://x/results?offset=50"
+
+    with recorder_context() as context:
+        rows = publicsearch.search_by_name(
+            context, "https://nueces.tx.publicsearch.us", "PALMILLA BEACH",
+            full_text_ocr=False, max_rows=120)
+    assert len(rows) > PAGE_SIZE, (
+        f"a search matching thousands must return more than one page, got {len(rows)}")
+    docs = [r.get("DOC NUMBER") for r in rows]
+    assert len(set(docs)) == len(docs), "an offset page repeated a document"
+    assert len(rows) <= 120, f"max_rows must bound the walk, got {len(rows)}"
+    print(f"PASS: paging returns {len(rows)} distinct documents across "
+          f"{-(-len(rows) // PAGE_SIZE)} pages, bounded by max_rows")
+
+
 def test_portal_error_is_not_read_as_an_empty_result() -> None:
     """The distinction itself, without a network call: the same missing results
     table means three different things, and only one of them is "no such
@@ -193,6 +221,7 @@ if __name__ == "__main__":
     test_ava_fidlar_kerr()
     test_publicsearch_nueces()
     test_publicsearch_montgomery()
+    test_results_are_paged_not_capped_at_one_page()
     test_portal_error_is_not_read_as_an_empty_result()
     test_enrich_row_from_legal_description()
     print("\nall recorder adapter smoke tests passed")

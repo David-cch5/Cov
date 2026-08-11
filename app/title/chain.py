@@ -912,7 +912,7 @@ def _walk_via_recorder_portal(session, covid: int, covenant, parcel, registry,
     against covid 2497 (Bexar) before that source was found: a name search
     for a prolific individual (the declarant here has hundreds of unrelated
     documents across 50 years) misses the actual target within the
-    portal's ~50-row result cap. An address-based full-text search
+    portal's first page of results. An address-based full-text search
     reliably surfaces the *first* conveyance, but a distinct entity name
     (the grantee of that conveyance) searches far more precisely and
     completely than a person's name does -- so this walks forward hop by
@@ -929,7 +929,17 @@ def _walk_via_recorder_portal(session, covid: int, covenant, parcel, registry,
     name search is tried first because it's the more direct source when it
     works at all; address search still runs afterward since it reliably
     surfaces the *recent* end of the chain even when the declarant's own
-    bulk sale is buried past this vendor's ~50-row cap.
+    bulk sale is buried past this vendor's first page.
+
+    THAT CAP WAS NEVER REAL, and this strategy was built around it. Measured
+    2026-08-11: the portal reports its own total (2,298 documents for one Nueces
+    subdivision) and serves them 50 at a time via &offset=. search_by_name now
+    pages, so the premise behind seeding from an address at all -- that the
+    declarant's own bulk sale is unreachable -- should be re-tested rather than
+    assumed. The seeds are left as they are for now because changing which
+    documents this walk considers changes recorded transfers and the fees computed
+    from them, and that needs its own verified pass over the covenants already
+    walked.
 
     Even with both seeds, hop 1 (the declarant's own conveyance) is often
     simply not in the index results -- see _walk_hop1_candidates for how
