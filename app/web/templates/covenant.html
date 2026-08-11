@@ -12,6 +12,12 @@
   <div><span class="k">Legal type</span><span class="v">{{ cov.legal_description_type|dash }}</span></div>
 </div>
 
+{% if has_map %}
+<p><a href="{{ url_for('covenant_map', covid=cov.covid) }}">▶ Formation map</a>
+  <span class="note">— play or drag to watch this covenant's lots come into existence on their
+  own recorded plat dates.</span></p>
+{% endif %}
+
 {% if cov.review_reason %}
 <h2>Review notes</h2>
 <div class="card"><p class="note">{{ cov.review_reason }}</p></div>

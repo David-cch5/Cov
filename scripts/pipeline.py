@@ -11,6 +11,7 @@ Usage:
   python3 scripts/pipeline.py work --county 48339  ... only this county's jobs
   python3 scripts/pipeline.py work --max 1         ... one job, then stop
   python3 scripts/pipeline.py run                  scan, then work
+  python3 scripts/pipeline.py maps --now           build every covenant's formation map
   python3 scripts/pipeline.py status               queue depth and stuck covenants
   python3 scripts/pipeline.py stage <name> <covid> run one stage by hand
 
@@ -45,6 +46,28 @@ def cmd_work(args) -> int:
 def cmd_run(args) -> int:
     scan_drop_folder(args.drop_dir)
     return cmd_work(args)
+
+
+def cmd_maps(args) -> int:
+    """Enqueue publish_map for every covenant a map can be built for.
+
+    Separate from `work` because the chain only reaches publish_map on a covenant
+    that got all the way through reconcile -- and a map is often most useful on one
+    still sitting at needs_review, where seeing the census is how somebody decides.
+    """
+    from app.gis.formation_map import eligible_covids
+
+    with get_session() as session:
+        covids = eligible_covids(session)
+    queued, already = [], []
+    for covid in covids:
+        (queued if enqueue_stage("publish_map", covid) else already).append(covid)
+    print(f"{len(covids)} covenant(s) eligible -- {len(queued)} queued, "
+          f"{len(already)} already in flight")
+    if args.now:
+        ran = run_worker(job_types=["pipeline_publish_map"], verbose=True)
+        return 1 if any(r["outcome"] == "error" for r in ran) else 0
+    return 0
 
 
 def cmd_status(args) -> int:
@@ -107,6 +130,9 @@ def main(argv=None) -> int:
     p_run.add_argument("--county", default=None)
     p_run.add_argument("--max", type=int, default=None)
 
+    p_maps = sub.add_parser("maps", help="build the formation map for every eligible covenant")
+    p_maps.add_argument("--now", action="store_true", help="also run the queued map jobs")
+
     sub.add_parser("status", help="queue depth, covenant statuses, and what is stuck")
 
     p_stage = sub.add_parser("stage", help="enqueue one stage for one covenant")
@@ -115,7 +141,7 @@ def main(argv=None) -> int:
     p_stage.add_argument("--now", action="store_true", help="also run it immediately")
 
     args = parser.parse_args(argv)
-    return {"scan": cmd_scan, "work": cmd_work, "run": cmd_run,
+    return {"scan": cmd_scan, "work": cmd_work, "run": cmd_run, "maps": cmd_maps,
             "status": cmd_status, "stage": cmd_stage}[args.command](args)
 
 

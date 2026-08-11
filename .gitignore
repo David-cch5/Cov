@@ -30,3 +30,11 @@ __pycache__/
 
 # Editor / temp
 *.tmp
+
+# Generated formation maps -- rebuilt by the publish_map pipeline stage from the
+# database, so they are output rather than source. _dropbox/_intake hold dropped
+# documents and their acquired text, which are data, not code.
+_artifacts/
+_dropbox/
+_intake/
+_intake_text/

@@ -12,6 +12,7 @@ runs.
 
 Usage: python3 scripts/test_pipeline.py
 """
+import os
 import sys
 
 from sqlalchemy import text
@@ -54,7 +55,10 @@ def test_stage_graph_is_coherent() -> None:
     assert next_stage("intake") == "resolve_tract"
     assert next_stage("resolve_tract") == "classify_parcels"
     assert next_stage("classify_parcels") == "reconcile"
-    assert next_stage("reconcile") is None, "reconcile is the end of the automatic pipeline"
+    # publish_map is last: it DRAWS the census, and reconcile is what checks the
+    # census is right, so the picture comes after the figure it depicts.
+    assert next_stage("reconcile") == "publish_map"
+    assert next_stage("publish_map") is None, "publish_map is the end of the automatic pipeline"
     # A subdivision-plat tract already has its census, so classification is skipped.
     assert next_stage("resolve_tract", ("classify_parcels",)) == "reconcile"
     # Manual stages are reachable only deliberately -- never by advancing.
@@ -177,7 +181,7 @@ def test_worker_drains_a_multi_stage_chain() -> None:
     finally:
         STAGES.update(originals)
 
-    assert seen == ["resolve_tract", "classify_parcels", "reconcile"], seen
+    assert seen == ["resolve_tract", "classify_parcels", "reconcile", "publish_map"], seen
     assert all(r["outcome"] == "advanced" for r in ran), ran
     statuses = {r["job_type"]: r["status"] for r in _rows(TEST_COVID)}
     assert set(statuses.values()) == {"done"}, statuses
@@ -201,7 +205,7 @@ def test_skip_stages_is_honoured_end_to_end() -> None:
         return handler
 
     STAGES["resolve_tract"] = resolve
-    for stage in ("classify_parcels", "reconcile"):
+    for stage in ("classify_parcels", "reconcile", "publish_map"):
         STAGES[stage] = make(stage)
     try:
         enqueue_stage("resolve_tract", TEST_COVID)
@@ -209,7 +213,7 @@ def test_skip_stages_is_honoured_end_to_end() -> None:
     finally:
         STAGES.update(originals)
 
-    assert seen == ["resolve_tract", "reconcile"], (
+    assert seen == ["resolve_tract", "reconcile", "publish_map"], (
         f"classify_parcels must be skipped for a plat resolution, got {seen}")
     print("PASS: a subdivision-plat resolution skips classification and goes to reconcile")
 
@@ -351,6 +355,40 @@ def test_record_only_notes_do_not_hold_a_covenant_open() -> None:
           f"open; an unknown tag still counts as a concern")
 
 
+def test_publish_map_is_the_final_stage_and_never_halts() -> None:
+    """The map runs for every covenant, so it must not be able to strand one.
+
+    No geometry, no census and no formation date are ordinary states, not
+    questions a human can answer -- halting on them would leave a needs_review row
+    that no answer resolves. It advances with the reason recorded either way, so
+    "no map" is never silent.
+    """
+    from app.gis.formation_map import artifact_path, eligible_covids
+    from app.pipeline.stages import run_publish_map
+
+    assert STAGE_ORDER[-1] == "publish_map", STAGE_ORDER
+    assert next_stage("reconcile") == "publish_map"
+    assert next_stage("publish_map") is None, "nothing follows the map"
+
+    with get_session() as session:
+        eligible = eligible_covids(session)
+        assert eligible, "no covenant has geometry and a census"
+
+        # A covenant whose parcels have formation dates produces a file.
+        built = run_publish_map(session, 3028, {})
+        assert built.status == "advanced", built
+        assert os.path.exists(artifact_path(3028)), "covid 3028's map should exist"
+        assert "map built" in built.note, built.note
+
+        # One with none advances anyway, saying why.
+        nothing = run_publish_map(session, 8534, {})
+        assert nothing.status == "advanced", nothing
+        assert "no formation map" in nothing.note, nothing.note
+        assert "formation date" in nothing.note, nothing.note
+    print(f"PASS: publish_map is last, runs for all {len(eligible)} eligible covenants, "
+          f"and advances even with nothing to draw")
+
+
 if __name__ == "__main__":
     _cleanup()
     try:
@@ -368,5 +406,6 @@ if __name__ == "__main__":
         test_needs_review_regresses_a_covenant_that_claimed_reconciled()
         test_record_only_notes_do_not_hold_a_covenant_open()
         print("\nall pipeline tests passed")
+        test_publish_map_is_the_final_stage_and_never_halts()
     finally:
         _cleanup()

@@ -22,12 +22,14 @@ THREE VERDICTS, and the middle one is the point:
 Anything unexpected raises, and the runner turns it into a job_queue error with
 backoff. Stages do not swallow exceptions to look tidy.
 
-STAGE ORDER, and what is deliberately not in it yet. The encumbered land has to
-be right before anything is built on top of it, so this pass runs
-intake -> resolve_tract -> classify_parcels -> reconcile and stops.
-chain_of_title and fee_compute are registered here, and are NOT auto-enqueued;
-running them on a covenant whose encumbered land is unconfirmed would spend
-recorder-portal and deed-reading effort against the wrong parcels.
+STAGE ORDER, and what is deliberately not in it. The encumbered land has to be
+right before anything is built on top of it, so the chain runs
+intake -> resolve_tract -> classify_parcels -> reconcile -> publish_map.
+publish_map comes last because it DRAWS the census and reconcile is what checks
+the census is right; a picture in front of an unvalidated figure is worse than no
+picture. chain_of_title and fee_compute are registered here and are NOT
+auto-enqueued -- running them on a covenant whose encumbered land is unconfirmed
+would spend recorder-portal and deed-reading effort against the wrong parcels.
 
 EVERY STAGE MUST BE IDEMPOTENT. app/queue/queue.py's docstring explains why: a
 crash between "work committed" and "job marked done" leaves the job to be
@@ -45,7 +47,7 @@ from app.gis.ngs import NgsUnanswered
 # Ordered. The runner advances along this list; a stage that is not the last one
 # names its successor implicitly by position, so adding a stage means adding it
 # here and nowhere else.
-STAGE_ORDER = ("intake", "resolve_tract", "classify_parcels", "reconcile")
+STAGE_ORDER = ("intake", "resolve_tract", "classify_parcels", "reconcile", "publish_map")
 
 # Registered so they can be enqueued and run deliberately, but never reached by
 # advancing: the encumbered land comes first. See the module docstring.
@@ -369,6 +371,53 @@ def run_reconcile(session, covid: int, payload: dict) -> StageVerdict:
 
 
 # --------------------------------------------------------------------------
+# publish_map
+# --------------------------------------------------------------------------
+
+def run_publish_map(session, covid: int, payload: dict) -> StageVerdict:
+    """Build the covenant's formation map, so every covenant gets one without
+    anybody remembering to run a script.
+
+    Last in the chain because the map draws the census, and reconcile is what
+    checks the census is right -- drawing first would put a picture in front of a
+    figure that had not been validated.
+
+    ALWAYS ADVANCES when there is simply nothing to draw. No geometry, no census,
+    no formation date are ordinary states of a covenant, not questions for a
+    human, and halting on them would leave a needs_review row that no answer
+    resolves. The reason is recorded either way, so "no map" is never silent.
+
+    A covenant that halted earlier never reaches this stage; run
+    `scripts/pipeline.py maps` to build maps for everything eligible regardless
+    of review state, since a map is often most useful precisely when something is
+    still open.
+    """
+    from app.gis.formation_map import build
+
+    result = build(session, covid)
+
+    # Deliberately writes NO covenant review note, unlike every other stage.
+    # review_reason is for things a human must review, and reconcile_covenant
+    # treats any note there as an open concern -- so a note saying "no map,
+    # because no parcel has a formation date" stopped covenants reaching
+    # 'reconciled' the moment this stage was added. Caught by
+    # scripts/test_reconcile.py, on covid 3595.
+    #
+    # Whether a map exists is not a review item: the verdict is on the job row,
+    # and app/web shows the link only when the file is actually there. A stage
+    # that produces an artifact should not be able to change a covenant's
+    # standing.
+    if result["written"]:
+        return StageVerdict(
+            "advanced",
+            f"map built: {result['parcels']:,} parcels, {result['formation_dates']} formation "
+            f"date(s), {result['undated']:,} with none, {result['from']}..{result['to']}",
+            covid=covid, detail=result)
+    return StageVerdict("advanced", f"no formation map: {result['reason']}",
+                        covid=covid, detail=result)
+
+
+# --------------------------------------------------------------------------
 # manual-only stages
 # --------------------------------------------------------------------------
 
@@ -396,6 +445,7 @@ STAGES = {
     "resolve_tract": run_resolve_tract,
     "classify_parcels": run_classify_parcels,
     "reconcile": run_reconcile,
+    "publish_map": run_publish_map,
     "chain_of_title": run_chain_of_title,
     "fee_compute": run_fee_compute,
 }
