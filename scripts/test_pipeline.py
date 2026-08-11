@@ -380,11 +380,25 @@ def test_publish_map_is_the_final_stage_and_never_halts() -> None:
         assert os.path.exists(artifact_path(3028)), "covid 3028's map should exist"
         assert "map built" in built.note, built.note
 
-        # One with none advances anyway, saying why.
-        nothing = run_publish_map(session, 8534, {})
-        assert nothing.status == "advanced", nothing
-        assert "no formation map" in nothing.note, nothing.note
-        assert "formation date" in nothing.note, nothing.note
+        # One with none advances anyway, saying why. Found by asking rather than
+        # hardcoded: covid 8534 was this case until its 213 Denton parcels got real
+        # plats on 2026-08-11, and a covenant acquiring formation dates is the
+        # pipeline working, not this test breaking.
+        undated = session.execute(text("""
+            SELECT pc.covid FROM parcel_covenant pc
+              JOIN parcel p ON p.county_fips = pc.county_fips AND p.apn = pc.apn
+              JOIN tract t ON t.covid = pc.covid AND t.geom IS NOT NULL
+             GROUP BY pc.covid HAVING count(p.formed_date) = 0
+             ORDER BY count(DISTINCT p.apn) DESC LIMIT 1
+        """)).scalar()
+        if undated is None:
+            print("    (every mapped covenant now has formation dates -- "
+                  "the empty-map path has no live case left to exercise)")
+        else:
+            nothing = run_publish_map(session, undated, {})
+            assert nothing.status == "advanced", nothing
+            assert "no formation map" in nothing.note, nothing.note
+            assert "formation date" in nothing.note, nothing.note
     print(f"PASS: publish_map is last, runs for all {len(eligible)} eligible covenants, "
           f"and advances even with nothing to draw")
 

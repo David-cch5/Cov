@@ -29,11 +29,23 @@ from app.recorder.adapters import publicsearch
 from app.recorder.session import recorder_context
 
 
+# A recorded date before this is a placeholder, not a date. Nueces' own index
+# stamps 1/1/1800 on plat rows whose real recording date it does not carry
+# (confirmed live: six PALMILLA BEACH REPLAT rows). That matters more here than
+# anywhere else, because this module deliberately takes the EARLIEST date per
+# section -- so a placeholder is not merely wrong, it WINS, and 1800-01-01 would
+# have become the formation date of lots platted in 2013. Texas counties did not
+# record subdivision plats before statehood; anything this old is the index
+# saying "unknown", and unknown belongs in the date column as NULL.
+_EARLIEST_PLAUSIBLE_PLAT_YEAR = 1850
+
+
 def _parse_slash_date(s: str | None):
     try:
-        return datetime.strptime((s or "").strip(), "%m/%d/%Y").date()
+        parsed = datetime.strptime((s or "").strip(), "%m/%d/%Y").date()
     except ValueError:
         return None
+    return None if parsed.year < _EARLIEST_PLAUSIBLE_PLAT_YEAR else parsed
 
 
 def _flag_plat_lookup_note(session, covid: int, tract_no: int, note: str) -> None:
@@ -72,7 +84,33 @@ def resolve_plats_for_tract(session, covid: int, tract_no: int) -> dict:
     live (once per subdivision name), and assign parcel.plat_id wherever a
     (subdivision, section) match is found. Never guesses a match -- an
     ambiguous description or an unresolved section is flagged on the
-    covenant, not silently skipped or silently assumed."""
+    covenant, not silently skipped or silently assumed.
+
+    KNOWN LIMIT, measured 2026-08-11 and not yet fixed: this searches the
+    recorder's plat index with the parcel's OWN RECITED subdivision string, and a
+    CAD's recited string is frequently not a name any plat index holds. It works
+    where the two happen to agree -- Denton linked 212 of 213 parcels, Montgomery
+    193 -- and fails wholesale where they don't:
+
+        recited by the CAD                                 the real plat's name
+        PALMILLA BEACH PUD UNIT 4C 2175 SQFT OUT OF BLK 10  PALMILLA BEACH
+        HEIGHTS AT WESTRIDGE PHASE III                      HEIGHTS AT WESTRIDGE
+        SHERMAN CROSSING ADDITION BLK A                     SHERMAN CROSSING
+        GLENEAGLES 04                                       GLENEAGLES
+
+    Nueces' own index answers "PALMILLA BEACH" with 39 real plat rows, so the
+    plats are there and findable -- 630 Nueces and 85 Collin parcels are blocked
+    on the QUERY, not on the records. app/gis/plat_link.py already solves exactly
+    this (plats_needed's `search_name` collapses spelling variants to the token
+    prefix every spelling shares, and _sections_match canonicalises 01/1/06B/ONE
+    B), so the fix is to search that collapsed name here and let plat_link do the
+    matching -- not to write a second matcher.
+
+    Until then, a failed search writes lookup_status='not_found', and because
+    `already_known` is keyed on the recited name that row SUPPRESSES the next
+    search for it. 33 such rows were written and deleted again by hand today.
+    Anything written by a name from the left column above is an artifact of the
+    query, never evidence that a plat does not exist."""
     row = session.execute(
         text("""
             SELECT c.county_fips, r.base_url

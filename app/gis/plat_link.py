@@ -170,6 +170,12 @@ def normalize_subdivision(name: str) -> str:
     out = re.sub(r"\s+", " ", out).strip()
     out = re.sub(r"\s+THE$", "", out)
     out = re.sub(r"^THE\s+", "", out)
+    # A DANGLING SECTION LABEL IS NOT PART OF THE NAME. Denton's own plat rows are
+    # named "SHERMAN CROSSING ADDITION PHASE" -- the word survives in the name
+    # after its number was pulled into the section column, so the plat and the
+    # parcel that recites "SHERMAN CROSSING ADDITION PHASE 2A" disagreed by one
+    # trailing word and 212 correct links went unreproduced.
+    out = re.sub(r"\s+(PHASE|PH|SECTION|SEC|UNIT)$", "", out)
     return out
 
 
@@ -379,5 +385,32 @@ def plats_needed(session, min_parcels: int = 1) -> list[dict]:
             continue
         entry["spellings"] = sorted(entry["spellings"])
         entry["sections"] = sorted(entry["sections"])
+        # The two-token group key is right for COLLAPSING spellings and wrong as
+        # the query itself: it asks a recorder's plat index for "RESERVE ON" and
+        # "HEIGHTS AT". The searchable name is the longest token prefix all the
+        # group's spellings share, which recovers "RESERVE ON LAKE CONROE" and
+        # "HEIGHTS AT WESTRIDGE" while still collapsing PALMILLA BEACH's five
+        # variants onto the two words they agree on.
+        entry["search_name"] = _common_prefix_name(entry["spellings"]) or entry["search_name"]
         out.append(entry)
     return sorted(out, key=lambda e: -e["parcels"])
+
+
+def _common_prefix_name(spellings: list[str]) -> str:
+    """Longest leading run of whole tokens shared by every spelling.
+
+    Whole tokens, not characters: a character-wise prefix of "PALMILLA BEACH" and
+    "PALMILLA BEACHES" would end mid-word and search for a name no county wrote.
+    A trailing bare section number is dropped, since the plat index is searched by
+    subdivision and returns every filing at once."""
+    if not spellings:
+        return ""
+    token_lists = [s.split() for s in spellings]
+    prefix: list[str] = []
+    for tokens in zip(*token_lists):
+        if len(set(tokens)) != 1:
+            break
+        prefix.append(tokens[0])
+    while prefix and re.fullmatch(r"\d{1,2}[A-Z]?", prefix[-1]):
+        prefix.pop()
+    return " ".join(prefix)

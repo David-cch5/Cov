@@ -48,7 +48,8 @@ def test_persisted_plat_resolution_covid_4440() -> None:
     per historical batch."""
     with get_session() as session:
         plat_rows = session.execute(text(
-            "SELECT subdivision_name, count(*) AS n FROM plat "
+            "SELECT subdivision_name, count(*) AS n, count(recording_date) AS dated, "
+            "       count(recording_instrument) AS instr FROM plat "
             "WHERE county_fips = '48339' AND lookup_status = 'found' GROUP BY subdivision_name"
         )).fetchall()
         assigned = session.execute(text("""
@@ -59,17 +60,38 @@ def test_persisted_plat_resolution_covid_4440() -> None:
         cov = session.execute(text("SELECT review_reason FROM covenant WHERE covid = 4440")).fetchone()
 
     plats_by_subdivision = {r.subdivision_name: r.n for r in plat_rows}
-    assert plats_by_subdivision == {
-        "HARRINGTON TRAILS": 13, "THE CANOPIES": 5, "THE PRESSWOODS": 9,
-        "TIMBERS EDGE": 4, "TOWNSEND RESERVE": 2,
-    }, plats_by_subdivision
+    # The five hand-verified subdivisions, asserted exactly. Not an equality on the
+    # whole dict any more: later plat lookups legitimately add subdivisions to this
+    # county (CRESCENT COVE, LAKE CREST ESTATES and THE RESERVE ON LAKE CONROE
+    # arrived on 2026-08-11), and a test that fails because real plats were found
+    # teaches a future session to stop looking them up. What must hold for every
+    # row, old or new, is checked below instead: a 'found' plat carries a real date
+    # and a real instrument, or it is not a finding.
+    for name, n in {"HARRINGTON TRAILS": 13, "THE CANOPIES": 5, "THE PRESSWOODS": 9,
+                    "TIMBERS EDGE": 4, "TOWNSEND RESERVE": 2}.items():
+        assert plats_by_subdivision.get(name) == n, (name, plats_by_subdivision)
+    undated = [(r.subdivision_name, r.n) for r in plat_rows if r.dated != r.n or r.instr != r.n]
+    assert not undated, f"a 'found' plat with no date or instrument asserts nothing: {undated}"
     # 4001, not 4002: apn 532316 (Townsend Reserve 01) overlapped tract 2 by
     # 7.43 m2 and was excluded in the 2026-08-07 review of every flagged
     # non-tract parcel (scripts/review_flagged_non_tract_parcels.py).
     assert assigned == 4001, assigned
     assert "PLAT LOOKUP" in cov.review_reason, cov.review_reason
-    assert "DUSTY TRAILS" in cov.review_reason, cov.review_reason
-    print("PASS: resolve_plats_for_tract (covid 4440, both tracts) -> 5 real subdivisions, "
+    # DUSTY TRAILS is asserted against the plat TABLE, not the covenant note. The
+    # note is regenerated per run and _flag_plat_lookup_note replaces this tract's
+    # own prior text wholesale, so a later run legitimately drops a subdivision
+    # that is no longer among that run's unresolved parcels -- as the 2026-08-11
+    # re-run did. The durable record of "searched, genuinely not found" is the
+    # lookup_status='not_found' row, and that is what must survive.
+    with get_session() as session:
+        dusty = session.execute(text("""
+            SELECT lookup_status FROM plat
+             WHERE county_fips = '48339' AND subdivision_name = 'DUSTY TRAILS'
+        """)).fetchone()
+    assert dusty is not None and dusty.lookup_status == "not_found", dusty
+    print(f"PASS: resolve_plats_for_tract (covid 4440, both tracts) -> the 5 verified "
+          f"subdivisions intact among {len(plat_rows)} now held, every one dated and "
+          f"instrumented, "
           "33 real dated plat filings, 4001 parcels assigned, 2 genuinely-unfound "
           "subdivisions correctly flagged rather than guessed")
 

@@ -195,6 +195,20 @@ def search_plats_by_subdivision(context: BrowserContext, base_url: str, subdivis
             raise RuntimeError("Department combobox control not found (page layout may have changed)")
         control.click()
         page.wait_for_timeout(300)
+        departments = [o.inner_text().strip()
+                       for o in page.query_selector_all("div[id*='option']")]
+        if "Plats" not in departments:
+            # NOT EVERY COUNTY ON THIS VENDOR HAS A PLATS DEPARTMENT. Confirmed
+            # live 2026-08-11: Denton and Collin both offer one; Nueces offers
+            # Official Public Records, Marriage, Foreclosures, Miscellaneous,
+            # Marks and Brands, Commissioners Court, Public Notice and Campaign
+            # Reports -- and no Plats. Its plats are filed in the default
+            # department as MAP and PLAT document types instead (the same place
+            # covid 5963's 2008 replat was found). Clicking a department that
+            # isn't there timed out five times and got recorded as a portal
+            # failure, when the real answer was "search somewhere else".
+            page.keyboard.press("Escape")
+            return _search_plats_in_default_department(page, base_url, subdivision_name)
         page.click("text=Plats", timeout=5000)
         page.wait_for_timeout(300)
         page.fill(f"#{SEARCH_BOX_ID}", subdivision_name)
@@ -209,6 +223,32 @@ def search_plats_by_subdivision(context: BrowserContext, base_url: str, subdivis
         return _parse_results_table(page)
     finally:
         page.close()
+
+
+# Document types that ARE a subdivision plat, for counties with no Plats
+# department. Taken from what Nueces' own index actually returns for a
+# subdivision name, not from a guess at the vendor's vocabulary.
+_PLAT_DOC_TYPES = {"MAP", "PLAT", "REPLAT", "MAP/PLAT", "PLAT/MAP", "AMENDED PLAT"}
+
+
+def _search_plats_in_default_department(page, base_url: str, subdivision_name: str) -> list[dict]:
+    """Plat records from a county with no Plats department: the ordinary search,
+    narrowed to plat document types.
+
+    The narrowing is the whole point -- an unfiltered subdivision search returns
+    deeds, liens and releases naming the same subdivision, and treating one of
+    those as the plat would date the lots from a mortgage. Returned rows keep this
+    vendor's own column names, so app/gis/plat_tracking.py consumes them exactly
+    as it consumes real Plats-department rows."""
+    page.fill(f"#{SEARCH_BOX_ID}", subdivision_name)
+    page.click('[data-testid="searchSubmitButton"]')
+    try:
+        page.wait_for_selector("table", timeout=20000)
+    except Exception:
+        return _no_table_verdict(page, base_url, subdivision_name)
+    page.wait_for_timeout(500)
+    return [r for r in _parse_results_table(page)
+            if (r.get("DOC TYPE") or "").strip().upper() in _PLAT_DOC_TYPES]
 
 
 def _digits_only(s: str) -> str:
