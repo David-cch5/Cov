@@ -108,9 +108,16 @@ def merge_tagged_note(review_reason: str | None, tag: str, note: str | None = No
 # is a deliberate act.
 RECORD_ONLY_TAGS = (
     "ANCHOR RESOLVED",
-    "ENCUMBERED LAND SUMMARY",
     "RE-VERIFIED",
 )
+
+# ENCUMBERED LAND SUMMARY is deliberately NOT here, though it started as a
+# summary and reads like one. On covid 4956 it was the natural place to record an
+# open question -- 0.1381 ac of the tract lying inside a parcel that may be
+# partially encumbered, unresolved until a plat is read -- and a tag that can
+# carry either a record or a concern has to count as a concern. Being wrong in
+# that direction leaves a covenant flagged for a human; being wrong the other way
+# marks encumbered land finished.
 
 
 def strip_record_only_notes(review_reason: str | None) -> str:
