@@ -751,6 +751,48 @@ def test_unchanged_resync_writes_no_history() -> None:
     print(f"PASS: an unchanged re-sync writes no history row ({before} stays {after})")
 
 
+def test_parcel_formation_stands_on_a_recorded_instrument() -> None:
+    """A formation date is only ever read from a recorded plat, never inferred.
+    ~3,000 parcels are raw abstract-survey tracts with no formation event, and
+    their formed_date stays NULL -- the correct answer, not a gap to fill. The
+    CHECK constraint refuses half a citation, because a date trusted with nothing
+    behind it is how a fabricated figure reaches a fee calculation."""
+    from app.db.session import get_session
+    from app.gis.formation import derive_formation_from_plats
+
+    with get_session() as session:
+        stats = derive_formation_from_plats(session)
+        assert stats["formed"] > 4000, stats
+        assert stats["platted_but_no_plat_date"] == 0, (
+            f"a parcel linked to a plat must get that plat's date: {stats}")
+        # Re-running writes nothing: idempotent by construction.
+        again = derive_formation_from_plats(session)
+        assert again["written"] == 0, f"re-run must be a no-op, wrote {again['written']}"
+
+        # Every formation date has its instrument and its kind of evidence.
+        bad = session.execute(text("""
+            SELECT count(*) FROM parcel
+             WHERE (formed_date IS NOT NULL) <> (formed_by_instrument IS NOT NULL)
+                OR (formed_date IS NOT NULL) <> (formation_source IS NOT NULL)""")).scalar()
+        assert bad == 0, f"{bad} parcel(s) carry a partial formation citation"
+
+        # And the constraint actually refuses one.
+        try:
+            session.execute(text("""
+                UPDATE parcel SET formed_date = DATE '2020-01-01', formed_by_instrument = NULL,
+                                  formation_source = NULL
+                 WHERE county_fips = '48113' AND apn = '24123500010010000'"""))
+            session.flush()
+        except Exception:
+            session.rollback()
+        else:
+            session.rollback()
+            raise AssertionError("a formation date with no instrument must be refused")
+    print(f"PASS: {stats['formed']:,} parcels formed from recorded plats, "
+          f"{stats['no_plat_reference']:,} correctly NULL, re-run is a no-op, "
+          f"partial citations refused")
+
+
 if __name__ == "__main__":
     test_classify_wrong_boundary_method_raises()
     test_resolve_subdivision_plat_tract_per_tract_reference()
@@ -770,3 +812,4 @@ if __name__ == "__main__":
     test_dallas_uses_current_geometry_not_the_2019_snapshot()
     test_superseded_parcel_geometry_is_kept_not_overwritten()
     test_unchanged_resync_writes_no_history()
+    test_parcel_formation_stands_on_a_recorded_instrument()
