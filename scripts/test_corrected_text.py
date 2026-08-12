@@ -36,21 +36,26 @@ def test_a_segment_correction_never_replaces_the_document() -> None:
           f"get_deed_text still returns all {len(whole):,} chars")
 
 
-def test_corrected_is_not_verified_and_the_evidence_travels() -> None:
-    """The repairs made all 14 calls readable and the area land within 0.6%, and the
-    traverse still closes at 1:25. Parsing is not correctness, so the claim stays
-    false and says why."""
+def test_closure_picked_the_reading_not_preference() -> None:
+    """Which of three witnesses is right is decided by the land, not by whose text it
+    is. Covid 4981's Young Survey tract walks to 0.02 ft over 2,892 ft (1:186,912) from
+    the reviewed sheet and to 115.13 ft (1:25) from the document's own OCR -- the same
+    14 courses, one of them misread in the scan. The sheet won on that evidence, and
+    the rejected alternative is kept so the choice can be re-examined."""
     rec = load_correction(4981, "tract_young_survey_11878")
-    assert rec["verified"] is False, "a 1:25 closure is not verified"
     ev = rec["evidence"]
+    assert rec["verified"] is True, "a 1:186,912 closure is verified"
     assert ev["courses_read"] == ev["thence_calls"] == 14, ev
-    assert ev["closure_ratio_denominator"] < 1000, ev
-    assert abs(ev["area_acres"] - ev["stated_acres"]) < 0.1, ev
-    assert "why_not_verified" in ev and ev["why_not_verified"], ev
+    assert ev["closure_ratio_denominator"] > 100000, ev
+    assert abs(ev["area_acres"] - ev["stated_acres"]) < 0.05, ev
+    assert ev["source"] == "COV_EXHA_EXTRACT.xlsx", ev
+    rejected = ev["rejected_alternative"]
+    assert rejected["closure_ratio_denominator"] < 100, rejected
+    assert rejected["closure_error_ft"] > ev["closure_error_ft"] * 1000, rejected
     assert rec["corrected_by"] and rec["basis"], rec
-    print(f"PASS: recorded corrected-but-not-verified -- {ev['courses_read']}/"
-          f"{ev['thence_calls']} calls, area {ev['area_acres']} vs {ev['stated_acres']}, "
-          f"closure 1:{ev['closure_ratio_denominator']}")
+    print(f"PASS: the reviewed sheet's reading closes 1:{ev['closure_ratio_denominator']:,} "
+          f"against the document OCR's 1:{rejected['closure_ratio_denominator']}, and the "
+          f"loser is recorded alongside it")
 
 
 def test_a_correction_must_name_its_author_and_evidence() -> None:
@@ -85,7 +90,7 @@ def test_corrections_are_listable_per_covenant() -> None:
 
 if __name__ == "__main__":
     test_a_segment_correction_never_replaces_the_document()
-    test_corrected_is_not_verified_and_the_evidence_travels()
+    test_closure_picked_the_reading_not_preference()
     test_a_correction_must_name_its_author_and_evidence()
     test_corrections_are_listable_per_covenant()
     print("\nall corrected-text tests passed")
