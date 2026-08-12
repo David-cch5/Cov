@@ -327,3 +327,38 @@ covid 3297's 28 transfers came from a name walk instead.
 
 Registering those URLs per county is therefore the highest-value title work
 available, and it is cheaper than any walking improvement.
+
+### Node identity: a surrogate key AND a readable label (both)
+
+A stable surrogate `node_id` is what parents, transfers and fees point at, so a
+covenant can be re-tracted or a tract re-read without rewriting every reference. A
+human-readable label rides alongside it -- county / covid / tract, then the split
+path, e.g. `48339-4780-T1.2.1` -- because a payoff statement, a review note and a
+person reading either one need to see WHICH piece of land is meant. Neither
+substitutes for the other: the label is for humans and can be regenerated, the
+surrogate is for referential integrity and never changes.
+
+### Acreage is a LEDGER, not a field -- because one deed can convey two tracts
+
+The stakeholder's point, and it decides money: a seller can convey TWO tracts in a
+single deed, one encumbered by the covenant and one not. The same happens with lots.
+
+So **a deed's stated acreage is a fact about the DEED, not about the covenant's
+land.** Subtracting it from the parent silently corrupts the retained remainder, and
+a fee computed from it overstates what is owed, because the covenant does not reach
+the unencumbered part of that conveyance.
+
+Each node therefore carries measurements, each with its own basis and source, rather
+than one authoritative number:
+
+    stated        what the instrument says it conveyed (about the deed)
+    encumbered    how much of that lies inside THIS covenant's tract -- the
+                  quantity a fee accrues on
+    derived       parent minus its siblings (arithmetic; only meaningful when the
+                  conveyance stayed inside the tract)
+    gis           from geometry, once the node has a parcel or a plat
+
+A disagreement between stated and derived is a FINDING, not an error to average
+away, and its commonest cause is exactly this: the conveyance reached outside the
+tract. Chase it to the deed -- the same rule CLAUDE.md already applies to a traverse
+that fails to close. Never reconcile by adjusting a number nobody recorded.

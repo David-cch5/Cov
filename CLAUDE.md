@@ -119,7 +119,17 @@ that row. The spine is the covenant's own acreage tract (minted id, unless its l
 description names an account), split forward by DEEDS: every conveyance creates two
 nodes, the piece conveyed AND the piece retained. An APN is something a node acquires
 at the leaf, when its owner is identifiable or it gets platted -- never the identity
-it is keyed on. `parcel_lineage` (APN-to-APN, written by `app/gis/monitor.py` when it
+it is keyed on. Nodes carry BOTH a stable surrogate id (what parents, transfers and
+fees reference) and a readable county/covid/tract split-path label (what a payoff
+statement shows a human).
+
+**Acreage on a node is a ledger, not a number, because one deed can convey two
+tracts -- one encumbered and one not.** A deed's stated acreage is a fact about the
+DEED; how much of it lies inside this covenant's tract is a separate quantity, and it
+is the one a fee accrues on. Subtracting a deed's total from the parent corrupts the
+retained remainder and overstates the fee. A stated-vs-derived disagreement is a
+finding to chase to the document -- most often a conveyance that reached outside the
+tract -- never something to reconcile by inventing a number. `parcel_lineage` (APN-to-APN, written by `app/gis/monitor.py` when it
 observes a retirement) is a different, narrower job and is not this spine. Full
 design in BUILD_SPEC.md.
 
