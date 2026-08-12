@@ -391,6 +391,20 @@ def backfill_from_plats(session, covid: int, tract_no: int = 1, *,
                    "plat_id": plat_id, "source_id": source_id})
             made += 1
 
+    # A NODE'S plat_id FOLLOWS ITS PARCEL. plat_link legitimately re-points a parcel at
+    # a different filing (a mis-keyed lot row corrected to its real phase plat), and a
+    # node recorded before that keeps the old plat_id -- which then blocks deleting the
+    # superseded plat row and, worse, makes the node cite a filing its parcel no longer
+    # claims. Re-synced on every back-fill so the spine cannot drift from the census.
+    session.execute(text("""
+        UPDATE tract_node n SET plat_id = p.plat_id, updated_at = now()
+          FROM parcel p
+         WHERE p.county_fips = n.county_fips AND p.apn = n.apn
+           AND n.covid = :covid AND n.tract_no = :tract_no
+           AND n.apn IS NOT NULL AND p.plat_id IS NOT NULL
+           AND (n.plat_id IS DISTINCT FROM p.plat_id)
+    """), {"covid": covid, "tract_no": tract_no})
+
     # THE REMAINDER EACH PLAT LEFT RAW, ensured over EVERY plat event on this tract --
     # not only ones this call added. Creating it inside the insert loop meant an
     # already-back-filled tract got none, because that loop only sees parcels without
