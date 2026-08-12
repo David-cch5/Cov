@@ -113,6 +113,26 @@ encumbered. On current geometry the parcel matches the deed's stated acreage to 
   is reported as unverifiable rather than assumed current. Verify a Travis parcel against a
   known figure before trusting acreage there.
 
+## Land lineage runs from the TRACT forward, and Texas has no retired APNs
+A lineage model whose parent is an old APN cannot work here -- the county deletes
+that row. The spine is the covenant's own acreage tract (minted id, unless its legal
+description names an account), split forward by DEEDS: every conveyance creates two
+nodes, the piece conveyed AND the piece retained. An APN is something a node acquires
+at the leaf, when its owner is identifiable or it gets platted -- never the identity
+it is keyed on. `parcel_lineage` (APN-to-APN, written by `app/gis/monitor.py` when it
+observes a retirement) is a different, narrower job and is not this spine. Full
+design in BUILD_SPEC.md.
+
+## Chain of title: assessor first, recorder only for the gaps
+Once a lot has an APN, get its deed history from the county ASSESSOR -- one request,
+already keyed to the parcel. Walk the recorder index only for the gaps the assessor
+leaves, and scope that search to the gap's own years rather than searching a county
+by name. A gap is often a FORECLOSURE (the trustee is the grantor, so the
+grantor->grantee name chain breaks there), which is a lead rather than a dead end.
+`walk_chain_of_title` already prefers the assessor; what is missing is per-county
+CONFIGURATION -- as of 2026-08-12 only Bexar has an assessor deed-history URL
+registered, so every other county silently falls back to a name walk.
+
 ## Non-negotiables
 - **Accuracy over completeness.** Every covenant passes a reconciliation check before it is
   considered done: classified acreage must reconcile with the covenant's stated acreage, and

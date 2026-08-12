@@ -258,3 +258,72 @@ check whether the deed already names an existing parcel (covid 5839 named its CA
 
 **Boundary parcels are never trusted on a raw match count** (CLAUDE.md non-negotiable,
 `app/gis/classifier.py`). Confirmed real: 254 matched parcels were actually 214.
+
+
+---
+
+## Land lineage: the spine is the TRACT, not the APN (design, 2026-08-12)
+
+Stated by the stakeholder and recorded here because it overturns how this project
+had been modelling lineage.
+
+**Texas counties do not keep retired APNs.** So a lineage table whose parent must be
+an old APN can never be populated here: the parent is exactly the row the county
+deletes. `parcel_lineage` (migration 0029) is APN-to-APN and its foreign keys
+require both ends to be live `parcel` rows, so it can only ever record splits this
+project OBSERVES happening while watching -- which is what `app/gis/monitor.py`
+does, and why it has produced 0 edges in 66 runs. That table stays for that job.
+It is not the lineage spine.
+
+**The spine starts at the acreage tract and runs forward on DEEDS.**
+
+    root        the covenant's own encumbered tract, as its legal description
+                describes it. It gets a minted id -- unless the legal description
+                itself names an account/APN, in which case use that.
+    a split     a deed conveying part of the tract creates TWO child nodes:
+                  * the piece CONVEYED
+                  * the piece RETAINED (the remainder, which nobody records a
+                    document for, and which is the node this project has been
+                    silently dropping)
+    forward     each child can be split again by its own later deed, on and on to
+                today
+    leaf        when a node's current owner is identifiable, it has an APN; when it
+                is platted, the APN and its data are already fetched (see
+                app/gis/plat_link.py, app/gis/formation.py)
+
+So an APN is an attribute a node ACQUIRES at the leaf, not the identity a node is
+keyed on. The retained remainder is a first-class node: it is how "how much of this
+covenant's land is still in the declarant's hands" is answerable at all, and it has
+no instrument of its own to be discovered by.
+
+This is back-fillable from deeds, unlike the APN-to-APN model. It needs its own
+table: nodes keyed on a minted tract id, with parent, the splitting instrument and
+its date, a conveyed/retained flag, acreage, and OPTIONAL (county_fips, apn) and
+plat_id populated once known.
+
+## Chain of title: ask the assessor first, the recorder only for the gaps
+
+Also stated by the stakeholder, and the order matters for cost as much as accuracy:
+
+1. **Once a lot has an APN/AAN, do NOT walk the recorder index.** Get the deed
+   history from the county ASSESSOR. It is one request, already keyed to the
+   parcel, and needs no name matching.
+2. **Only then walk the recorder records, for the GAPS the assessor left** -- and
+   that search is narrow, because the gap's own bracketing dates say which years to
+   look in. This is the opposite of a countywide name search.
+3. **A gap is a lead, not just a hole.** A missing link is often a FORECLOSURE
+   sale, which is precisely the event that breaks a grantor->grantee name chain
+   (the trustee, not the owner, is the grantor). Foreclosure doc types are already
+   classified -- see migration 0031 and app/title/chain.py.
+
+`walk_chain_of_title` ALREADY implements this preference: it checks
+cad_deed_history_url, then mcad_deed_history_url, then cad_sales_data_url, and only
+then falls back to the recorder-portal name walk. The problem measured 2026-08-12 is
+CONFIGURATION, not logic -- of 15 registered counties, only Bexar has any assessor
+deed-history URL on record, so every other county falls through to the portal by
+default. Montgomery is the sharpest case: its MCAD deed-history adapter is built and
+has its own passing tests, and no `mcad_deed_history_url` is registered anywhere, so
+covid 3297's 28 transfers came from a name walk instead.
+
+Registering those URLs per county is therefore the highest-value title work
+available, and it is cheaper than any walking improvement.
