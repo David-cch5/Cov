@@ -63,7 +63,13 @@ _COURSE_RE = re.compile(
     # stays safe because the terminator must follow "feet" immediately: the
     # intermediate "at 1125.15 feet PASS a 5/8 inch iron rod" recitals are still
     # skipped, and the non-greedy match still lands on the total distance.
-    r"[^;]*?([\d,]+\.?\d*)\s*" + _FEET + r"\s*(?:\(Deed[^)]*\))?\s+(?:to|for)\b",
+    #
+    # A COMMA MAY SIT BEFORE THE TERMINATOR: "for a distance of 121.92 feet, to a 1/2
+    # inch iron rod found". Requiring whitespace there dropped two of covid 4981's own
+    # calls -- and dropped them SILENTLY, since a missing course only shows up as a bad
+    # closure. The terminator must still follow the distance immediately, so the "at
+    # 1125.15 feet PASS a rod" recitals are skipped exactly as before.
+    r"[^;]*?([\d,]+\.?\d*)\s*" + _FEET + r"\s*(?:\(Deed[^)]*\))?[,]?\s+(?:to|for)\b",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -179,7 +185,7 @@ _CHORD_CURVE_RE = re.compile(
     r"(?:curve\s+to\s+the\s+(right|left)[^.;]{0,80}?)?"
     r"arc\s+(?:distance|length)\s+of\s+([\d,]+\.?\d*)\s*" + _FEET +
     r"[^.;]{0,40}?[Cc]hord\s+[Bb]e[a4]ring\s+(North|South)\s*" + _DMS_OCR + _SEP +
-    r"(" + _EAST + r"|" + _WEST + r")\s*[-–—]?\s*([\d,]+\.?\d*)\s*" + _FEET,
+    r"(" + _EAST + r"|" + _WEST + r")[,\s]*[-–—]?[,\s]*([\d,]+\.?\d*)\s*" + _FEET,
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -212,6 +218,24 @@ _OCR_WORD_REPAIRS = (
     (re.compile(r"(\d)\s*\bfect\b", re.I), r"\1 feet"),
     (re.compile(r"(" + _FEET + r")\s*,?\s+10\s+(a|an|the)\b", re.I), r"\1, to \2"),
 )
+
+
+def _repair_chord_against_arc(chord_ft: float | None, arc_ft: float | None) -> float | None:
+    """A CHORD CAN NEVER EXCEED ITS ARC -- it is the straight line between the same two
+    points. So a chord reading 6491 feet against a 65.08 foot arc is not a long chord,
+    it is a lost decimal point (covid 4981: "East, - 6491 feet}").
+
+    Repaired only when the reading is UNIQUE, the same discipline
+    repair_quadrant_by_closure applies: shifting the decimal two places must land in
+    [0.9 x arc, arc], which is where a real chord sits for any ordinary boundary curve.
+    Anything else is left alone to fail loudly in the closure rather than be guessed
+    at."""
+    if chord_ft is None or arc_ft is None or arc_ft <= 0 or chord_ft <= arc_ft:
+        return chord_ft
+    candidate = chord_ft / 100.0
+    if 0.9 * arc_ft <= candidate <= arc_ft:
+        return candidate
+    return chord_ft
 
 
 def repair_ocr_survey_words(text: str) -> str:
@@ -461,9 +485,10 @@ def extract_courses(text: str) -> list[Course]:
     matches: list[tuple[int, Course]] = []
     for m in _CHORD_CURVE_RE.finditer(text):
         direction, arc, ns, deg, minute, sec, ew, chord = m.groups()
+        chord_ft = _repair_chord_against_arc(_feet(chord), _feet(arc))
         matches.append((m.start(), Course(
             ns=ns, degrees=float(deg), minutes=float(minute), seconds=float(sec),
-            ew=ew, distance_ft=_feet(chord), is_curve=True,
+            ew=ew, distance_ft=chord_ft, is_curve=True,
             curve_direction=direction.lower() if direction else None,
             arc_length_ft=_feet(arc))))
     for m in _COURSE_RE.finditer(text):
