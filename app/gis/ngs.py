@@ -85,17 +85,21 @@ class NgsDatasheetUnreadable(NgsUnanswered):
 
 
 class NgsNamedMarkUnresolved(NgsUnanswered):
-    """Marks came back, under the cap, and none is one the deed names.
+    """A search resolved none of the marks a DEED names.
 
-    The last of the four ways this search can come up empty, and the one that
-    stayed silent longest: the other three raise, while this fell through and
-    returned {} -- which anchor_resolver's NGS tier read as "no tie here" and
-    walked on toward the paid tiers. Caught after covid 5838's 1.029 ac carve-out
-    intermittently declined a tie it places on eleven runs out of twelve.
+    Raised by the caller, not by find_monuments, and the distinction is the
+    whole point. find_monuments is a generic client: marks came back, none was
+    the one asked for, nowhere near the cap -- it cannot tell a complete answer
+    from a partial one, so it reports what it saw and returns empty. What makes
+    that not an answer is evidence it does not have: the deed reciting "a
+    National Geodetic Survey monument stamped X bears ...", which says the
+    monument exists. Only app/gis/anchor_resolver.py's NGS tier holds that, so
+    only it may draw the conclusion.
 
-    Not transient in the way an outage is, but not a finding either: retry, or
-    narrow the search area. An area a deed ties to is not empty of the monument
-    the deed names."""
+    An earlier pass put this raise inside find_monuments and thereby reversed a
+    deliberate decision recorded in scripts/test_monument_ties.py -- that a
+    genuine "not in this area" is a real answer. Both are right about their own
+    case; the seam between them is who knows what the deed says."""
 
 # NGS datasheet State Plane zone codes -> EPSG (NAD83, US survey feet).
 # Deliberately keyed on the datasheet's own spelling so the mapping is checkable
@@ -292,22 +296,5 @@ def find_monuments(designations, bbox: dict, timeout: int = 45) -> dict:
             f"{sorted(unreadable.values())}) but their datasheets did not parse, so "
             f"{sorted(missing)} could not be resolved. The bounds result is itself evidence "
             f"these marks exist -- retry later; do not treat it as 'no NGS tie available'."
-        )
-    if missing and not found:
-        # Marks came back, under the cap, and not one of them is a monument this
-        # deed names. Still not a finding about the land: the search area is a
-        # county envelope, the deed's own recital is evidence the monument exists,
-        # and NGS has been observed answering the same bbox with different
-        # subsets. Declining here would send a covenant with a free, published,
-        # survey-grade tie down to the paid LLM tiers -- ~$45-50 to answer what
-        # NGS answers for nothing -- so this reports an unanswered query and lets
-        # the queue retry with the tier still available. If the mark really is
-        # unpublished, the retries exhaust into a durable job_queue row and a
-        # person looks, which is the right destination for that too.
-        raise NgsNamedMarkUnresolved(
-            f"NGS bounds search returned {len(marks)} marks for bbox {bbox}, none of them "
-            f"{sorted(missing)}. A deed reciting a monument stamping is evidence the monument "
-            f"exists, so an incomplete result set is not evidence it does not -- retry later, "
-            f"or narrow the search area."
         )
     return found

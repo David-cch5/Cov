@@ -32,7 +32,7 @@ from app.db.review_notes import merge_tagged_note
 from app.gis.classifier import COUNTY_ADAPTERS, classify_metes_and_bounds_tract
 from app.ingestion.walk import get_deed_text
 from app.gis.geocode_anchor import resolve_metes_bounds_approximate
-from app.gis.ngs import NgsUnanswered, find_monuments
+from app.gis.ngs import NgsNamedMarkUnresolved, NgsUnanswered, find_monuments
 from app.gis.state_plane_anchor import (
     EPSG_BY_TX_ZONE,
     anchor_by_adjoining_plat,
@@ -184,8 +184,20 @@ def _try_ngs_monument_tie(session, county_fips: str, deed_text: str, courses: li
     if bbox is None:
         return None
     try:
-        monuments = find_monuments({t.designation for t in pob_ties}, bbox)
+        wanted = {t.designation for t in pob_ties}
+        monuments = find_monuments(wanted, bbox)
         if not monuments:
+            # THIS deed names those marks, which find_monuments does not know.
+            # An empty result is therefore not "no tie here" -- it is a question
+            # NGS did not answer -- and the difference is ~$45-50, since
+            # declining walks down to Opus and Fable for what NGS gives free.
+            # Raised here rather than in the client because the evidence that
+            # the monument exists is the deed's own recital, which only this
+            # tier is holding.
+            raise NgsNamedMarkUnresolved(
+                f"the deed recites monument(s) {sorted(wanted)} at its Point of Beginning, "
+                f"but the NGS search of {bbox} resolved none of them -- retry, or narrow "
+                f"the search area; do not read this as 'no NGS tie available'")
             # Defensive only. find_monuments now raises (NgsUnanswered family) on
             # every way a named mark can fail to resolve -- empty response,
             # truncated result, unparseable datasheet, or a result set that

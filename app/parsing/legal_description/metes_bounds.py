@@ -33,9 +33,36 @@ _THENCE = r"[‘’'\"`]?\s*(?:THENCE|THENCR|TRENCE|TRENCR|HENCE|TENCE)"
 # appear exclusively in SEPARATOR positions, never inside a value, so tolerating
 # them between the parts of a bearing costs no precision: the digits, the marks
 # and the quadrant words are all still matched exactly.
-_SEP = r"[\s:;|]*"
+# A COMMA is a separator here too: "North 10 degrees, 01 minutes, 04 seconds
+# East" is an ordinary way to write a bearing, and leaving the comma out of this
+# class dropped every course in descriptions that use it -- 91 calls across
+# covid 2349 alone, silently, since a missing course only shows as bad closure.
+_SEP = r"[\s:;|,]*"
 
 _SECONDS_MARK = r"(?:seconds?|sec\.?|[\"”'’]+)?"
+
+# Surveyors abbreviate, and this corpus does it constantly: "S 23-03-50 W",
+# "N 36°43'02\" W", "N32°07'". Requiring the words North/South/East/West missed
+# every one of them. The single letters are safe here only because a bearing is
+# always LETTER-DIGITS: nothing else in a deed reads "N" immediately followed by
+# a degree value.
+_NS = r"(North|South|N|S)\.?"
+_EW = r"(East|West|E|W)\.?"
+# Degrees-minutes-seconds, however written: "23 degrees 03 minutes 50 seconds",
+# "23°03'50\"", or the compact dashed "23-03-50". Named apart from the _DMS
+# defined further down, which this must not shadow -- that one is the chord-curve
+# reader's and does not accept the dashed form.
+_DMS_ANY = (r"(\d{1,3})\s*(?:degrees?|deg\.?|[°º˚]|-)" + _SEP +
+            r"(\d{1,2})\s*(?:minutes?|min\.?|['’]|-)" + _SEP +
+            r"(\d{1,2})\s*" + _SECONDS_MARK)
+
+
+def _cardinal(token: str, axis: str) -> str:
+    """Normalise an abbreviated cardinal to the word walk_traverse expects."""
+    letter = (token or "").strip(".").upper()[:1]
+    if axis == "ns":
+        return "South" if letter == "S" else "North"
+    return "West" if letter == "W" else "East"
 
 # "feet" is itself an OCR casualty: covid 5838 TRACT 5 recites the 2.59 ft course
 # as `a distance of 2.59 “et`, having eaten the "fe" entirely, and elsewhere
@@ -45,7 +72,7 @@ _SECONDS_MARK = r"(?:seconds?|sec\.?|[\"”'’]+)?"
 _FEET = r"(?:feet|fe?et|[“”‘’]e{1,2}t|ft\.?)"
 
 _COURSE_RE = re.compile(
-    _THENCE + r"[,;:]?\s+(North|South)\s*(\d{1,3})\s*(?:degrees?|deg\.?|°)" + _SEP + r"(\d{1,2})\s*(?:minutes?|min\.?|'|’)" + _SEP + r"(\d{1,2})\s*" + _SECONDS_MARK + r"" + _SEP + r"\s*(East|West)"
+    _THENCE + r"[,;:]?\s+(North|South)\s*(\d{1,3})\s*(?:degrees?|deg\.?|[°º˚])" + _SEP + r"(\d{1,2})\s*(?:minutes?|min\.?|'|’)" + _SEP + r"(\d{1,2})\s*" + _SECONDS_MARK + r"" + _SEP + r"\s*(East|West)"
     # The intervening text lists adjoiner tracts by ACREAGE, not feet, so the first
     # "<number> feet to <something>" after the bearing is reliably the course's own
     # distance -- more robust than anchoring on the literal phrase "distance of",
@@ -69,7 +96,16 @@ _COURSE_RE = re.compile(
     # calls -- and dropped them SILENTLY, since a missing course only shows up as a bad
     # closure. The terminator must still follow the distance immediately, so the "at
     # 1125.15 feet PASS a rod" recitals are skipped exactly as before.
-    r"[^;]*?([\d,]+\.?\d*)\s*" + _FEET + r"\s*(?:\(Deed[^)]*\))?[,]?\s+(?:to|for)\b",
+    #
+    # THE INTERVENING TEXT MAY NOT CROSS THE NEXT THENCE. Under DOTALL a bare
+    # "[^;]*?" happily runs past the following call to find some later
+    # "<distance> feet to", swallowing whole courses into one match. It stayed
+    # invisible while the patterns were disjoint and each call was read at most
+    # once; the moment overlapping matches are deduped, a swallowing match
+    # suppresses the good reading of every call inside it. A course's own
+    # distance is never recited after the next THENCE.
+    r"(?:(?!" + _THENCE + r")[^;])*?([\d,]+\.?\d*)\s*" + _FEET
+    + r"\s*(?:\(Deed[^)]*\))?[,]?\s+(?:to|for)\b",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -82,8 +118,50 @@ _COURSE_RE = re.compile(
 # feet;" phrasing is literally present, so this never overlaps what _COURSE_RE
 # already catches (which always ends in "to", not a bare semicolon).
 _COMPOUND_BEARING_RE = re.compile(
-    r"(North|South)\s+(\d{1,3})\s*(?:degrees?|deg\.?|°)" + _SEP + r"(\d{1,2})\s*(?:minutes?|min\.?|'|’)" + _SEP + r"(\d{1,2})\s*" + _SECONDS_MARK + r"\s+(East|West)\s*,\s*a distance of\s+([\d,]+\.?\d*)\s*feet\s*(?:\(Deed[^)]*\))?\s*;",
+    r"(North|South)\s+(\d{1,3})\s*(?:degrees?|deg\.?|[°º˚])" + _SEP + r"(\d{1,2})\s*(?:minutes?|min\.?|'|’)" + _SEP + r"(\d{1,2})\s*" + _SECONDS_MARK + r"\s+(East|West)\s*,\s*a distance of\s+([\d,]+\.?\d*)\s*feet\s*(?:\(Deed[^)]*\))?\s*;",
     re.IGNORECASE,
+)
+
+# THE COMMONEST CALL IN THIS CORPUS, and the one the parser could not read.
+#
+# _COURSE_RE requires the words North/South...East/West and a "to"/"for"
+# terminator after the distance; _COMPOUND_BEARING_RE requires the exact ", a
+# distance of N feet;" shape. Between them they miss every one of these, all
+# real, all THENCE-led boundary calls:
+#
+#   thence North 0°00'05" East 243.78 feet;              (no "to", no "distance of")
+#   thence S 23-03-50 W 99.27 feet to an iron pin;       (abbreviated, dashed DMS)
+#   thence, N 36°43'02" W 53.70 feet (L34);              (terminator is a line label)
+#   THENCE, along or near a fence, with the common line between said 143.7 acres
+#     and said Lot No. 1, N32°07'...                     (description before the bearing)
+#
+# Measured across the whole reviewed sheet: 214 of the 232 tract descriptions
+# that closed worse than 1:100 had read FEWER courses than they have THENCE
+# calls, 1,853 calls dropped in total. That is a parser gap, not bad OCR, and it
+# was invisible because a dropped course only ever shows up as a bad closure.
+#
+# What keeps this safe where _COURSE_RE needs its "to": the distance must follow
+# the BEARING immediately (only "a distance of" and punctuation may intervene),
+# so the "at 1125.15 feet PASS a rod" recitals and the adjoiner acreages recited
+# mid-call are still not mistaken for the course's own distance. The lead-in text
+# before the bearing may not cross a semicolon, so a call cannot borrow the next
+# one's bearing.
+_COMPACT_COURSE_RE = re.compile(
+    _THENCE + r"[,;:]?\s*(?:[^;]{0,160}?)?\b" + _NS + r"\s*" + _DMS_ANY + r"\s*" + _EW +
+    # The distance does not always follow the bearing immediately: "EAST along
+    # the easterly line of said lands 100.00 feet;" and "East along lands
+    # reputedly of Isidore Dobris for a distance of 226.71 feet" both describe
+    # what the line runs along first. The gap may not cross a semicolon or reach
+    # into the next call.
+    r"[.,]?(?:(?!" + _THENCE + r")[^;]){0,120}?(?:a\s+distance\s+of\s+)?"
+    r"([\d,]+\.?\d*)\s*" + _FEET +
+    # ...but it must be the call's OWN distance, so the figure has to END the
+    # call. Without this the "at 1125.15 feet PASS a 5/8 inch iron rod" recitals
+    # -- an intermediate distance along the same course -- would be read as the
+    # course itself, which is why the first version of this pattern demanded the
+    # distance sit immediately after the bearing.
+    r"\s*(?:\(Deed[^)]*\))?\s*(?=[;.,)]|$|\s*(?:to|for)\b)",
+    re.IGNORECASE | re.DOTALL,
 )
 
 # Confirmed real, and precisely diagnosed (covid 5838/Nueces): a curve call can
@@ -155,10 +233,10 @@ _WEST = r"(?:W[ae]st|W\.?)"
 # "{_D}{1,2}", which matches nothing. Defining the shape once removes that whole
 # class of mistake. _DMS_OCR additionally tolerates the letter-for-digit
 # substitutions seen in radius bearings (see _D).
-_DMS = (r"(\d{1,3})\s*(?:degrees?|deg\.?|°)" + _SEP +
+_DMS = (r"(\d{1,3})\s*(?:degrees?|deg\.?|[°º˚])" + _SEP +
         r"(\d{1,2})\s*(?:minutes?|min\.?|['’])" + _SEP +
         r"(\d{1,2})\s*" + _SECONDS_MARK)
-_DMS_OCR = (r"(" + _D + r"{1,3})\s*(?:degrees?|deg\.?|°)" + _SEP +
+_DMS_OCR = (r"(" + _D + r"{1,3})\s*(?:degrees?|deg\.?|[°º˚])" + _SEP +
             r"(" + _D + r"{1,2})\s*(?:minutes?|min\.?|['’])" + _SEP +
             r"(" + _D + r"{1,2})\s*" + _SECONDS_MARK)
 
@@ -308,7 +386,7 @@ _TANGENT_CURVE_RE = re.compile(
 # curve that DOES state its radius bearing is never read twice.
 _PC_TANGENT_CURVE_RE = re.compile(
     r"point\s+of\s+curvature\s+of\s+(?:with\s+)?(?:a|an|another)?\s*" + _CIRCULAR + r"\s+(?:curve\s+)?(?:to|fo)\s+the\s+(right|left)"
-    r"[^;]{0,40}?" + _DELTA_KEYWORD + r"\s*(\d{1,3})\s*(?:degrees?|deg\.?|°)" + _SEP + r"(\d{1,2})\s*"
+    r"[^;]{0,40}?" + _DELTA_KEYWORD + r"\s*(\d{1,3})\s*(?:degrees?|deg\.?|[°º˚])" + _SEP + r"(\d{1,2})\s*"
     r"(?:minutes?|min\.?|['\u2019])\s*(\d{1,2})\s*" + _SECONDS_MARK +
     r".{0,90}?\S*dius\s+of\s+([\d,]+\.?\d*)\s*" + _FEET +
     r".{0,260}?" + _THENCE + r"[,;:]?\s+with\s+(?:said\s+)?(?:the\s+)?" + _CIRCULAR + r"\s+curve"
@@ -482,21 +560,38 @@ def extract_courses(text: str) -> list[Course]:
     interleaved between THENCE-led courses and must come back in true traversal
     order, not "all THENCE courses, then all compound ones"."""
     text = repair_ocr_survey_words(repair_ocr_decimals(text))
-    matches: list[tuple[int, Course]] = []
+    # (start, Course, end). The END matters: the patterns below are no longer
+    # mutually exclusive -- _COMPACT_COURSE_RE deliberately overlaps _COURSE_RE
+    # on calls that have BOTH a spelled-out bearing and a "to" terminator -- so
+    # overlapping spans are resolved after the fact rather than by keeping the
+    # patterns disjoint, which is what limited them in the first place.
+    spans: list[tuple[int, Course, int]] = []
     for m in _CHORD_CURVE_RE.finditer(text):
         direction, arc, ns, deg, minute, sec, ew, chord = m.groups()
         chord_ft = _repair_chord_against_arc(_feet(chord), _feet(arc))
-        matches.append((m.start(), Course(
+        spans.append((m.start(), Course(
             ns=ns, degrees=float(deg), minutes=float(minute), seconds=float(sec),
             ew=ew, distance_ft=chord_ft, is_curve=True,
             curve_direction=direction.lower() if direction else None,
-            arc_length_ft=_feet(arc))))
+            arc_length_ft=_feet(arc)), m.end()))
     for m in _COURSE_RE.finditer(text):
         ns, deg, minute, sec, ew, dist = m.groups()
-        matches.append((m.start(), Course(
+        spans.append((m.start(), Course(
             ns=ns, degrees=float(deg), minutes=float(minute), seconds=float(sec),
             ew=ew, distance_ft=_feet(dist),
-        )))
+        ), m.end()))
+    for m in _COMPACT_COURSE_RE.finditer(text):
+        # Same guard _COMPOUND_BEARING_RE needs: "<landmark> bears <bearing>
+        # <distance>" states where a monument sits relative to a corner, not a
+        # course walking the boundary.
+        if "bears" in m.group(0).lower():
+            continue
+        ns, deg, minute, sec, ew, dist = m.groups()
+        spans.append((m.start(), Course(
+            ns=_cardinal(ns, "ns"), degrees=float(deg), minutes=float(minute),
+            seconds=float(sec), ew=_cardinal(ew, "ew"), distance_ft=_feet(dist),
+        ), m.end()))
+
     for m in _COMPOUND_BEARING_RE.finditer(text):
         # Confirmed real (covid 5838/Nueces): this pattern's own "<bearing>, a
         # distance of N feet;" shape also matches monument/reference TIES
@@ -510,10 +605,24 @@ def extract_courses(text: str) -> list[Course]:
         if "bears" in text[max(0, m.start() - 20):m.start()].lower():
             continue
         ns, deg, minute, sec, ew, dist = m.groups()
-        matches.append((m.start(), Course(
+        spans.append((m.start(), Course(
             ns=ns, degrees=float(deg), minutes=float(minute), seconds=float(sec),
             ew=ew, distance_ft=_feet(dist),
-        )))
+        ), m.end()))
+
+    # One call, one course. Where two patterns read the same text, keep the one
+    # that read MORE of it -- the longer match is the more specific reading (a
+    # curve's chord form over the bare bearing inside it, say) -- and drop
+    # anything overlapping what is already accepted. Without this, broadening the
+    # patterns would double-count calls and corrupt the traverse rather than
+    # complete it.
+    matches: list[tuple[int, Course]] = []
+    accepted_end = -1
+    for start, course, end in sorted(spans, key=lambda s: (s[0], -(s[2] - s[0]))):
+        if start < accepted_end:
+            continue
+        matches.append((start, course))
+        accepted_end = end
     # Curves are resolved AFTER the straight courses are in document order,
     # because the tangent-form ones need the previous course's own azimuth to
     # pick between the radius's two perpendiculars. Positioned at the arc

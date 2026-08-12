@@ -80,7 +80,10 @@ def test_a_declaration_row_is_not_mistaken_for_a_tract() -> None:
     rows = {e["sheet_row"]: e for e in got["sheet_tracts"]}
     assert len(rows) == 3, sorted(rows)
     assert rows[1667]["declaration"] is True, rows[1667]
-    assert rows[1667]["facts"].area_agrees is False
+    # Its closure is what keeps it out, not its area: the parser reads this row
+    # well enough that its area now agrees to 0.5%, so an area test would have
+    # let a declaration through the moment the parser improved.
+    assert (rows[1667]["facts"].closure_denominator or 0) < 10_000, rows[1667]["facts"]
     anchorable = {e["sheet_row"] for e in got["anchorable"]}
     assert anchorable == {1665, 1666}, anchorable
     print(f"PASS: covid 4981's two real tracts are anchorable (1:"

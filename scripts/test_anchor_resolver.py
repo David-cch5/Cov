@@ -252,9 +252,13 @@ def test_every_way_a_named_mark_fails_to_resolve_is_unanswered_not_absent() -> N
             _find_monuments_error(ngs, [{"name": "SF 010", "pid": "AB1234"}],
                                   datasheet="<html>maintenance</html>"),
             ngs.NgsDatasheetUnreadable),
-        "marks, but not this one": (_find_monuments_error(ngs, bulk),
-                                    ngs.NgsNamedMarkUnresolved),
     }
+    # The fourth case is NOT find_monuments'. Marks came back, under the cap,
+    # none of them ours -- a generic client cannot tell that from a complete
+    # answer of "not here", and scripts/test_monument_ties.py deliberately pins
+    # it as a real answer. What makes it unanswered is the DEED reciting the
+    # mark, which only the tier holds, so the tier is where it is raised.
+    assert _find_monuments_error(ngs, bulk) is None, "the client must not conclude absence"
     for label, (exc, expected) in got.items():
         assert exc is not None, f"{label}: returned instead of raising"
         assert isinstance(exc, ngs.NgsUnanswered), \
@@ -262,8 +266,28 @@ def test_every_way_a_named_mark_fails_to_resolve_is_unanswered_not_absent() -> N
         assert isinstance(exc, expected), f"{label}: got {type(exc).__name__}"
         assert "retry" in str(exc).lower() or "search again" in str(exc).lower(), \
             f"{label}: the message must tell a caller what to do, not just what failed"
-    print(f"PASS: all {len(got)} ways a named mark fails to resolve raise NgsUnanswered -- "
-          f"none reports a published monument absent")
+    from app.gis.anchor_resolver import _try_ngs_monument_tie
+
+    _, segments = _covid_5838_excepted_segments()
+    segment = segments[0][1]        # a carve-out that DOES tie its own POB to SF 010
+    real_get = ngs._get
+    ngs._get = lambda *a, **k: _StubResponse(bulk)
+    try:
+        with get_session() as session:
+            try:
+                _try_ngs_monument_tie(session, "48355", segment, extract_courses(segment))
+            except ngs.NgsNamedMarkUnresolved:
+                pass
+            except Exception as exc:                          # noqa: BLE001
+                raise AssertionError(f"tier raised {type(exc).__name__}, not Unresolved") from exc
+            else:
+                raise AssertionError("a deed naming a mark the search did not resolve must "
+                                     "not read as 'no tie here'")
+    finally:
+        ngs._get = real_get
+    print(f"PASS: {len(got)} client-side failures raise NgsUnanswered; a result set simply "
+          f"lacking the mark returns empty, and the TIER -- which holds the deed's own "
+          f"recital -- is what calls that unanswered")
 
 
 def test_verify_llm_anchor_rejects_acreage_mismatch() -> None:
