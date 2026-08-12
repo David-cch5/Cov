@@ -147,9 +147,10 @@ def check_formation_date_plausibility(session, covid: int | None = None) -> dict
                         conveyances of the ancestor tract, recorded against the lot's
                         own APN because that is the only place chain.py had to put
                         them. Those belong on an ancestor node of the tract spine
-                        (app/title/tract_spine.py), not on the lot. So this finding
-                        means "the date or the attachment is wrong", and each row
-                        carries which reading to check first.
+                        (app/title/tract_spine.py), and once recorded there the
+                        transfer is EXPLAINED and drops out of this finding. What is
+                        left is genuinely unaccounted for: either the date is wrong or
+                        the chain is attached to the wrong parcel.
       future_date       a formation date after today.
 
     Deliberately no auto-repair. Each of these has more than one possible cause (the
@@ -191,13 +192,33 @@ def check_formation_date_plausibility(session, covid: int | None = None) -> dict
          ORDER BY (e.first_filing - p.formed_date) DESC LIMIT 200
     """), params).fetchall()
 
+    # A PRE-PLAT CONVEYANCE STOPS BEING A FINDING ONCE THE SPINE EXPLAINS IT. The lot
+    # genuinely did not exist in 2011; the deed conveyed the ANCESTOR tract. Recording
+    # that ancestry (app/title/tract_spine.py record_split) is the fix, and this query
+    # recognises it: a transfer whose instrument appears on any ancestor of the
+    # parcel's own spine node is accounted for. Anything left is still unexplained --
+    # either the date is wrong or the chain is on the wrong parcel.
     conveyed_early = session.execute(text(f"""
+        WITH RECURSIVE ancestry AS (
+            SELECT n.node_id AS leaf, n.county_fips, n.apn, n.parent_node_id,
+                   n.split_instrument_number, 0 AS depth
+              FROM tract_node n WHERE n.apn IS NOT NULL
+            UNION ALL
+            SELECT a.leaf, a.county_fips, a.apn, p.parent_node_id,
+                   p.split_instrument_number, a.depth + 1
+              FROM ancestry a JOIN tract_node p ON p.node_id = a.parent_node_id
+             WHERE a.depth < 40
+        )
         SELECT p.county_fips, p.apn, p.formed_date, p.formed_by_instrument,
                min(t.recording_date) AS earliest_transfer,
                count(*) AS transfers_before
           FROM parcel p
           JOIN transfer t ON t.parcel_county_fips = p.county_fips AND t.parcel_apn = p.apn
          WHERE p.formed_date IS NOT NULL AND t.recording_date < p.formed_date {scope}
+           AND NOT EXISTS (
+               SELECT 1 FROM ancestry a
+                WHERE a.county_fips = p.county_fips AND a.apn = p.apn
+                  AND a.split_instrument_number = t.instrument_number)
          GROUP BY 1, 2, 3, 4
          ORDER BY min(t.recording_date) LIMIT 200
     """), params).fetchall()

@@ -25,6 +25,8 @@ conveyance that reached outside the tract, and the fix is to read the deed.
 """
 from __future__ import annotations
 
+import re
+
 from sqlalchemy import text
 
 ACREAGE_BASES = ("stated", "encumbered", "derived", "gis")
@@ -117,9 +119,12 @@ def _next_child_path(session, parent_node_id: int) -> str:
         tail = row.node_label[len(prefix):].lstrip(".")
         segment = tail[len(parent_path):].lstrip(".") if parent_path else tail
         head = segment.split(".")[0]
-        digits = "".join(c for c in head if c.isdigit())
-        if digits:
-            steps.add(int(digits))
+        # LEADING digits only. Concatenating every digit in the segment turned a
+        # platted label like "1P709" into 1709, so the next sibling was numbered 6123
+        # -- a label that states nothing about the descent it is supposed to describe.
+        leading = re.match(r"\d+", head)
+        if leading:
+            steps.add(int(leading.group(0)))
     step = (max(steps) + 1) if steps else 1
     return f"{parent_path}.{step}" if parent_path else str(step)
 

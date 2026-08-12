@@ -94,41 +94,69 @@ def test_a_future_formation_date_is_caught() -> None:
     print("PASS: a formation date in the future is caught")
 
 
-def test_conveyance_before_formation_is_caught_and_says_what_to_check() -> None:
-    """Live finding, and the subtle one: a lot cannot be sold before the plat created
-    it, but the DATE is not always what is wrong. Collin 2766013/2766016 were platted
-    2017-10-03 and carry 2011 transfers -- pre-plat conveyances of the ancestor tract,
-    recorded against the lot's APN because chain.py had nowhere else to put them. So
-    the finding must point at both readings, not assert the date is bad."""
+def test_the_spine_explains_the_pre_plat_conveyances() -> None:
+    """The resolution, not a silencing. Collin 2766013/2766016 were platted 2017-10-03
+    and carry 2011 transfers -- pre-plat conveyances of the ANCESTOR tract, which the
+    lot could not have been party to because it did not exist. record_split recorded
+    that ancestry (root -> 2011-01-04 -> 2011-12-30 -> the 2017 plat), and a transfer
+    whose instrument sits on an ancestor is accounted for."""
+    from app.title.tract_spine import walk_up
+
     with get_session() as session:
+        for apn, expected_deeds in (("2766013", ["20171003010004680", "20111230001411880",
+                                                  "20110104000015390"]),
+                                     ("2766016", ["20171003010004680", "20110104000015390"])):
+            node = session.execute(text("""
+                SELECT node_id FROM tract_node WHERE covid = 3028 AND apn = :apn
+            """), {"apn": apn}).scalar()
+            assert node is not None, f"{apn} has no spine node"
+            chain = walk_up(session, node)
+            deeds = [c["split_instrument_number"] for c in chain if c["split_instrument_number"]]
+            assert deeds == expected_deeds, (apn, deeds)
+            assert chain[-1]["disposition"] == "root", chain[-1]
+
         got = check_formation_date_plausibility(session)
-        hits = got["conveyed_before_formed"]
-        assert hits, "the two known Collin parcels should still be reported"
-        for f in hits:
-            assert f["earliest_transfer"] < f["formed_date"], f
-            assert "ancestor tract" in f["check_first"], f
-            assert "tract_spine" in f["check_first"], f
-    print(f"PASS: {len(hits)} conveyance(s) predating formation reported, each naming "
-          f"the ancestor-tract reading to check first")
+        assert not got["conveyed_before_formed"], got["conveyed_before_formed"]
+    print("PASS: both lots walk back through their 2011 conveyances to the tract root, "
+          "and neither is reported any more")
+
+
+def test_an_unexplained_conveyance_before_formation_is_still_caught() -> None:
+    """The check must not have been weakened into uselessness: a transfer with no
+    matching ancestor is still a finding."""
+    with get_session() as session:
+        # 2766013's 2021-12-28 sale is a conveyance OF the lot, so it is on no ancestor.
+        # Move formation after it and the parcel becomes unexplained again.
+        _set_date(session, "48085", "2766013", date(2022, 6, 1))
+        got = check_formation_date_plausibility(session)
+        hits = [f for f in got["conveyed_before_formed"] if f["apn"] == "2766013"]
+        assert hits, "a transfer on no ancestor must still be reported"
+        assert hits[0]["earliest_transfer"] < date(2022, 6, 1), hits[0]
+        assert "ancestor tract" in hits[0]["check_first"], hits[0]
+        session.rollback()
+    print("PASS: a conveyance explained by no ancestor is still caught")
 
 
 def test_the_live_database_has_no_impossible_dates() -> None:
-    """The standing assertion. sentinel/before_subdivision/future must stay at zero;
-    conveyed_before_formed is allowed to be non-empty because the two known cases are a
-    modelling gap the tract spine exists to close, not a wrong date."""
+    """The standing assertion, now on all four classes. conveyed_before_formed was
+    allowed to be non-empty while the two Collin lots' ancestry was unrecorded; the
+    spine records it, so nothing is outstanding and this holds every class at zero."""
     with get_session() as session:
         got = check_formation_date_plausibility(session)
-        for kind in ("sentinel_date", "before_subdivision", "future_date"):
+        for kind in ("sentinel_date", "before_subdivision",
+                     "conveyed_before_formed", "future_date"):
             assert not got[kind], f"{kind}: {got[kind][:3]}"
-    print(f"PASS: {got['checked']:,} formation dates on record -- no sentinel, none "
-          f"before its own subdivision, none in the future "
-          f"({len(got['conveyed_before_formed'])} pre-plat conveyance(s) flagged)")
+        assert got["plausible"], got["implausible"]
+    print(f"PASS: all {got['checked']:,} formation dates on record are plausible -- no "
+          f"sentinel, none before its own subdivision, none conveyed before it existed, "
+          f"none in the future")
 
 
 if __name__ == "__main__":
     test_a_sentinel_date_is_caught()
     test_a_lot_dated_before_its_own_subdivision_is_caught()
     test_a_future_formation_date_is_caught()
-    test_conveyance_before_formation_is_caught_and_says_what_to_check()
+    test_the_spine_explains_the_pre_plat_conveyances()
+    test_an_unexplained_conveyance_before_formation_is_still_caught()
     test_the_live_database_has_no_impossible_dates()
     print("\nall formation-date plausibility tests passed")
