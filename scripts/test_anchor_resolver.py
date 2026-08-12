@@ -185,6 +185,78 @@ def test_ngs_bounds_cap_is_an_error_not_an_answer() -> None:
     print("PASS: wide NGS search returned both monuments (result cap appears to have been raised)")
 
 
+class _StubResponse:
+    """Enough of a requests.Response for find_monuments' bounds call."""
+
+    status_code = 200
+    content = b"[]"
+
+    def __init__(self, payload):
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+
+def _find_monuments_error(ngs, marks, datasheet=None):
+    """Run find_monuments against a stubbed NGS and return the exception it
+    raised, or None if it returned instead."""
+    real_get, real_sheet = ngs._get, ngs.fetch_datasheet
+    ngs._get = lambda *a, **k: _StubResponse(marks)
+    if datasheet is not None:
+        ngs.fetch_datasheet = lambda *a, **k: datasheet
+    try:
+        ngs.find_monuments({"SF 010"}, {"min_lon": -97.9, "max_lon": -97.0,
+                                        "min_lat": 27.5, "max_lat": 27.9}, timeout=5)
+        return None
+    except Exception as exc:                      # noqa: BLE001
+        return exc
+    finally:
+        ngs._get, ngs.fetch_datasheet = real_get, real_sheet
+
+
+def test_every_way_a_named_mark_fails_to_resolve_is_unanswered_not_absent() -> None:
+    """All four ways find_monuments can come up empty must raise, because the
+    tier above cannot tell them apart from "this tract has no monument tie" --
+    and that difference is real money: declining walks the covenant down to Opus
+    and Fable to answer what NGS answers for nothing.
+
+    Three of the four already raised. The fourth -- marks returned, under the
+    cap, none of them the one the deed names -- fell through and returned {}.
+    It surfaced as covid 5838's 1.029 ac carve-out intermittently declining a
+    tie it places on eleven runs out of twelve, which is how a silent path
+    presents: not as an error, as an occasional wrong answer.
+
+    Stubbed, not live -- a partial NGS response is not something a test can ask
+    the real service to produce.
+    """
+    from app.gis import ngs
+
+    bulk = [{"name": f"MARK {i}", "pid": f"AA{i:04d}"} for i in range(40)]
+    capped = [{"name": f"MARK {i}", "pid": f"AA{i:04d}"}
+              for i in range(ngs.NGS_BOUNDS_RESULT_CAP)]
+
+    got = {
+        "nothing came back": (_find_monuments_error(ngs, []), ngs.NgsServiceEmpty),
+        "result set is capped": (_find_monuments_error(ngs, capped), ngs.NgsResultTruncated),
+        "datasheet will not parse": (
+            _find_monuments_error(ngs, [{"name": "SF 010", "pid": "AB1234"}],
+                                  datasheet="<html>maintenance</html>"),
+            ngs.NgsDatasheetUnreadable),
+        "marks, but not this one": (_find_monuments_error(ngs, bulk),
+                                    ngs.NgsNamedMarkUnresolved),
+    }
+    for label, (exc, expected) in got.items():
+        assert exc is not None, f"{label}: returned instead of raising"
+        assert isinstance(exc, ngs.NgsUnanswered), \
+            f"{label}: {type(exc).__name__} is outside the NgsUnanswered family"
+        assert isinstance(exc, expected), f"{label}: got {type(exc).__name__}"
+        assert "retry" in str(exc).lower() or "search again" in str(exc).lower(), \
+            f"{label}: the message must tell a caller what to do, not just what failed"
+    print(f"PASS: all {len(got)} ways a named mark fails to resolve raise NgsUnanswered -- "
+          f"none reports a published monument absent")
+
+
 def test_verify_llm_anchor_rejects_acreage_mismatch() -> None:
     """An LLM's own self-reported confidence must never be trusted alone --
     a candidate whose independently-recomputed area is off from the deed's
@@ -273,6 +345,7 @@ if __name__ == "__main__":
     test_ngs_tier_places_every_tie_that_is_at_the_point_of_beginning()
     test_ngs_search_bbox_is_narrow_and_skips_an_unloaded_county()
     test_ngs_bounds_cap_is_an_error_not_an_answer()
+    test_every_way_a_named_mark_fails_to_resolve_is_unanswered_not_absent()
     test_verify_llm_anchor_rejects_acreage_mismatch()
     test_verify_llm_anchor_accepts_reconciled_case()
     test_verify_llm_anchor_rejects_malformed_geojson()

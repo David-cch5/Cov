@@ -180,6 +180,13 @@ def _try_ngs_monument_tie(session, county_fips: str, deed_text: str, courses: li
     try:
         monuments = find_monuments({t.designation for t in pob_ties}, bbox)
         if not monuments:
+            # Defensive only. find_monuments now raises (NgsUnanswered family) on
+            # every way a named mark can fail to resolve -- empty response,
+            # truncated result, unparseable datasheet, or a result set that
+            # simply lacks it -- precisely because reaching this line used to
+            # mean "no tie here" and sent the covenant to the paid tiers. This
+            # tract's deed names a monument, so an empty answer is never a
+            # finding about the land.
             return None
         placed = anchor_by_ngs_monument_tie(walk_traverse(courses)["vertices"], pob_ties, monuments)
     except NgsUnanswered:

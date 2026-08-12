@@ -75,6 +75,28 @@ class NgsResultTruncated(NgsUnanswered):
     retrying the same oversized bbox returns the same truncated set. The search
     area has to shrink, which is a fix, not a wait."""
 
+
+class NgsDatasheetUnreadable(NgsUnanswered):
+    """The bounds search returned the mark, but its datasheet did not parse.
+
+    The first call already established the monument exists, so this is the
+    service failing on the second call -- never evidence of absence. Transient:
+    retry later."""
+
+
+class NgsNamedMarkUnresolved(NgsUnanswered):
+    """Marks came back, under the cap, and none is one the deed names.
+
+    The last of the four ways this search can come up empty, and the one that
+    stayed silent longest: the other three raise, while this fell through and
+    returned {} -- which anchor_resolver's NGS tier read as "no tie here" and
+    walked on toward the paid tiers. Caught after covid 5838's 1.029 ac carve-out
+    intermittently declined a tie it places on eleven runs out of twelve.
+
+    Not transient in the way an outage is, but not a finding either: retry, or
+    narrow the search area. An area a deed ties to is not empty of the monument
+    the deed names."""
+
 # NGS datasheet State Plane zone codes -> EPSG (NAD83, US survey feet).
 # Deliberately keyed on the datasheet's own spelling so the mapping is checkable
 # against the sheet rather than inferred from the county.
@@ -211,12 +233,18 @@ def find_monuments(designations, bbox: dict, timeout: int = 45) -> dict:
             f"({len(resp.content)} bytes) -- the service is not answering: {e}") from e
 
     found: dict[str, NgsMonument] = {}
+    unreadable: dict[str, str] = {}
     for mark in marks:
         key = normalize_designation(mark.get("name"))
         if key not in wanted or key in found:
             continue
         sheet = parse_datasheet(fetch_datasheet(mark["pid"], timeout=timeout))
         if "lat" not in sheet:
+            # The mark IS published -- the bounds search just returned it -- and
+            # only its datasheet failed to parse. Recorded rather than skipped
+            # silently, because dropping it here is indistinguishable downstream
+            # from the monument not existing.
+            unreadable[key] = mark.get("pid") or "?"
             continue
         found[key] = NgsMonument(
             designation=sheet.get("designation") or mark.get("name") or "",
@@ -254,5 +282,32 @@ def find_monuments(designations, bbox: dict, timeout: int = 45) -> dict:
             f"NGS bounds search hit its {NGS_BOUNDS_RESULT_CAP}-result cap and did not return "
             f"{sorted(missing)} -- the result set is truncated, so this is not evidence the "
             f"monument does not exist. Narrow the bbox and search again."
+        )
+    if missing and unreadable:
+        # The mark came back from the bounds search and its datasheet did not
+        # parse. That is the service failing on the second call, not the monument
+        # being absent -- the first call just said it exists.
+        raise NgsDatasheetUnreadable(
+            f"NGS returned {sorted(unreadable)} from the bounds search (PIDs "
+            f"{sorted(unreadable.values())}) but their datasheets did not parse, so "
+            f"{sorted(missing)} could not be resolved. The bounds result is itself evidence "
+            f"these marks exist -- retry later; do not treat it as 'no NGS tie available'."
+        )
+    if missing and not found:
+        # Marks came back, under the cap, and not one of them is a monument this
+        # deed names. Still not a finding about the land: the search area is a
+        # county envelope, the deed's own recital is evidence the monument exists,
+        # and NGS has been observed answering the same bbox with different
+        # subsets. Declining here would send a covenant with a free, published,
+        # survey-grade tie down to the paid LLM tiers -- ~$45-50 to answer what
+        # NGS answers for nothing -- so this reports an unanswered query and lets
+        # the queue retry with the tier still available. If the mark really is
+        # unpublished, the retries exhaust into a durable job_queue row and a
+        # person looks, which is the right destination for that too.
+        raise NgsNamedMarkUnresolved(
+            f"NGS bounds search returned {len(marks)} marks for bbox {bbox}, none of them "
+            f"{sorted(missing)}. A deed reciting a monument stamping is evidence the monument "
+            f"exists, so an incomplete result set is not evidence it does not -- retry later, "
+            f"or narrow the search area."
         )
     return found
