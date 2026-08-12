@@ -58,6 +58,47 @@ def test_closure_picked_the_reading_not_preference() -> None:
           f"loser is recorded alongside it")
 
 
+def test_the_verified_reading_anchored_the_tract() -> None:
+    """The payoff of the correction, and the reason `verified` is a separate claim: a
+    reading that closes 1:186,912 is a boundary worth placing, and one closing 1:25 is
+    not. The deed's POB named the tie outright -- the Easterly Northeast corner of
+    Heights at Westridge Phase I, on the West line of Independence Parkway -- so no
+    rotation had to be solved and no LLM tier was reached.
+
+    Four independent checks, none of them the traverse agreeing with itself:
+      the POB lands 9.5 ft from the corner Collin's own fabric puts there
+      Phase I's east line steps 634 ft west; the traverse is 633 ft wide
+      the tract lands on that notch with 464 sq ft of overlap onto Phase I
+      the parcels inside recite PARCEL 1209 -- the deed says 'Parcels 1201-1209'
+    """
+    from sqlalchemy import text
+
+    ev = load_correction(4981, "tract_young_survey_11878")["evidence"]["anchor"]
+    c = ev["checks"]
+    assert ev["method"] == "named_adjoining_parcel_tie", ev
+    assert ev["rotation_solved"] is False, "the plat's bearings ARE grid bearings here"
+    assert c["pob_offset_from_recited_corner_ft"] < 15, c
+    assert c["south_line_rms_to_phase_i_boundary_ft"] < 15, c
+    assert abs(c["phase_i_east_line_step_ft"] - c["traverse_width_ft"]) < 5, c
+    assert c["overlap_onto_phase_i_sqft"] < 2000, "the tract cannot sit on top of Phase I"
+    assert "1209" in ev["live_parcel_dry_run"], ev
+
+    with get_session() as session:
+        row = session.execute(text("""
+            SELECT stated_acreage, boundary_resolution_method m,
+                   ST_Area(geom::geography) / 4046.8564224 gis_ac,
+                   geom IS NOT NULL anchored, ST_IsValid(geom) valid
+              FROM tract WHERE covid = 4981 AND tract_no = 2
+        """)).fetchone()
+    assert row is not None, "the Young Survey tract has no row"
+    assert row.anchored and row.valid, row
+    assert row.m == "metes_and_bounds_traverse", row.m
+    assert abs(row.gis_ac - float(row.stated_acreage)) < 0.05, (row.gis_ac, row.stated_acreage)
+    print(f"PASS: covid 4981 tract 2 is anchored on the deed's own recited corner -- "
+          f"{row.gis_ac:.3f} GIS acres against the stated {row.stated_acreage}, POB "
+          f"{c['pob_offset_from_recited_corner_ft']} ft off, no LLM tier reached")
+
+
 def test_a_correction_must_name_its_author_and_evidence() -> None:
     """This file outranks three machine readings, so an anonymous one is refused."""
     for kwargs in ({"corrected_by": "", "basis": "x"}, {"corrected_by": "x", "basis": ""}):
@@ -91,6 +132,7 @@ def test_corrections_are_listable_per_covenant() -> None:
 if __name__ == "__main__":
     test_a_segment_correction_never_replaces_the_document()
     test_closure_picked_the_reading_not_preference()
+    test_the_verified_reading_anchored_the_tract()
     test_a_correction_must_name_its_author_and_evidence()
     test_corrections_are_listable_per_covenant()
     print("\nall corrected-text tests passed")
