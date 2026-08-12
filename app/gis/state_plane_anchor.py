@@ -15,6 +15,14 @@ transform (rotation + translation, no scaling -- both are in feet) registers
 its local traverse onto the real world too. Still deterministic geometry, per
 CLAUDE.md's "deterministic code for exact work" -- no guessing involved, just
 solved from the shared corners.
+
+And the adjoining-PLAT case (anchor_by_adjoining_plat, at the foot of this file):
+when the deed's Point of Beginning is a corner of a recorded plat the county
+publishes, and its opening courses run WITH that plat's line, the tract can be
+placed against the published fabric with no rotation to solve. Generalised out
+of the script that anchored covid 4981; see the long comment there for the four
+plausible-looking inference shortcuts it does NOT take, each of which produced a
+confident answer over 1,000 ft from the truth.
 """
 import math
 
@@ -347,3 +355,308 @@ def anchor_by_ngs_monument_tie(vertices_ft, ties, monuments, corner_index: int =
         "verified": bool(check and (check["agree"] or check["trusted"]))
                     and (zone_error_ft is not None and zone_error_ft < 1.0),
     }
+
+
+# --- adjoining-plat anchoring ----------------------------------------------
+#
+# The technique that placed covid 4981's Andrew S. Young Survey tract, generalised
+# out of the one-off script that did it. It applies whenever a deed's Point of
+# Beginning is a corner OF a recorded plat the county already publishes, which is
+# the ordinary case for suburban acreage carved out of, or adjoining, a
+# subdivision:
+#
+#   "BEGINNING at a 1/2 inch iron rod found at the Easterly Northeast corner of
+#    The Heights at Westridge Phase I ... a point in the West line of
+#    Independence Parkway; THENCE, South 88 degrees 11 minutes 53 seconds West,
+#    ... WITH A NORTH LINE OF SAID The Heights at West ridge Phase I ..."
+#
+# Two things make it deterministic rather than a search for a resemblance.
+#
+# NO ROTATION IS SOLVED. A deed running WITH a plat's boundary is on that plat's
+# basis of bearings, so the only unknown is a translation -- two parameters,
+# recovered by fit rather than assumed. The assumption is not taken on faith:
+# `rotation_probe_deg` re-fits at a spread of small rotations and REFUSES if a
+# rotated fit is materially better, the signature of a plat whose bearings are
+# not grid-referenced.
+#
+# THE CONTACT COURSES ARE READ FROM THE DEED, NOT GUESSED. `contact_indices`
+# names the vertices the deed itself says lie on the adjoiner, and it is a
+# required argument with no default. Three attempts at inferring them instead
+# all failed against 4981, each in a way worth keeping:
+#
+#   scoring every vertex (distance capped so far ones don't drag the fit)
+#     preferred placements INSIDE the plat, where everything is near some
+#     boundary -- 2,338 ft off
+#   scoring the best run of 4 consecutive vertices fitted four SHORT closing
+#     courses onto a lot line, residual 0.10 ft, 1,379 ft off
+#   requiring that run to span 200 ft moved it to a long STRAIGHT run, which
+#     slides along a straight boundary fitting perfectly the whole way
+#
+# All three are the same error: inferring from geometry alone a fact the document
+# states outright. The deed says which courses run with the plat; a search that
+# re-derives it can only be less reliable than reading it, and CLAUDE.md already
+# says to read the full legal description before reaching for GIS trial-and-error.
+
+_CONTACT_TOL_FT = 15.0          # within this, a vertex counts as ON the adjoiner
+_MIN_CONTACT_VERTICES = 3       # a LINE of contact -- one touching corner proves nothing
+_MIN_CONTACT_SPAN_FT = 200.0    # and a run long enough to fix position along it
+_MAX_OVERLAP_SQFT = 2000.0      # a tract cannot lie on top of the plat it adjoins
+_MAX_RMS_FT = 15.0              # measured against a tax-parcel fabric, not a survey plat
+_MAX_SEEDS = 40000            # every boundary vertex of a big plat, not a sample
+_MAX_REFINED_CANDIDATES = 800  # bound on the work, not a shortlist of the promising
+_REFINE_PASSES = ((10.0, 20.0), (2.0, 4.0), (0.4, 0.8), (0.05, 0.1))
+
+
+class _BoundaryIndex:
+    """Nearest-segment lookup over the adjoiner's boundary.
+
+    The fit evaluates tens of thousands of candidate placements, each measuring
+    the contact vertices against the plat. Straight `boundary.distance(point)`
+    is linear in the plat's vertex count -- on an 82-acre union of 398 tax
+    parcels that turns the search into hundreds of millions of segment tests.
+    An R-tree over the individual segments makes each lookup logarithmic.
+    """
+
+    def __init__(self, polygon):
+        from shapely import STRtree
+        from shapely.geometry import LineString
+
+        geoms = getattr(polygon, "geoms", None) or [polygon]
+        self.segments = []
+        for g in geoms:
+            for ring in [g.exterior] + list(g.interiors):
+                pts = list(ring.coords)
+                self.segments.extend(LineString([pts[i], pts[i + 1]])
+                                     for i in range(len(pts) - 1))
+        self.tree = STRtree(self.segments)
+
+    def distance(self, point) -> float:
+        return self.segments[self.tree.nearest(point)].distance(point)
+
+
+def _boundary_seed_points(polygon) -> list[tuple[float, float]]:
+    """Every distinct boundary vertex of the adjoiner, decimated to a bounded
+    count. These are the candidate corners the deed's POB might name.
+
+    Enumerating them is the point. Naming a corner in English ("the Easterly
+    Northeast corner") is not the same as knowing which vertex of a published
+    polygon it is, and picking one by eye is what went wrong twice on 4981 --
+    first the northernmost point of the plat's east extreme, which put the tract
+    ON TOP of the plat, then a bearing check against that same wrong corner,
+    which missed by 20 degrees and was blamed on the plat's bearings.
+    """
+    geoms = getattr(polygon, "geoms", None) or [polygon]
+    coords = []
+    for g in geoms:
+        for ring in [g.exterior] + list(g.interiors):
+            coords.extend(list(ring.coords)[:-1])
+    if len(coords) > _MAX_SEEDS:
+        step = len(coords) / _MAX_SEEDS
+        coords = [coords[int(i * step)] for i in range(_MAX_SEEDS)]
+    return coords
+
+
+def _rotate(ring, degrees: float):
+    if not degrees:
+        return list(ring)
+    theta = math.radians(degrees)
+    c, s = math.cos(theta), math.sin(theta)
+    ox, oy = ring[0]
+    return [(ox + (x - ox) * c - (y - oy) * s, oy + (x - ox) * s + (y - oy) * c)
+            for x, y in ring]
+
+
+def _contact_rms(ring, dx, dy, index, contact_indices) -> float:
+    from shapely.geometry import Point
+
+    return math.sqrt(sum(index.distance(Point(ring[i][0] + dx, ring[i][1] + dy)) ** 2
+                         for i in contact_indices) / len(contact_indices))
+
+
+def _contact_span_ft(ring, contact_indices) -> float:
+    ordered = sorted(contact_indices)
+    return sum(math.dist(ring[ordered[k]], ring[ordered[k + 1]])
+               for k in range(len(ordered) - 1))
+
+
+def _fit_translation(ring, adjoiner, index, seeds, contact_indices, max_overlap_sqft,
+                     prepared_interior) -> tuple | None:
+    """Coarse multi-seed pass, then local refinement of the best few. Returns
+    (dx, dy, rms, overlap_sqft), or None if no placement stayed out of the
+    adjoiner."""
+    from shapely.geometry import Point, Polygon
+
+    def outside(dx, dy) -> bool:
+        return not any(prepared_interior.contains(Point(x + dx, y + dy)) for x, y in ring)
+
+    def admissible(dx, dy) -> bool:
+        """Exterior AND not overlapping. Overlap has to constrain the SEARCH, not
+        just filter its output: refinement minimises the residual, and it can
+        always shave a little off by sliding the tract into the plat. On 4981 the
+        true corner refined itself straight through the overlap cap and was then
+        thrown away, handing the answer to a worse-fitting placement 1,194 ft off."""
+        if not outside(dx, dy):
+            return False
+        return (Polygon([(x + dx, y + dy) for x, y in ring])
+                .intersection(adjoiner).area <= max_overlap_sqft)
+
+    # Rank every candidate corner on the cheap contact residual FIRST, and only
+    # then pay for the interior test. Decimating the seed list instead is what
+    # kept 4981's true corner out of the running: an 82-acre plat has thousands
+    # of boundary vertices, sampling 600 of them missed the one the deed names,
+    # and no local refinement recovers a corner it never started near.
+    ox, oy = ring[contact_indices[0]]
+    ranked = sorted((_contact_rms(ring, sx - ox, sy - oy, index, contact_indices),
+                     sx - ox, sy - oy) for sx, sy in seeds)
+    # Refine EVERY candidate, and judge NONE of them before refining. Two
+    # filters that seemed obviously safe each discarded 4981's true corner:
+    # keeping only the top 20 by coarse residual (it ranked below that, yet
+    # refined to 6.36 ft against the winner's 7.51 ft), and requiring the raw
+    # seed to sit outside the plat (a corner of the plat, with the traverse
+    # hung off it unrefined, has a vertex inside -- of course it does). A seed
+    # is a starting point, not a placement; admissibility is enforced on where
+    # the refinement LANDS.
+    coarse = ranked[:_MAX_REFINED_CANDIDATES]
+
+    best = None
+    for _, dx0, dy0 in coarse:
+        dx, dy = dx0, dy0
+        for step, span in _REFINE_PASSES:
+            n = int(span / step)
+            options = [(_contact_rms(ring, dx + i * step, dy + j * step, index, contact_indices),
+                        dx + i * step, dy + j * step)
+                       for i in range(-n, n + 1) for j in range(-n, n + 1)
+                       if admissible(dx + i * step, dy + j * step)]
+            if options:
+                _, dx, dy = min(options)
+        overlap = Polygon([(x + dx, y + dy) for x, y in ring]).intersection(adjoiner).area
+        # Overlap is a hard fact about the placement, not a tie-breaker: a tract
+        # cannot lie on top of the plat it adjoins, however well its edges line up.
+        if overlap > max_overlap_sqft:
+            continue
+        rms = _contact_rms(ring, dx, dy, index, contact_indices)
+        if best is None or rms < best[2]:
+            best = (dx, dy, rms, overlap)
+    return best
+
+
+def anchor_by_adjoining_plat(
+    vertices_ft: list[tuple[float, float]], adjoiner_polygon,
+    contact_indices: list[int], *,
+    epsg: int | None = None, stated_acres: float | None = None,
+    max_overlap_sqft: float = _MAX_OVERLAP_SQFT, contact_tol_ft: float = _CONTACT_TOL_FT,
+    min_contact_vertices: int = _MIN_CONTACT_VERTICES,
+    min_contact_span_ft: float = _MIN_CONTACT_SPAN_FT, max_rms_ft: float = _MAX_RMS_FT,
+    rotation_probe_deg: float = 2.0, rotation_probe_step: float = 0.25,
+    max_rotation_deg: float = 0.5,
+) -> dict:
+    """Anchor a local traverse against an adjoining plat's published footprint.
+
+    `vertices_ft` is a walk_traverse traverse in feet whose bearings are on the
+    adjoiner's own basis; `adjoiner_polygon` is a shapely polygon of the
+    adjoining plat in the SAME State Plane feet CRS (`epsg`, needed only to
+    return lon/lat). `contact_indices` are the traverse vertices the DEED says
+    lie on that plat -- vertex i is the start of course i, so a deed whose first
+    four courses run with the adjoiner gives [0, 1, 2, 3, 4].
+
+    Returns a dict that always says whether it anchored and, when it did not,
+    why -- never a forced placement. `anchored` True means every check passed: a
+    long enough line of contact, no overlap into the plat, a residual consistent
+    with a tax-parcel fabric, an area agreeing with the deed's stated acreage
+    when one is given, and no rotation fitting better than grid.
+    """
+    from shapely.geometry import Point, Polygon
+    from shapely.prepared import prep
+
+    out = {"method": "adjoining_plat_tie", "anchored": False, "reason": None,
+           "epsg": epsg, "stated_acres": stated_acres,
+           "contact_indices": list(contact_indices)}
+    if len(vertices_ft) < 4 or adjoiner_polygon is None or adjoiner_polygon.is_empty:
+        out["reason"] = "need a closed traverse and a non-empty adjoiner footprint"
+        return out
+
+    ring = list(vertices_ft[:-1]) if vertices_ft[0] == vertices_ft[-1] else list(vertices_ft)
+    contact_indices = sorted({i for i in contact_indices if 0 <= i < len(ring)})
+    if len(contact_indices) < min_contact_vertices:
+        out["reason"] = (f"{len(contact_indices)} contact vertex/vertices named -- at least "
+                         f"{min_contact_vertices} are needed to fix a line, not a point")
+        return out
+    span = _contact_span_ft(ring, contact_indices)
+    out["contact_span_ft"] = span
+    if span < min_contact_span_ft:
+        out["reason"] = (f"the courses running with the adjoiner span {span:.0f} ft, under the "
+                         f"{min_contact_span_ft:.0f} ft needed to fix position along its line")
+        return out
+
+    index = _BoundaryIndex(adjoiner_polygon)
+    seeds = _boundary_seed_points(adjoiner_polygon)
+    if not seeds:
+        out["reason"] = "adjoiner footprint has no boundary vertices to try as corners"
+        return out
+    # A vertex this far inside the plat is not "on its line" by any tolerance.
+    # Eroding first means a vertex sitting ON the boundary never reads as interior.
+    interior = prep(adjoiner_polygon.buffer(-contact_tol_ft))
+
+    fit = _fit_translation(ring, adjoiner_polygon, index, seeds, contact_indices,
+                           max_overlap_sqft, interior)
+    if fit is None:
+        out["reason"] = ("every candidate corner placed the tract inside the adjoining plat "
+                         "or overlapping it -- no exterior placement found")
+        return out
+    dx, dy, rms, overlap = fit
+
+    # Is grid north actually right? Re-fit at a spread of small rotations; if one
+    # fits materially better, this plat's bearings are not grid-referenced and a
+    # translation-only anchor would be wrong however tidy its residual looks. The
+    # probe re-seeds from the solved placement rather than re-running every corner:
+    # the question is whether THIS placement wants to be rotated.
+    probe = [(rms, 0.0)]
+    steps = int(rotation_probe_deg / rotation_probe_step)
+    seed_xy = [(ring[contact_indices[0]][0] + dx, ring[contact_indices[0]][1] + dy)]
+    for k in range(-steps, steps + 1):
+        theta = k * rotation_probe_step
+        if theta == 0:
+            continue
+        r = _fit_translation(_rotate(ring, theta), adjoiner_polygon, index, seed_xy,
+                             contact_indices, max_overlap_sqft, interior)
+        if r is not None:
+            probe.append((r[2], theta))
+    best_rms, best_theta = min(probe)
+
+    placed = Polygon([(x + dx, y + dy) for x, y in ring])
+    contact = sum(1 for x, y in ring
+                  if index.distance(Point(x + dx, y + dy)) <= contact_tol_ft)
+    area_acres = placed.area / 43560.0
+    out.update({
+        "dx": dx, "dy": dy, "rms_ft": rms,
+        "pob_xy": (ring[0][0] + dx, ring[0][1] + dy),
+        "contact_vertices": contact, "total_vertices": len(ring),
+        "overlap_sqft": overlap, "area_acres": area_acres,
+        "rotation_probe_deg": rotation_probe_deg, "best_rotation_deg": best_theta,
+        "rotation_rms_ft": best_rms,
+    })
+    if stated_acres:
+        out["area_delta_pct"] = (area_acres - stated_acres) / stated_acres * 100.0
+
+    if abs(best_theta) > max_rotation_deg and best_rms < rms * 0.7:
+        out["reason"] = (f"a {best_theta:+.2f} deg rotation fits materially better "
+                         f"({best_rms:.2f} ft vs {rms:.2f} ft) -- this plat's bearings are not "
+                         f"grid-referenced, so a translation-only tie does not apply")
+        return out
+    if rms > max_rms_ft:
+        out["reason"] = f"fit residual {rms:.2f} ft exceeds {max_rms_ft:.0f} ft"
+        return out
+    if overlap > max_overlap_sqft:
+        out["reason"] = (f"placement overlaps the adjoiner by {overlap:,.0f} sq ft -- a tract "
+                         f"cannot lie on top of the plat it adjoins")
+        return out
+    if stated_acres and abs(out["area_delta_pct"]) > 3.0:
+        out["reason"] = (f"area {area_acres:.3f} ac is {out['area_delta_pct']:+.2f}% off the "
+                         f"deed's stated {stated_acres} ac")
+        return out
+
+    out["anchored"] = True
+    if epsg:
+        out["geojson"] = traverse_to_geojson_state_plane(
+            list(vertices_ft), ring[0][0] + dx, ring[0][1] + dy, epsg)
+    return out

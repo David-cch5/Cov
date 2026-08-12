@@ -231,15 +231,29 @@ def _try_sibling_tract_tie(session, covid: int, tract_no: int) -> dict | None:
 
 
 def _try_parcel_tie(session, county_fips: str, legal_description_raw: str, courses: list) -> dict | None:
-    """Tier 0d: not automated in this pass, for the same reason as 0c.
-    Confirmed real by this project's own experience: my own manual attempt
-    at exactly this kind of tie on covid 5838 accepted a wrong correspondence
-    (a 606 ft real edge forced to match a 719.14 ft recited course, a 16%
-    mismatch) before stopping to check the fit's own implied scale factor.
-    Automating "which adjoiner citation matches which course" reliably needs
-    the same kind of judgment -- left to Tier 1, which has real tools
-    (query_gis_parcels, solve_anchor_similarity) to do this properly and a
-    hard length_ratio sanity check it's instructed to respect."""
+    """Tier 0d: the geometry is built and tested -- see
+    `app/gis/state_plane_anchor.py`'s `anchor_by_adjoining_plat`, which anchored
+    covid 4981's Young Survey tract unattended to within 0.66 ft of the placement
+    a person had derived by hand, and refuses (rather than guessing) on a short
+    contact run, an overlap into the plat, a bad area, or bearings that are not
+    the plat's. What it needs from a caller is NOT judgment about geometry --
+    that is now settled in code -- but two pieces of bookkeeping this function
+    does not yet have:
+
+      the CONTACT COURSES: which courses the deed says run with the adjoiner.
+        The deed states it ("with a North line of said ..."), so this is a
+        parsing job over `app/parsing/legal_description/adjoiners.py`'s output,
+        not an inference. Four attempts at inferring it from geometry alone are
+        recorded in that module, each confidently wrong by over 1,000 ft.
+      the county's STATE PLANE EPSG, to work in feet. There is no column for it;
+        `county_gis_registry.quirks` is where the per-county settings already
+        live (see Bexar's cad_deed_history_url).
+
+    Until both exist this returns None and the covenant falls through, which is
+    the honest outcome -- a tier that cannot identify its own inputs must not
+    invent them. My own manual attempt at this kind of tie on covid 5838 forced
+    a 606 ft real edge onto a 719.14 ft recited course, a 16% mismatch, before
+    checking the implied scale factor."""
     return None
 
 
