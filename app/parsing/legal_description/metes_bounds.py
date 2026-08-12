@@ -156,6 +156,71 @@ _DMS_OCR = (r"(" + _D + r"{1,3})\s*(?:degrees?|deg\.?|°)" + _SEP +
             r"(" + _D + r"{1,2})\s*(?:minutes?|min\.?|['’])" + _SEP +
             r"(" + _D + r"{1,2})\s*" + _SECONDS_MARK)
 
+# A CURVE STATED AS ARC + CHORD, which is the commonest form of all and was the one
+# shape this module could not read: no radius, no central angle, just how far along the
+# arc and where the chord points.
+#
+#   "THENCE, continuing with said North line and said curve to the right, for an arc
+#    distance of 100.59 feet, (Chord Bearing North 87 degrees 04 minutes 12 seconds
+#    East - 100.55 feet) to a 1/2 inch iron rod set"
+#
+# The CHORD is what a traverse needs: it is the straight line between the two vertices,
+# so walking it puts the next corner in exactly the right place. The arc length is kept
+# for area, which is the only thing the chord understates. Confirmed on covid 4981's
+# Andrew S. Young Survey tract, where six of fourteen calls are this shape and dropping
+# them left the traverse closing at 1:0.22 against a stated 11.878 acres.
+# The direction word is OPTIONAL, because a continuation call omits it entirely --
+# "THENCE, continuing along said East and West lines for an arc distance of 57.71
+# feet, (Chord Bearing South 08 degrees 50 minutes 13 seconds Bast - 57 56 feet)".
+# Unlike the bearingless curves above, nothing has to be inferred here: the chord
+# bearing is stated, and the chord alone fixes the next vertex. Direction is kept when
+# given because it still says which way the arc bows, which matters for area.
+_CHORD_CURVE_RE = re.compile(
+    r"(?:curve\s+to\s+the\s+(right|left)[^.;]{0,80}?)?"
+    r"arc\s+(?:distance|length)\s+of\s+([\d,]+\.?\d*)\s*" + _FEET +
+    r"[^.;]{0,40}?[Cc]hord\s+[Bb]e[a4]ring\s+(North|South)\s*" + _DMS_OCR + _SEP +
+    r"(" + _EAST + r"|" + _WEST + r")\s*[-–—]?\s*([\d,]+\.?\d*)\s*" + _FEET,
+    re.IGNORECASE | re.DOTALL,
+)
+
+# OCR LOSES THE DECIMAL POINT, and the damage is silent rather than loud: "103 68
+# feet" parsed as 68.0 and "112-89 feet" as 89.0, because the distance pattern takes
+# the last numeric run before "feet". A dropped course shows up as a bad closure; a
+# distance quietly 35 feet short may not. Only a separator sitting between digits and
+# immediately before a feet-word is rewritten, so "at 541.68 feet passing" and a plain
+# "100 feet" are untouched.
+_OCR_DECIMAL_RE = re.compile(r"(\d)[ \-–](\d{2})(\s*(?:feet|fe?et|ft\.?))", re.IGNORECASE)
+
+
+def repair_ocr_decimals(text: str) -> str:
+    """Restore a decimal point OCR turned into a space or hyphen inside a distance."""
+    return _OCR_DECIMAL_RE.sub(r"\1.\2\3", text)
+
+
+# The survey vocabulary OCR mangles, each confirmed in covid 4981's own Exhibit A.
+# Repaired as WORDS rather than by widening five separate regexes: the damage is in
+# the reading, the same fault recurs across documents, and a repair here fixes every
+# pattern at once instead of one.
+#
+#   "an are distance" / "an atc distance"   -> arc
+#   "Chord Beating"                          -> Bearing
+#   "82.94 fect"                             -> feet
+#   "34.83 feet, 10 a 1/2 inch iron rod"     -> to      (the call's own terminator)
+_OCR_WORD_REPAIRS = (
+    (re.compile(r"\ba([rt])([ce])\s+(distance|length)\b", re.I), r"arc \3"),
+    (re.compile(r"\b([Cc]hord\s+)Be([a4])ting\b"), r"\1Be\2ring"),
+    (re.compile(r"(\d)\s*\bfect\b", re.I), r"\1 feet"),
+    (re.compile(r"(" + _FEET + r")\s*,?\s+10\s+(a|an|the)\b", re.I), r"\1, to \2"),
+)
+
+
+def repair_ocr_survey_words(text: str) -> str:
+    """Repair the OCR faults that stop a course being read at all."""
+    for pattern, replacement in _OCR_WORD_REPAIRS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
 _NON_TANGENTIAL_CURVE_RE = re.compile(
     r"curve\s+to\s+the\s+(right|left)\s+having\s+a\s+" + _DELTA_KEYWORD + r"\s*" + _DMS +
     r".{0,80}?\S*dius\s+of\s+([\d,]+\.?\d*)\s*" + _FEET +
@@ -392,7 +457,15 @@ def extract_courses(text: str) -> list[Course]:
     ";"), so this never double-counts a course, but a compound-list run can be
     interleaved between THENCE-led courses and must come back in true traversal
     order, not "all THENCE courses, then all compound ones"."""
+    text = repair_ocr_survey_words(repair_ocr_decimals(text))
     matches: list[tuple[int, Course]] = []
+    for m in _CHORD_CURVE_RE.finditer(text):
+        direction, arc, ns, deg, minute, sec, ew, chord = m.groups()
+        matches.append((m.start(), Course(
+            ns=ns, degrees=float(deg), minutes=float(minute), seconds=float(sec),
+            ew=ew, distance_ft=_feet(chord), is_curve=True,
+            curve_direction=direction.lower() if direction else None,
+            arc_length_ft=_feet(arc))))
     for m in _COURSE_RE.finditer(text):
         ns, deg, minute, sec, ew, dist = m.groups()
         matches.append((m.start(), Course(
