@@ -170,3 +170,109 @@ def extract_adjoining_subdivisions(deed_text: str | None) -> list[dict]:
             prior["context"] = text[max(0, m.start() - 90):m.start() + 40].strip()
 
     return sorted(found.values(), key=lambda d: d["subdivision"])
+
+
+# --- which courses run WITH an adjoiner's line -----------------------------
+#
+# `app/gis/state_plane_anchor.py`'s adjoining-plat anchor needs to know which
+# traverse vertices the deed puts ON the adjoining plat. That is stated, not
+# inferred -- "THENCE ... with a North line of said The Heights at West ridge
+# Phase I", then "THENCE, continuing with said North line and said curve" --
+# and four attempts to infer it from geometry instead each produced a confident
+# answer over 1,000 ft wrong (see that module's own comment).
+
+_CONTACT_NAMED_RE = re.compile(
+    r"\bwith\s+(?:a|an|the|said)\s+[\w\- ]{0,24}?lines?\s+of\s+(?:said\s+)?", re.IGNORECASE)
+_CONTACT_CONTINUING_RE = re.compile(
+    r"\b(?:continuing|along)\s+with\s+said\b|\bwith\s+said\s+[\w\- ]{0,24}?lines?\b",
+    re.IGNORECASE)
+_POB_ADJOINER_RE = re.compile(
+    r"corner\s+of\s+(?:the\s+)?(?P<name>[A-Z][\w'’]*(?:\s+[A-Za-z][\w'’]*){0,7}?)\s*,\s*"
+    r"(?:an?\s+addition|according|as\s+recorded)", re.IGNORECASE)
+_THENCE_SPLIT_RE = re.compile(r"(?=\bTHENCE\b)", re.IGNORECASE)
+_NAME_NOISE_TOKENS = {"THE", "AT", "OF", "AND", "A", "AN"}
+
+
+def adjoiner_name_key(name: str) -> str:
+    """A comparison key for a subdivision name: significant tokens only, joined.
+
+    Two spellings of one subdivision have to compare equal across three
+    independent corruptions at once. The deed says "The Heights at West ridge
+    Phase I" (OCR split WESTRIDGE in two); the CAD says "HEIGHTS AT WESTRIDGE
+    PHASE I THE" (the article moved to the end, the house style for a name
+    beginning with "The"). Dropping the connectors and joining what is left
+    reduces both to HEIGHTSWESTRIDGEPHASEI, which is the same subdivision --
+    and does so without a fuzzy score that could quietly equate two different
+    phases of one development.
+    """
+    tokens = re.findall(r"[A-Za-z0-9]+", (name or "").upper())
+    return "".join(t for t in tokens if t not in _NAME_NOISE_TOKENS)
+
+
+def point_of_beginning_adjoiner(deed_text: str) -> str | None:
+    """The plat whose corner the deed's POB sits on, if it names one."""
+    if not deed_text:
+        return None
+    head = _THENCE_SPLIT_RE.split(deed_text, maxsplit=1)[0]
+    matches = _POB_ADJOINER_RE.findall(head)
+    return matches[-1].strip() if matches else None
+
+
+def courses_running_with_adjoiner(deed_text: str, total_courses: int) -> dict | None:
+    """Which traverse vertices the deed places on the POB's adjoining plat.
+
+    Returns {"adjoiner", "contact_indices", "contact_courses"} or None when the
+    deed does not support the reading. Vertex i is the START of course i, so a
+    course that runs with the adjoiner puts BOTH its endpoints on that line.
+
+    Refuses rather than guessing in three cases, because a wrong contact set
+    anchors a tract onto the wrong corner and reports a residual that looks fine:
+    no adjoiner named at the POB, no course that says it runs with that plat, or
+    -- the important one -- a course count that disagrees with the caller's. This
+    function counts courses by splitting on THENCE and re-extracting per segment;
+    if that total does not match what extract_courses read from the whole text,
+    the index mapping is not trustworthy and no answer is better than a plausible
+    one.
+    """
+    from app.parsing.legal_description.metes_bounds import (
+        extract_courses, repair_ocr_decimals, repair_ocr_survey_words)
+
+    adjoiner = point_of_beginning_adjoiner(deed_text)
+    if not adjoiner:
+        return None
+    key = adjoiner_name_key(adjoiner)
+    if not key:
+        return None
+
+    repaired = repair_ocr_survey_words(repair_ocr_decimals(deed_text))
+    segments = _THENCE_SPLIT_RE.split(repaired)[1:]      # [0] is the POB preamble
+    if not segments:
+        return None
+
+    contact_courses: list[int] = []
+    index, previous_was_contact, counted = 0, False, 0
+    for segment in segments:
+        here = len(extract_courses(segment))
+        counted += here
+        if here == 0:
+            continue
+        named = any(adjoiner_name_key(segment[m.end():m.end() + 60]).startswith(key[:12])
+                    for m in _CONTACT_NAMED_RE.finditer(segment))
+        # "continuing with said North line" names no plat -- it inherits the one
+        # the previous course was running with, and only that.
+        inherited = previous_was_contact and bool(_CONTACT_CONTINUING_RE.search(segment))
+        if named or inherited:
+            contact_courses.extend(range(index, index + here))
+            previous_was_contact = True
+        else:
+            previous_was_contact = False
+        index += here
+
+    if counted != total_courses:
+        return None
+    if len(contact_courses) < 2:
+        return None
+
+    vertices = sorted({i for c in contact_courses for i in (c, c + 1)})
+    return {"adjoiner": adjoiner, "contact_indices": vertices,
+            "contact_courses": contact_courses}

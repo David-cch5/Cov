@@ -74,16 +74,25 @@ def test_stated_coordinate_unknown_county_returns_none() -> None:
     print("PASS: unknown county -> correctly returns None rather than guessing a State Plane zone")
 
 
-def test_sibling_and_parcel_tie_are_deliberately_stubbed() -> None:
-    """Tiers 0b/0c are intentionally not automated in this pass -- vertex-
-    to-real-corner correspondence needs judgment (confirmed the hard way:
-    my own manual covid 5838 attempt got this wrong, accepting a 16%
-    length mismatch). They must always defer to the LLM tiers, never
-    half-guess a correspondence."""
+def test_sibling_tie_is_deferred_and_the_parcel_tie_declines_on_its_merits() -> None:
+    """Tier 0c (sibling-tract tie) is still deliberately not automated: mapping a
+    named corner of an already-anchored sibling onto a particular vertex of THIS
+    traverse is the judgment call my own manual covid 5838 attempt got wrong,
+    accepting a 16% length mismatch.
+
+    Tier 0d is no longer stubbed -- it reads the adjoining plat off the POB and
+    the contact courses off the deed -- so what is pinned here is that it still
+    returns None when the deed supports none of that, rather than reaching for
+    the county's GIS on the strength of nothing. covid 5838's own deed names no
+    POB adjoiner at all, so it must decline without a single network call."""
     with get_session() as session:
         assert _try_sibling_tract_tie(session, covid=5838, tract_no=1) is None
-        assert _try_parcel_tie(session, "48355", "any text", []) is None
-    print("PASS: sibling-tie and parcel-tie tiers correctly deferred (not half-automated)")
+        assert _try_parcel_tie(session, 5838, 1, "48355", "any text", []) is None
+        deed, _ = _covid_5838_excepted_segments()
+        assert _try_parcel_tie(session, 5838, 1, "48355", deed,
+                               extract_courses(deed)) is None
+    print("PASS: sibling tie still deferred; parcel tie declines a deed that names no "
+          "POB adjoiner, without touching the network")
 
 
 def _covid_5838_excepted_segments():
@@ -340,7 +349,7 @@ if __name__ == "__main__":
     test_stated_coordinate_found_and_placed()
     test_stated_coordinate_absent_returns_none()
     test_stated_coordinate_unknown_county_returns_none()
-    test_sibling_and_parcel_tie_are_deliberately_stubbed()
+    test_sibling_tie_is_deferred_and_the_parcel_tie_declines_on_its_merits()
     test_ngs_tier_declines_a_tie_that_is_not_at_the_point_of_beginning()
     test_ngs_tier_places_every_tie_that_is_at_the_point_of_beginning()
     test_ngs_search_bbox_is_narrow_and_skips_an_unloaded_county()

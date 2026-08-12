@@ -190,9 +190,26 @@ BUILD_SPEC.md.
 never anchor a tract by hand-writing a one-off script per covenant again.
 1. Deterministic techniques first, free: a stated State Plane coordinate in the deed itself,
    **a published NGS control-monument tie**, a shared corner with an already-anchored sibling
-   tract, a tie to a named adjoining platted parcel (`app/gis/state_plane_anchor.py`) — each
+   tract, **a tie to the adjoining PLAT the POB names** (`app/gis/state_plane_anchor.py`) — each
    with its own sanity check (recomputed closure/area; a parcel tie's implied `length_ratio`
    must be within ~5% of 1.0) before ever being trusted.
+   - **The adjoining-plat tie (Tier 0d) is automated and is the common case for suburban
+     acreage.** When the POB is a corner of a plat the county publishes and the opening courses
+     run WITH that plat's line, `anchor_by_adjoining_plat` places the tract by solving a
+     TRANSLATION ONLY — a deed running with a plat's boundary is on that plat's bearings — and
+     verifies rather than assumes: a rotation probe refuses if a rotated fit is materially
+     better. On covid 4981 it lands 0.66 ft from a placement derived by hand.
+   - **Which courses run with the adjoiner is READ FROM THE DEED, never inferred**
+     (`courses_running_with_adjoiner`). Four attempts to infer it from geometry each returned a
+     confident answer over 1,000 ft wrong, because a straight contact run slides along a
+     straight boundary fitting perfectly the whole way. The deed says it outright ("with a North
+     line of said ..."), and the parser refuses when its own course count disagrees with the
+     caller's rather than mapping indices it cannot trust.
+   - The State Plane zone is derived from the county's parcels against each zone's **published
+     area of use**, accepted only when exactly one zone contains them; Texas' zones are
+     overlapping latitude bands, so ambiguous counties fall through to `_KNOWN_TX_ZONES` and an
+     unregistered ambiguous county declines. A wrong zone tilts the traverse by the convergence
+     difference and trips the rotation probe — a false refusal, not a wrong answer.
    - **Check for an NGS tie before anything cleverer.** When a deed says "a National Geodetic
      Survey monument stamped X bears <bearing> <distance>", the answer is published, free and
      survey-grade: `extract_ngs_monument_ties` → `app/gis/ngs.py`'s `find_monuments` →

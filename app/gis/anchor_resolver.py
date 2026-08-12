@@ -23,6 +23,7 @@ self-reported confidence number alone).
 import json
 import re
 
+from pyproj import CRS
 from sqlalchemy import text
 
 from app.config import LLM_MODEL_HARD, LLM_MODEL_HARDEST
@@ -34,6 +35,7 @@ from app.gis.geocode_anchor import resolve_metes_bounds_approximate
 from app.gis.ngs import NgsUnanswered, find_monuments
 from app.gis.state_plane_anchor import (
     EPSG_BY_TX_ZONE,
+    anchor_by_adjoining_plat,
     anchor_by_ngs_monument_tie,
     traverse_to_geojson_state_plane,
 )
@@ -43,6 +45,10 @@ from app.parsing.legal_description.metes_bounds import (
     _COURSE_RE,
     extract_point_of_beginning,
     walk_traverse,
+)
+from app.parsing.legal_description.adjoiners import (
+    adjoiner_name_key,
+    courses_running_with_adjoiner,
 )
 from app.parsing.legal_description.monument_ties import extract_ngs_monument_ties
 from app.parsing.legal_description.metes_bounds_llm import extract_courses_with_escalation
@@ -237,31 +243,165 @@ def _try_sibling_tract_tie(session, covid: int, tract_no: int) -> dict | None:
     return None
 
 
-def _try_parcel_tie(session, county_fips: str, legal_description_raw: str, courses: list) -> dict | None:
-    """Tier 0d: the geometry is built and tested -- see
-    `app/gis/state_plane_anchor.py`'s `anchor_by_adjoining_plat`, which anchored
-    covid 4981's Young Survey tract unattended to within 0.66 ft of the placement
-    a person had derived by hand, and refuses (rather than guessing) on a short
-    contact run, an overlap into the plat, a bad area, or bearings that are not
-    the plat's. What it needs from a caller is NOT judgment about geometry --
-    that is now settled in code -- but two pieces of bookkeeping this function
-    does not yet have:
+_ADJOINER_BUFFER_FT = 45.0        # dissolve lot lines and fill streets: a plat's
+                                  # outer line is not carried by any one tax parcel
+_MIN_ADJOINER_PARCELS = 8         # fewer than this is not a subdivision footprint
+_MAX_ADJOINER_PARCELS = 4000
 
-      the CONTACT COURSES: which courses the deed says run with the adjoiner.
-        The deed states it ("with a North line of said ..."), so this is a
-        parsing job over `app/parsing/legal_description/adjoiners.py`'s output,
-        not an inference. Four attempts at inferring it from geometry alone are
-        recorded in that module, each confidently wrong by over 1,000 ft.
-      the county's STATE PLANE EPSG, to work in feet. There is no column for it;
-        `county_gis_registry.quirks` is where the per-county settings already
-        live (see Bexar's cad_deed_history_url).
 
-    Until both exist this returns None and the covenant falls through, which is
-    the honest outcome -- a tier that cannot identify its own inputs must not
-    invent them. My own manual attempt at this kind of tie on covid 5838 forced
-    a 606 ft real edge onto a 719.14 ft recited course, a 16% mismatch, before
-    checking the implied scale factor."""
-    return None
+def _state_plane_epsg_for_county(session, county_fips: str) -> tuple[int, str] | None:
+    """The State Plane zone to work in, or None rather than a guess.
+
+    The zone is load-bearing here for a reason that is easy to miss: the deed's
+    bearings are the PLAT's bearings, which are grid bearings on the surveyor's
+    own zone. Fitting in a different projection tilts the traverse by the
+    convergence difference -- around a degree a couple of degrees off the central
+    meridian -- and anchor_by_adjoining_plat's rotation probe would then refuse a
+    perfectly good tie. Getting it wrong costs a false refusal, not a wrong
+    answer, but a tier that refuses everything is not a tier.
+
+    A hand-registered zone wins. Otherwise it is derived from the county's own
+    loaded parcels against each zone's PUBLISHED area of use, and accepted only
+    when exactly one zone contains them -- Texas' zones are latitude bands whose
+    published extents overlap, so Montgomery and Travis sit in two at once and
+    fall through to the registry rather than being assigned by a coin toss.
+    """
+    zone = _KNOWN_TX_ZONES.get(county_fips)
+    if zone is not None:
+        return EPSG_BY_TX_ZONE[zone], f"registered zone (Texas {zone.replace('_', ' ')})"
+    row = session.execute(text("""
+        SELECT ST_X(ST_Centroid(e)) AS lon, ST_Y(ST_Centroid(e)) AS lat
+          FROM (SELECT ST_Extent(geom) AS e FROM parcel WHERE county_fips = :fips) x
+    """), {"fips": county_fips}).fetchone()
+    if row is None or row.lon is None:
+        return None
+    hits = []
+    for name, epsg in EPSG_BY_TX_ZONE.items():
+        use = CRS.from_epsg(epsg).area_of_use
+        if use and use.west <= row.lon <= use.east and use.south <= row.lat <= use.north:
+            hits.append((epsg, name))
+    if len(hits) != 1:
+        return None
+    epsg, name = hits[0]
+    return epsg, (f"derived: the county's parcels fall in exactly one zone's published "
+                  f"area of use (Texas {name.replace('_', ' ')}, EPSG {epsg})")
+
+
+def _adjoiner_footprint(session, county_fips: str, name: str, epsg: int):
+    """The adjoining plat's outer boundary, in State Plane feet, or None.
+
+    Matched on adjoiner_name_key rather than the string: the deed's spelling and
+    the CAD's rarely agree ("The Heights at West ridge Phase I" against "HEIGHTS
+    AT WESTRIDGE PHASE I THE"). The county's own parcels are tried first because
+    they are free and already local; the live layer is queried only when the plat
+    is not one this covenant's census already pulled -- which is the usual case,
+    since an ADJOINING subdivision is by definition not the encumbered one.
+    """
+    from shapely import wkt as shapely_wkt
+
+    key = adjoiner_name_key(name)
+    if len(key) < 8:
+        return None
+    tokens = sorted(re.findall(r"[A-Za-z]{4,}", name.upper()), key=len, reverse=True)
+    if not tokens:
+        return None
+    probe = tokens[0]
+
+    def _footprint_from(rows):
+        """rows: (subdivision_text, geojson-or-None, wkb-or-None)."""
+        kept = [r for r in rows
+                if adjoiner_name_key(str(r[0] or "").split(",")[0]) == key]
+        if not (_MIN_ADJOINER_PARCELS <= len(kept) <= _MAX_ADJOINER_PARCELS):
+            return None, len(kept)
+        session.execute(text("CREATE TEMP TABLE IF NOT EXISTS _adjoiner(g geometry)"))
+        session.execute(text("TRUNCATE _adjoiner"))
+        for sub, gj, geom_wkt in kept:
+            if gj:
+                session.execute(text(
+                    "INSERT INTO _adjoiner VALUES "
+                    "(ST_Transform(ST_SetSRID(ST_GeomFromGeoJSON(:g), 4326), :e))"),
+                    {"g": json.dumps(gj), "e": epsg})
+            else:
+                session.execute(text(
+                    "INSERT INTO _adjoiner VALUES "
+                    "(ST_Transform(ST_GeomFromText(:g, 4326), :e))"), {"g": geom_wkt, "e": epsg})
+        outline = session.execute(text(
+            "SELECT ST_AsText(ST_Buffer(ST_Buffer(ST_Union(g), :b), -:b)) FROM _adjoiner"),
+            {"b": _ADJOINER_BUFFER_FT}).scalar()
+        session.execute(text("DROP TABLE IF EXISTS _adjoiner"))
+        return (shapely_wkt.loads(outline) if outline else None), len(kept)
+
+    local = session.execute(text("""
+        SELECT recited_legal_description, ST_AsText(geom)
+          FROM parcel
+         WHERE county_fips = :fips AND geom IS NOT NULL
+           AND upper(recited_legal_description) LIKE :probe
+    """), {"fips": county_fips, "probe": f"%{probe}%"}).fetchall()
+    poly, kept = _footprint_from([(r[0], None, r[1]) for r in local])
+    if poly is not None:
+        return poly
+
+    adapter = COUNTY_ADAPTERS.get(county_fips)
+    field = getattr(adapter, "FIELD_MAPPING", {}).get("abs_sub_name") if adapter else None
+    if not field:
+        return None
+    live = [(p.get("recited_legal_description"), p.get("geojson"), None)
+            for p in adapter.iter_parcels(where=f"UPPER({field}) LIKE '%{probe}%'")
+            if p.get("geojson")]
+    poly, kept = _footprint_from(live)
+    return poly
+
+
+def _try_parcel_tie(session, covid: int, tract_no: int, county_fips: str,
+                    deed_text: str, courses: list) -> dict | None:
+    """Tier 0d: the deed's Point of Beginning is a corner of a recorded plat the
+    county publishes, and its opening courses run WITH that plat's line.
+
+    Every part of this is read rather than inferred. The plat is the one the POB
+    names; the contact courses are the ones the deed says run with it; the fit is
+    a translation only, because a deed running with a plat's boundary is on that
+    plat's bearings. `anchor_by_adjoining_plat` re-derives all of it and refuses
+    on a short contact run, an overlap into the plat, a bad area, or bearings
+    that turn out not to be the plat's -- so this returns None on anything it
+    cannot stand behind, and the covenant falls through to the paid tiers only
+    when the free reading genuinely does not hold.
+    """
+    if not courses:
+        return None
+    contact = courses_running_with_adjoiner(deed_text, len(courses))
+    if contact is None:
+        return None
+    zone = _state_plane_epsg_for_county(session, county_fips)
+    if zone is None:
+        return None
+    epsg, zone_basis = zone
+
+    footprint = _adjoiner_footprint(session, county_fips, contact["adjoiner"], epsg)
+    if footprint is None or footprint.is_empty:
+        return None
+
+    stated = session.execute(text(
+        "SELECT stated_acreage FROM tract WHERE covid = :c AND tract_no = :t"),
+        {"c": covid, "t": tract_no}).scalar()
+    placed = anchor_by_adjoining_plat(
+        walk_traverse(courses)["vertices"], footprint, contact["contact_indices"],
+        epsg=epsg, stated_acres=float(stated) if stated else None)
+    if not placed.get("anchored"):
+        print(f"  [anchor_resolver] adjoining-plat tier declines: {placed.get('reason')}",
+              flush=True)
+        return None
+
+    return {
+        "geojson": placed["geojson"], "method": "adjoining_plat_tie", "confidence": 0.9,
+        "reasoning": (
+            f"deed's POB is a corner of {contact['adjoiner']}, and courses "
+            f"{contact['contact_courses']} run with that plat's line. Fitted against the "
+            f"county's published footprint on {zone_basis}: residual "
+            f"{placed['rms_ft']:.2f} ft over {placed['contact_span_ft']:.0f} ft of "
+            f"frontage, {placed['overlap_sqft']:,.0f} sq ft overlap, area "
+            f"{placed['area_acres']:.3f} ac, best rotation "
+            f"{placed['best_rotation_deg']:+.2f} deg (grid holds)"),
+    }
 
 
 def _polygon_area_acres(session, geojson: dict) -> float | None:
@@ -468,7 +608,8 @@ def resolve_metes_and_bounds_anchor(session, covid: int, tract_no: int = 1,
         (_try_stated_coordinate, (county_fips, legal_description_raw, courses)),
         (_try_ngs_monument_tie, (session, county_fips, legal_description_raw, courses)),
         (_try_sibling_tract_tie, (session, covid, tract_no)),
-        (_try_parcel_tie, (session, county_fips, legal_description_raw, courses)),
+        (_try_parcel_tie, (session, covid, tract_no, county_fips,
+                           legal_description_raw, courses)),
     ]:
         candidate = attempt_fn(*args)
         if candidate is None:

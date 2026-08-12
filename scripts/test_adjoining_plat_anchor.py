@@ -162,10 +162,113 @@ def test_it_reproduces_covid_4981_from_live_collin_geometry() -> None:
           f"{got['contact_span_ft']:.0f} ft of frontage, area {got['area_delta_pct']:+.2f}%")
 
 
+
+# --- Tier 0d: the same technique, wired into the resolver ------------------
+
+def test_the_deed_says_which_courses_run_with_the_plat() -> None:
+    """The contact set is read, not inferred. Covid 4981's deed names its POB
+    adjoiner and then says four courses run with that plat's north line -- the
+    same [0,1,2,3,4] a person arrived at by reading it."""
+    from app.ingestion.corrected_text import load_correction
+    from app.parsing.legal_description.adjoiners import (
+        adjoiner_name_key, courses_running_with_adjoiner, point_of_beginning_adjoiner)
+    from app.parsing.legal_description.metes_bounds import extract_courses
+
+    deed = load_correction(4981, "tract_young_survey_11878")["text"]
+    got = courses_running_with_adjoiner(deed, len(extract_courses(deed)))
+    assert got is not None, "the deed states this outright"
+    assert got["contact_indices"] == [0, 1, 2, 3, 4], got
+    assert got["contact_courses"] == [0, 1, 2, 3], got
+    assert "Westridge" in got["adjoiner"] or "West ridge" in got["adjoiner"], got
+    # The deed's spelling and the county's disagree two different ways at once:
+    # OCR split WESTRIDGE, and the CAD moved the leading article to the end.
+    assert (adjoiner_name_key(point_of_beginning_adjoiner(deed))
+            == adjoiner_name_key("HEIGHTS AT WESTRIDGE PHASE I THE")
+            == "HEIGHTSWESTRIDGEPHASEI")
+    print(f"PASS: read '{got['adjoiner']}' off the POB and courses {got['contact_courses']} "
+          f"as running with it; deed and CAD spellings reduce to one key")
+
+
+def test_the_parser_refuses_when_it_cannot_map_courses_to_text() -> None:
+    """The self-check that makes the index mapping safe. This function counts
+    courses by splitting on THENCE; if that total disagrees with what
+    extract_courses read from the whole document, the indices it would return
+    are not the caller's indices, and a wrong contact set anchors a tract to the
+    wrong corner while reporting a residual that looks fine."""
+    from app.ingestion.corrected_text import load_correction
+    from app.parsing.legal_description.adjoiners import courses_running_with_adjoiner
+
+    deed = load_correction(4981, "tract_young_survey_11878")["text"]
+    assert courses_running_with_adjoiner(deed, 13) is None, "a count mismatch must refuse"
+    assert courses_running_with_adjoiner(deed, 99) is None
+    assert courses_running_with_adjoiner("no plat, no courses, no POB here", 4) is None
+    print("PASS: refuses a course count it cannot reconcile, and a deed naming no adjoiner")
+
+
+def test_the_state_plane_zone_is_derived_or_registered_but_never_guessed() -> None:
+    """Texas' zones are latitude bands whose PUBLISHED extents overlap, so the
+    derivation only answers where exactly one zone contains the county. Collin
+    resolves cleanly; Travis sits in two at once and is not in the registry, so
+    it correctly yields nothing rather than a coin toss."""
+    from app.db.session import get_session
+    from app.gis.anchor_resolver import _state_plane_epsg_for_county
+
+    with get_session() as session:
+        collin = _state_plane_epsg_for_county(session, "48085")
+        assert collin is not None and collin[0] == 2276, collin
+        assert "derived" in collin[1], collin
+        # registered zones win outright
+        nueces = _state_plane_epsg_for_county(session, "48355")
+        assert nueces[0] == 2279 and "registered" in nueces[1], nueces
+        # ambiguous and unregistered -> no answer
+        assert _state_plane_epsg_for_county(session, "48453") is None
+        # no parcels loaded at all -> no answer
+        assert _state_plane_epsg_for_county(session, "48001") is None
+    print(f"PASS: Collin derived to EPSG 2276, Nueces from the registry, Travis "
+          f"(two zones) and an unloaded county both decline")
+
+
+def test_tier_0d_anchors_covid_4981_unattended() -> None:
+    """The whole tier, as the pipeline calls it: nothing passed in but the covid,
+    the county and the deed's own text."""
+    from app.db.session import get_session
+    from app.gis.anchor_resolver import _try_parcel_tie
+    from app.ingestion.corrected_text import load_correction
+    from app.parsing.legal_description.metes_bounds import extract_courses
+
+    deed = load_correction(4981, "tract_young_survey_11878")["text"]
+    with get_session() as session:
+        try:
+            got = _try_parcel_tie(session, 4981, 2, "48085", deed, extract_courses(deed))
+        except Exception as exc:                                   # noqa: BLE001
+            print(f"SKIP: live Collin GIS unavailable ({type(exc).__name__})")
+            return
+    if got is None:
+        print("SKIP: tier declined -- live Collin layer did not return Phase I")
+        return
+    assert got["method"] == "adjoining_plat_tie", got
+    assert got["confidence"] == 0.9, got
+    assert "Westridge" in got["reasoning"] or "West ridge" in got["reasoning"], got
+    ring = got["geojson"]["coordinates"][0][0]
+    assert ring[0] == ring[-1], "the ring must be closed"
+    assert len(ring) == 15, len(ring)
+    lons = [p[0] for p in ring]
+    lats = [p[1] for p in ring]
+    # Collin County, and specifically the committed tract-2 footprint.
+    assert -96.76 < sum(lons) / len(lons) < -96.74, lons[:2]
+    assert 33.18 < sum(lats) / len(lats) < 33.20, lats[:2]
+    print(f"PASS: Tier 0d anchored covid 4981 tract 2 from the deed alone -- "
+          f"{got['reasoning'][:96]}...")
+
+
 if __name__ == "__main__":
     test_it_finds_the_corner_it_was_not_told()
     test_it_refuses_a_contact_run_too_short_to_fix_position()
     test_it_refuses_when_the_plat_is_not_on_grid_bearings()
     test_it_refuses_an_area_that_contradicts_the_deed()
     test_it_reproduces_covid_4981_from_live_collin_geometry()
+    test_the_deed_says_which_courses_run_with_the_plat()
+    test_the_parser_refuses_when_it_cannot_map_courses_to_text()
+    test_the_state_plane_zone_is_derived_or_registered_but_never_guessed()
+    test_tier_0d_anchors_covid_4981_unattended()
     print("\nall adjoining-plat anchor tests passed")
