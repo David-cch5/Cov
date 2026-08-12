@@ -10,6 +10,11 @@ six separate repairs (a lost decimal point, "an atc distance", "Chord Beating",
 This directory holds the corrected reading itself, with what was changed and on what
 evidence, so the work is not repeated per run.
 
+IT IS VERSION-CONTROLLED, unlike every other text directory in this project. Those
+hold machine readings, and losing one costs a re-run; this holds a human verdict on
+which reading is right, which nothing regenerates. Keep it that way when adding
+files here.
+
 A WHOLE-DOCUMENT CORRECTION AND A SEGMENT CORRECTION ARE NOT THE SAME THING, and
 conflating them would be a regression rather than a fix. A corrected TRACT
 description covers one tract of a document that may hold several, so returning it

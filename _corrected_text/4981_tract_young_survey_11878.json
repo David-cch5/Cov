@@ -1,0 +1,47 @@
+{
+ "covid": 4981,
+ "scope": "segment",
+ "key": "tract_young_survey_11878",
+ "text": "BEING a tract of land situated in the Andrew S. Young Survey, Abstract No .1037, in tire City of McKinney, Collin County, Texas and being out of that Final Boundary Plat of Parcels 1201-1209, 1216 & 1217, an addition to the City of McKinney as recorded in Cabinet 0, Pages 269 & 270 in the Plat Records of Collin County, Texas, and being more particularly described as follows: BEGINNING at a 1/2 inch iron rod found at the Easterly Northeast corner of The Heights at West ridge Phase I, an addition to the City of McKinney as recorded in Volume P, Pages 891 & 892, in the Plat Records of Collin County, Texas, and being a point in the West line of Independence Parkway; THENCE, South 88 degrees 11 minutes 53 seconds West, departing said West line of Independence Parkway and with a North line of said The Heights at West ridge Phase I, for a distance of 121.92 feet, to a 1/2 inch iron rod found at the point of curvature of a curve to the right, having a radius of 609 00 feet, a tangent of 50.41 feet and a central angle of 09 degrees 27 minutes 50 seconds; THENCE, continuing with said North line and said curve to the right, for an arc distance of 100.59 feet, (Chord Bearing North 87 degrees 04 minutes 12 seconds West - 100.48 feet), to a 1/2 inch iron rod found at the point of reverse curvature of a curve to the left having a radius of 1891.00 feet, a tangent of 153.48 feet and a central angle of 09 degrees 16 minutes 48 seconds; THENCE, continuing with said North line and said curve to the left for an arc distance of 306.28 feet, (Chord Bearing North 86 degrees 58 minutes 41 seconds West - 305.95 feet), to a 1/2-inch iron rod found at the point of tangency of said curve; THENCE, South 88 degrees 22 minutes 55 seconds West, continuing with said North line, for a distance of 103.68 feet to a 1/2 inch iron rod found at an interior ell corner of said Heights at West ridge Phase I; THENCE, North 00 degrees 07 minutes 20 seconds West, with an East line of said Phase I, at 541.68 feet passing a 1/2 inch iron rod found being the Northeast corner of said Heights at West ridge Phase I and continuing for a total distance of 839.30 feet to a 1/2 inch iron rod set, being a point in the South line of West ridge Boulevard, being in the North line of said Boundary Plat of Parcels 1201-1209,1216 & 1217; THENCE, North 89 degrees 52 minutes 40 seconds East, along said North and South lines for a distance of 332.97 feet to a 1/2 inch iron rod set at the point of curvature of a curve to tire right having a radius of 235.00 feet, a tangent of 29.00 feet and a central angle of 14 degrees 04 minutes 12 seconds; THENCE, continuing with said North and South lines and with said curve to the right for an arc distance of 57.71 feet (Chord Beating South 83 degrees 05 minutes 14 seconds East - 57.56 feet) to a 1/2 inch iron rod set at the point of reverse curvature of a curve to the left having a radius of 265.00 feet, a tangent of 32.70 feet and a central angle of 14 degrees 04 minutes 12 seconds; THENCE, continuing with said North and South lines and with said curve to the left for an arc distance of 65.08 feet, (Chord Bearing South 83 degrees 05 minutes 14 seconds East, - 64 91 feet), to a 1/2-inch iron rod set at the point of tangency of said curve; THENCE, North 89 degrees 52 minutes 40 seconds East, continuing along said North and South lines for a distance of 112.89 feet to a 1/2 inch iron rod set; THENCE, South 45 degrees 57 minutes 43 seconds East, continuing along said North line for a distance of 34.83 feet, to a 1/2 inch iron rod set, being a point in said West line of Independence Parkway and being in tire East line of said Boundary Plat of Parcels 1201-1209, 1216 & 1217; THENCE, South 01 degree 48 minutes 07 seconds East, along said East and West lines for a distance of 82.94 feet to a 1/2 inch iron rod set at the point of curvature of a curve to the left having a radius of 265.00 feet, a tangent of 32.70 feet and a central angle of 14 degrees 04 minutes 12 seconds; THENCE, continuing with said East and West lines and said curve to the left for an arc distance of 65.08 feet, (Chord Bearing South 08 degrees 50 minutes 13 seconds East - 64.91 feet), to a 1/2 inch iron rod set at the point of reverse curvature of a curve to the right, having a radius of 235.00 feet, a tangent of 29.00 feet and a central angle of 14 degrees 04 minutes 12 seconds; THENCE, continuing along said East and West lines for' an arc distance of 57.71 feet, (Chord Bearing South 08 degrees 50 minutes 13 seconds East - 57.56 feet), to a 1/2 inch iron rod set at the point of tangency of said curve; THENCE, South 01 degree 48 minutes 07 seconds East, continuing along said East and West lines for a distance of 612.18 feet to the POINT OF BEGINNING and containing 11.878 acres of land.",
+ "corrected_by": "COV_EXHA_EXTRACT.xlsx -- OCR reviewed by the Covenant Clearinghouse team",
+ "basis": "Chosen over the document's own OCR by CLOSURE, not by preference: the same 14 courses walked from this text close at 0.02 ft over 2,892 ft (1:186,912) and give 11.9049 acres against a stated 11.878, while the document's cached OCR -- even after six repairs -- closes at 115.13 ft (1:25). One course is misread in the scan and right here. Prose OCR faults remain in this text ('tire' for 'the', 'No .1037') but touch no course.",
+ "repairs": [],
+ "verified": true,
+ "evidence": {
+  "source": "COV_EXHA_EXTRACT.xlsx",
+  "courses_read": 14,
+  "thence_calls": 14,
+  "closure_error_ft": 0.015,
+  "closure_ratio_denominator": 186912,
+  "area_acres": 11.9049,
+  "stated_acres": 11.878,
+  "rejected_alternative": {
+   "source": "document OCR + repairs",
+   "closure_error_ft": 115.131,
+   "closure_ratio_denominator": 25
+  },
+  "anchor": {
+   "committed_as": "tract(covid=4981, tract_no=2)",
+   "method": "named_adjoining_parcel_tie",
+   "tie_recited_in_deed": "BEGINNING at a 1/2 inch iron rod found at the Easterly Northeast corner of The Heights at Westridge Phase I ... and being a point in the West line of Independence Parkway",
+   "tie_source": "Collin CAD live parcel layer, legalAbsSubName = 'HEIGHTS AT WESTRIDGE PHASE I THE' (398 parcels), unioned in EPSG:2276",
+   "rotation_solved": false,
+   "rotation_note": "none needed -- Phase I's own longest control lines run az 271.1-271.5 deg against the deed's west courses at 268.2-273.0 deg, so the plat's basis of bearings is the State Plane grid and only the translation was unknown",
+   "checks": {
+    "pob_offset_from_recited_corner_ft": 9.45,
+    "south_line_rms_to_phase_i_boundary_ft": 6.39,
+    "overlap_onto_phase_i_sqft": 464,
+    "west_line_vs_phase_i_northern_leg_ft": 7.2,
+    "phase_i_east_line_step_ft": 634,
+    "traverse_width_ft": 633,
+    "area_acres": 11.9048,
+    "stated_acres": 11.878,
+    "area_delta_pct": 0.23
+   },
+   "live_parcel_dry_run": "parcels wholly inside recite HEIGHTS AT WESTRIDGE PLANNING AREA 12 PARCEL 1209 -- the deed places the tract in 'Parcels 1201-1209, 1216 & 1217', so the county fabric names the deed's own parcel back",
+   "anchored_on": "2026-08-12"
+  }
+ },
+ "chars": 4811,
+ "recorded_at": "2026-08-12T19:10:14.947416+00:00"
+}

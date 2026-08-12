@@ -38,4 +38,10 @@ _artifacts/
 _dropbox/
 _intake/
 _intake_text/
-/_corrected_text/
+
+# _corrected_text/ is deliberately NOT ignored, though it was at first, grouped
+# with the acquired text above. That was a misreading of what it holds. The text
+# caches are machine readings that re-derive from the same scan on every run, so
+# losing one costs a re-run; a correction is a HUMAN VERDICT about which reading
+# is right and on what evidence, and nothing regenerates it. It was the one
+# artifact here that could not be rebuilt and the one artifact not backed up.
