@@ -203,6 +203,100 @@ def test_the_schema_refuses_a_node_with_no_provenance() -> None:
           "with no county")
 
 
+def test_encumbered_acreage_is_measured_only_against_a_real_boundary() -> None:
+    """'encumbered' is the intersection with the covenant's ANCHORED tract polygon.
+    A tract that only has app/gis/geocode_anchor.py's approximate placement is
+    shape-valid and position-unconfirmed, so intersecting a parcel with it would
+    manufacture a fee basis. That tract gets no encumbered figure and says why."""
+    with get_session() as session:
+        approx = session.execute(text("""
+            SELECT covid, tract_no FROM tract
+             WHERE geom IS NULL AND approximate_geom IS NOT NULL LIMIT 1
+        """)).fetchone()
+        if approx is None:
+            print("SKIP: no approximately-placed tract on record to check")
+        else:
+            got = spine.sync_acreage_from_gis(session, approx.covid, approx.tract_no)
+            assert got["measured"] == 0 and got["skipped_no_tract_geom"], got
+            assert "approximate" in got["reason"], got["reason"]
+            print(f"    covid {approx.covid} (approximate boundary only): {got['reason']}")
+
+        # And a real one measures every node it can, with nothing impossible.
+        real = session.execute(text("""
+            SELECT covid, tract_no FROM tract_node n JOIN tract t USING (covid, tract_no)
+             WHERE t.geom IS NOT NULL AND n.apn IS NOT NULL
+             GROUP BY 1, 2 ORDER BY count(*) DESC LIMIT 1
+        """)).fetchone()
+        assert real is not None, "no anchored tract with APN-bearing nodes"
+        got = spine.sync_acreage_from_gis(session, real.covid, real.tract_no)
+        assert got["measured"] > 0 and not got["impossible"], got
+        session.rollback()
+    print(f"PASS: encumbered acreage measured for {got['measured']} node(s) of covid "
+          f"{real.covid}; an approximate boundary yields none")
+
+
+def test_a_boundary_lot_is_supposed_to_disagree_with_itself() -> None:
+    """'gis' is the whole parcel, 'encumbered' is the part inside the tract. On a lot
+    straddling the tract line those differ BY DESIGN, and reporting that as a conflict
+    was my own error -- all 26 nodes it flagged on covid 4440 were classified
+    'boundary', one of them 56% inside. The pair is compared only where the two should
+    agree: an 'interior' parcel lies wholly within the tract."""
+    with get_session() as session:
+        row = session.execute(text("""
+            SELECT n.covid, n.tract_no, n.node_id, pc.classification,
+                   (SELECT acreage FROM tract_node_acreage
+                     WHERE node_id = n.node_id AND basis = 'gis') AS gis,
+                   (SELECT acreage FROM tract_node_acreage
+                     WHERE node_id = n.node_id AND basis = 'encumbered') AS enc
+              FROM tract_node n
+              JOIN parcel_covenant pc ON pc.covid = n.covid AND pc.tract_no = n.tract_no
+                   AND pc.county_fips = n.county_fips AND pc.apn = n.apn
+             WHERE pc.classification = 'boundary'
+             LIMIT 1
+        """)).fetchone()
+        if row is None:
+            print("SKIP: no boundary-classified node on record")
+            return
+        assert row.gis is not None and row.enc is not None, row
+        assert float(row.gis) > float(row.enc), (
+            "a boundary lot must measure smaller inside the tract than in total")
+        report = spine.reconcile(session, row.covid, row.tract_no)
+        flagged = [c for c in report["basis_conflict"] if c["node_id"] == row.node_id]
+        assert not flagged, f"a boundary lot must not be reported as a conflict: {flagged}"
+    print(f"PASS: boundary node keeps both figures ({row.gis} ac total, {row.enc} ac "
+          f"inside) and is not mis-reported as a conflict")
+
+
+def test_the_backfill_is_idempotent_and_platted_lots_cite_their_plat() -> None:
+    """A plat is one instrument creating MANY lots (migration 0047) -- not a
+    conveyance, and not two children. Re-running must not duplicate a lot."""
+    with get_session() as session:
+        target = session.execute(text("""
+            SELECT covid, tract_no, count(*) AS n FROM tract_node
+             WHERE disposition = 'platted' GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 1
+        """)).fetchone()
+        assert target is not None, "nothing back-filled yet"
+        again = spine.backfill_from_plats(session, target.covid, target.tract_no)
+        assert again["lots_added"] == 0, f"re-running added {again['lots_added']} duplicates"
+
+        rows = session.execute(text("""
+            SELECT count(*) AS n,
+                   count(*) FILTER (WHERE split_instrument_number IS NULL) AS no_instrument,
+                   count(*) FILTER (WHERE plat_id IS NULL) AS no_plat,
+                   count(DISTINCT split_instrument_number) AS instruments
+              FROM tract_node
+             WHERE covid = :covid AND tract_no = :tract_no AND disposition = 'platted'
+        """), {"covid": target.covid, "tract_no": target.tract_no}).fetchone()
+        assert rows.no_instrument == 0, "every platted lot cites the plat that made it"
+        assert rows.no_plat == 0, "every platted lot points at its plat row"
+        assert rows.instruments < rows.n, (
+            "a plat should create several lots -- one instrument per lot means the "
+            "one-to-many nature was lost")
+        session.rollback()
+    print(f"PASS: covid {target.covid} has {rows.n} platted lots from {rows.instruments} "
+          f"plat filings, all cited; re-running adds none")
+
+
 def test_live_state_is_clean() -> None:
     with get_session() as session:
         counts = session.execute(text(
@@ -222,5 +316,8 @@ if __name__ == "__main__":
     test_over_conveyance_is_reported_with_its_likely_cause()
     test_apn_arrives_at_the_leaf_and_the_round_trip_works()
     test_the_schema_refuses_a_node_with_no_provenance()
+    test_encumbered_acreage_is_measured_only_against_a_real_boundary()
+    test_a_boundary_lot_is_supposed_to_disagree_with_itself()
+    test_the_backfill_is_idempotent_and_platted_lots_cite_their_plat()
     test_live_state_is_clean()
     print("\nall tract-spine tests passed")

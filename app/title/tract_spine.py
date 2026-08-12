@@ -221,6 +221,132 @@ def attach_parcel(session, node_id: int, county_fips: str, apn: str, *,
         set_acreage(session, node_id, "gis", gis_acreage, source_id=source_id)
 
 
+def sync_acreage_from_gis(session, covid: int, tract_no: int = 1) -> dict:
+    """Measure every APN-bearing node from geometry: its own area, and how much of it
+    lies inside this covenant's tract.
+
+    'gis'        the parcel's whole area, from the county's own polygon
+    'encumbered' the area of the INTERSECTION with the tract -- what a fee accrues on
+
+    ONLY THE ANCHORED POLYGON IS USED. `tract.geom` is a boundary resolved from the
+    deed's own metes and bounds and tied to real coordinates. `tract.approximate_geom`
+    is the shape-valid, position-unconfirmed fallback from app/gis/geocode_anchor.py,
+    and intersecting a parcel with a polygon that is merely the right SHAPE in roughly
+    the right PLACE would manufacture an encumbered acreage -- a number that looks
+    like evidence and would go straight under a fee. A tract with no real geom gets
+    no encumbered figure at all, and says so.
+
+    A parcel whose intersection exceeds its own area is impossible and is reported
+    rather than written: it means one of the two geometries is invalid.
+    """
+    tract = session.execute(
+        text("""SELECT geom IS NOT NULL AS anchored, approximate_geom IS NOT NULL AS approx
+                  FROM tract WHERE covid = :covid AND tract_no = :tract_no"""),
+        {"covid": covid, "tract_no": tract_no}).fetchone()
+    if tract is None:
+        raise ValueError(f"no tract for covid {covid} tract {tract_no}")
+    if not tract.anchored:
+        return {"covid": covid, "tract_no": tract_no, "measured": 0, "skipped_no_tract_geom": True,
+                "reason": ("this tract has only an approximate boundary, so no encumbered "
+                           "acreage can be measured from it"
+                           if tract.approx else "this tract has no boundary at all"),
+                "impossible": []}
+
+    rows = session.execute(text("""
+        SELECT n.node_id,
+               round((ST_Area(p.geom::geography) / 4046.8564224)::numeric, 3) AS own_acres,
+               round((ST_Area(ST_Intersection(p.geom, t.geom)::geography)
+                      / 4046.8564224)::numeric, 3) AS inside_acres
+          FROM tract_node n
+          JOIN parcel p ON p.county_fips = n.county_fips AND p.apn = n.apn
+          JOIN tract t ON t.covid = n.covid AND t.tract_no = n.tract_no
+         WHERE n.covid = :covid AND n.tract_no = :tract_no AND n.apn IS NOT NULL
+           AND p.geom IS NOT NULL AND t.geom IS NOT NULL
+           AND ST_IsValid(p.geom) AND ST_IsValid(t.geom)
+    """), {"covid": covid, "tract_no": tract_no}).fetchall()
+
+    measured, impossible = 0, []
+    for r in rows:
+        own, inside = float(r.own_acres), float(r.inside_acres)
+        if inside - own > ACREAGE_TOLERANCE_ACRES:
+            impossible.append({"node_id": r.node_id, "own_acres": own, "inside_acres": inside})
+            continue
+        set_acreage(session, r.node_id, "gis", own,
+                    note="parcel polygon area, county GIS")
+        set_acreage(session, r.node_id, "encumbered", inside,
+                    note="intersection with this covenant's anchored tract boundary")
+        measured += 1
+
+    unmeasurable = session.execute(text("""
+        SELECT count(*) FROM tract_node n
+          LEFT JOIN parcel p ON p.county_fips = n.county_fips AND p.apn = n.apn
+         WHERE n.covid = :covid AND n.tract_no = :tract_no AND n.apn IS NOT NULL
+           AND (p.geom IS NULL OR NOT ST_IsValid(p.geom))
+    """), {"covid": covid, "tract_no": tract_no}).scalar()
+    return {"covid": covid, "tract_no": tract_no, "measured": measured,
+            "skipped_no_tract_geom": False,
+            "parcels_without_usable_geometry": unmeasurable,
+            "impossible": impossible}
+
+
+def backfill_from_plats(session, covid: int, tract_no: int = 1, *,
+                        source_id: int | None = None) -> dict:
+    """Build the spine that the record already supports: the tract, the lots a plat
+    made out of it, and the raw acreage those plats left behind.
+
+    This is the only split event back-fillable today. The transfers on record are
+    LOT-level deed histories -- each conveying a whole lot, not part of a tract -- so
+    they say nothing about how the tract itself was divided. What does say it is
+    parcel.plat_id and parcel.formed_by_instrument: the recorded plat that created
+    each lot, already established and dated (app/gis/plat_link.py).
+
+    One 'retained' node per plat carries what that filing left unplatted, so the
+    remainder is a node in the spine rather than only a number on the tract. Its
+    acreage is derived ONLY where the tract's own encumbered total is known and the
+    arithmetic stays non-negative -- the same refusal as record_split.
+
+    Idempotent: a parcel appears once per tract (tract_node_one_node_per_parcel_per_tract).
+    """
+    root = create_root(session, covid, tract_no, source_id=source_id)
+    lots = session.execute(text("""
+        SELECT DISTINCT p.county_fips, p.apn, p.plat_id, p.formed_by_instrument,
+                        p.formed_date, pl.recording_instrument
+          FROM parcel_covenant pc
+          JOIN parcel p ON p.county_fips = pc.county_fips AND p.apn = pc.apn
+          JOIN plat pl ON pl.plat_id = p.plat_id
+         WHERE pc.covid = :covid AND pc.tract_no = :tract_no
+           AND p.plat_id IS NOT NULL AND p.formed_by_instrument IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM tract_node n
+                            WHERE n.covid = pc.covid AND n.tract_no = pc.tract_no
+                              AND n.county_fips = p.county_fips AND n.apn = p.apn)
+         ORDER BY p.formed_date, p.apn
+    """), {"covid": covid, "tract_no": tract_no}).fetchall()
+
+    by_plat: dict[tuple, list] = {}
+    for lot in lots:
+        by_plat.setdefault((lot.plat_id, lot.formed_by_instrument, lot.formed_date), []).append(lot)
+
+    made = 0
+    for (plat_id, instrument, formed), group in sorted(by_plat.items(), key=lambda kv: str(kv[0][2])):
+        path = _next_child_path(session, root)
+        for i, lot in enumerate(group, start=1):
+            session.execute(text("""
+                INSERT INTO tract_node
+                    (node_label, covid, tract_no, parent_node_id, disposition,
+                     split_county_fips, split_instrument_number, split_recording_date,
+                     county_fips, apn, plat_id, source_id)
+                VALUES (:label, :covid, :tract_no, :root, 'platted',
+                        :cf, :instrument, :recorded, :cf, :apn, :plat_id, :source_id)
+            """), {"label": _label_for(covid, tract_no, f"{path}P{i}"), "covid": covid,
+                   "tract_no": tract_no, "root": root, "cf": lot.county_fips,
+                   "instrument": instrument, "recorded": formed, "apn": lot.apn,
+                   "plat_id": plat_id, "source_id": source_id})
+            made += 1
+
+    return {"covid": covid, "tract_no": tract_no, "root_node_id": root,
+            "plat_events": len(by_plat), "lots_added": made}
+
+
 def walk_down(session, node_id: int) -> list[dict]:
     """Every descendant, breadth-first, with its depth -- the covenant -> child ->
     child's child -> current lot traversal. Cycle-guarded: a spine should be a tree,
@@ -298,10 +424,30 @@ def reconcile(session, covid: int, tract_no: int = 1) -> dict:
         if n.parent_node_id is not None:
             children.setdefault(n.parent_node_id, []).append(n)
 
+    # A BOUNDARY PARCEL IS SUPPOSED TO DISAGREE WITH ITSELF. 'gis' is the whole
+    # parcel and 'encumbered' is the part inside the tract, so on a lot straddling the
+    # tract line they differ BY DESIGN -- that difference is the measurement, not a
+    # fault. Confirmed on covid 4440: all 26 flagged nodes were classified 'boundary',
+    # one of them 56% inside. So that pair is only compared where the two should
+    # agree: a parcel classified 'interior' lies wholly within the tract, and there a
+    # gap between its own area and the intersection means one geometry is wrong.
+    interior = {r.apn for r in session.execute(
+        text("""SELECT DISTINCT pc.apn FROM parcel_covenant pc
+                 WHERE pc.covid = :covid AND pc.tract_no = :tract_no
+                   AND pc.classification = 'interior'"""),
+        {"covid": covid, "tract_no": tract_no}).fetchall()}
+    node_apn = {n.node_id: n.apn for n in session.execute(
+        text("""SELECT node_id, apn FROM tract_node
+                 WHERE covid = :covid AND tract_no = :tract_no"""),
+        {"covid": covid, "tract_no": tract_no}).fetchall()}
+
     for node_id, own in acres.items():
         pair = [(b, v) for b, v in own.items() if b in ("stated", "encumbered", "gis")]
+        is_interior = node_apn.get(node_id) in interior
         for i, (b1, v1) in enumerate(pair):
             for b2, v2 in pair[i + 1:]:
+                if {b1, b2} == {"gis", "encumbered"} and not is_interior:
+                    continue  # a boundary lot: the gap IS the part outside the tract
                 if abs(v1 - v2) > ACREAGE_TOLERANCE_ACRES:
                     basis_conflict.append({
                         "node_id": node_id, "node_label": by_id[node_id].node_label,
