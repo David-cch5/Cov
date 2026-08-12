@@ -327,6 +327,7 @@ def run_reconcile(session, covid: int, payload: dict) -> StageVerdict:
     footprint is flagged. A covenant that does not reconcile is not finished, and
     saying otherwise is the one outcome this project treats as unacceptable.
     """
+    from app.gis.formation import check_formation_date_plausibility
     from app.gis.reconcile import reconcile_covenant
 
     # reconcile_covenant already writes covenant.status and merges its own
@@ -343,10 +344,30 @@ def run_reconcile(session, covid: int, payload: dict) -> StageVerdict:
     problems = {tn: r.get("note") for tn, r in per_tract.items()
                 if r.get("checked") and r.get("status") != "reconciled"}
 
-    if final_status == "reconciled" and not unchecked and not problems:
+    # A FORMATION DATE THAT CANNOT BE TRUE FAILS THIS GATE. Three wrong plat dates
+    # reached this database and every one was caught by a human noticing the year --
+    # the last survived a correction pass because one row was fixed and no duplicate
+    # was looked for. A formation date is what a fee accrues from, so it is checked
+    # here, where "this covenant is done" is decided, rather than left to whoever
+    # happens to read a date.
+    dates = check_formation_date_plausibility(session, covid)
+    result["formation_date_check"] = dates
+
+    if final_status == "reconciled" and not unchecked and not problems and dates["plausible"]:
         return StageVerdict("advanced",
-                            f"reconciled across {len(per_tract)} tract(s)",
+                            f"reconciled across {len(per_tract)} tract(s); "
+                            f"{dates['checked']:,} formation dates all plausible",
                             covid=covid, detail=result)
+
+    if final_status == "reconciled" and not unchecked and not problems:
+        kinds = ", ".join(f"{k} x{len(v)}" for k, v in dates.items()
+                          if isinstance(v, list) and v)
+        return StageVerdict(
+            "needs_review",
+            f"acreage reconciles across {len(per_tract)} tract(s), but {dates['implausible']} "
+            f"formation date(s) cannot be true ({kinds}) -- a fee accrues from these, so "
+            f"this is not done",
+            covid=covid, detail=result)
 
     detail = "; ".join(
         [f"tract {tn}: {note}" for tn, note in problems.items()]

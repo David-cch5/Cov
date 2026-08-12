@@ -104,3 +104,131 @@ def formation_timeline(session, covid: int, tract_no: int | None = None) -> list
         {"covid": covid, "tract_no": tract_no},
     ).fetchall()
     return [dict(r._mapping) for r in rows]
+
+
+# Sentinel dates a county index uses to mean "unknown", and the floor below which no
+# Texas subdivision plat exists. Duplicated from app/gis/plat_tracking.py on purpose:
+# that module guards them at PARSE time, and this one checks what actually landed in
+# the table, whichever path wrote it. A parse-time guard cannot see a row written by
+# resolve_subdivision_plat_tract, and that is where two of the three real errors came
+# from.
+_SENTINEL_DATES = ("1800-01-01", "1900-01-01", "1899-12-31")
+_EARLIEST_PLAUSIBLE_YEAR = 1850
+
+# How far before its subdivision's own earliest filing a lot's date may sit before it
+# is a finding. Zero would flag ordinary noise: a subdivision's first section and a
+# same-day amending plat can differ by a day in how a county indexes them.
+_EARLY_TOLERANCE_DAYS = 2
+
+
+def check_formation_date_plausibility(session, covid: int | None = None) -> dict:
+    """Report formation dates that cannot be true. Changes nothing.
+
+    WHY THIS EXISTS. Three wrong plat dates reached this database and every one was
+    caught only because a human noticed the YEAR looked wrong -- Nueces' 1/1/1800
+    sentinel, Collin's 1/1/1900 on a subdivision platted in 2004, and doc 46201's
+    2008-10-16 sitting on 11 lots of a subdivision whose earliest real filing is 2013.
+    The last one survived a correction pass because I fixed one row and never looked
+    for a duplicate. A formation date is what a fee accrues from, so "somebody will
+    notice" is not a control.
+
+    Four findings, each one a real error class already seen:
+
+      sentinel_date     an index's placeholder written as a date. Cheap to check and
+                        the only one already guarded upstream.
+      before_subdivision  a lot dated before its own subdivision's earliest recorded
+                        plat. This is what caught unit 4A: land cannot be platted into
+                        a subdivision that did not yet exist.
+      conveyed_before_formed  a parcel with a recorded transfer PREDATING its formation
+                        date. A lot cannot be sold before the plat created it, so
+                        something is misplaced -- and it is not always the date. The
+                        first two this check found (Collin 2766013/2766016, platted
+                        2017-10-03, transfers dated 2011-01-04) are PRE-PLAT
+                        conveyances of the ancestor tract, recorded against the lot's
+                        own APN because that is the only place chain.py had to put
+                        them. Those belong on an ancestor node of the tract spine
+                        (app/title/tract_spine.py), not on the lot. So this finding
+                        means "the date or the attachment is wrong", and each row
+                        carries which reading to check first.
+      future_date       a formation date after today.
+
+    Deliberately no auto-repair. Each of these has more than one possible cause (the
+    wrong plat matched, the right plat mis-dated, the chain attached to the wrong
+    parcel), and picking one would be the same guess that produced the errors.
+    """
+    scope = "AND EXISTS (SELECT 1 FROM parcel_covenant pc WHERE pc.county_fips = p.county_fips " \
+            "AND pc.apn = p.apn AND pc.covid = :covid)" if covid is not None else ""
+    params = {"covid": covid} if covid is not None else {}
+
+    sentinel = session.execute(text(f"""
+        SELECT p.county_fips, p.apn, p.formed_date, p.formed_by_instrument
+          FROM parcel p
+         WHERE p.formed_date IS NOT NULL {scope}
+           AND (p.formed_date IN ('{"','".join(_SENTINEL_DATES)}')
+                OR EXTRACT(YEAR FROM p.formed_date) < {_EARLIEST_PLAUSIBLE_YEAR})
+         ORDER BY p.formed_date LIMIT 200
+    """), params).fetchall()
+
+    # A subdivision's earliest filing, over every plat row this project holds for it,
+    # compared on the same normalised name plat_link matches with -- so "HEIGHTS AT
+    # WESTRIDGE" and "HEIGHTS WESTRIDGE" are one subdivision, not two.
+    before_sub = session.execute(text(f"""
+        WITH earliest AS (
+            SELECT county_fips, subdivision_name, min(recording_date) AS first_filing
+              FROM plat
+             WHERE lookup_status = 'found' AND recording_date IS NOT NULL
+             GROUP BY county_fips, subdivision_name
+        )
+        SELECT p.county_fips, p.apn, p.formed_date, p.formed_by_instrument,
+               pl.subdivision_name, e.first_filing,
+               (e.first_filing - p.formed_date) AS days_early
+          FROM parcel p
+          JOIN plat pl ON pl.plat_id = p.plat_id
+          JOIN earliest e ON e.county_fips = pl.county_fips
+                         AND e.subdivision_name = pl.subdivision_name
+         WHERE p.formed_date IS NOT NULL {scope}
+           AND p.formed_date < e.first_filing - {_EARLY_TOLERANCE_DAYS}
+         ORDER BY (e.first_filing - p.formed_date) DESC LIMIT 200
+    """), params).fetchall()
+
+    conveyed_early = session.execute(text(f"""
+        SELECT p.county_fips, p.apn, p.formed_date, p.formed_by_instrument,
+               min(t.recording_date) AS earliest_transfer,
+               count(*) AS transfers_before
+          FROM parcel p
+          JOIN transfer t ON t.parcel_county_fips = p.county_fips AND t.parcel_apn = p.apn
+         WHERE p.formed_date IS NOT NULL AND t.recording_date < p.formed_date {scope}
+         GROUP BY 1, 2, 3, 4
+         ORDER BY min(t.recording_date) LIMIT 200
+    """), params).fetchall()
+
+    future = session.execute(text(f"""
+        SELECT p.county_fips, p.apn, p.formed_date, p.formed_by_instrument
+          FROM parcel p
+         WHERE p.formed_date > current_date {scope}
+         ORDER BY p.formed_date DESC LIMIT 200
+    """), params).fetchall()
+
+    def as_dicts(rows, cause=None):
+        out = []
+        for r in rows:
+            row = dict(r._mapping)
+            if cause:
+                row["check_first"] = cause
+            out.append(row)
+        return out
+    findings = {
+        "sentinel_date": as_dicts(sentinel),
+        "before_subdivision": as_dicts(before_sub),
+        "conveyed_before_formed": as_dicts(
+            conveyed_early,
+            "whether these transfers are PRE-PLAT conveyances of the ancestor tract "
+            "attributed to this lot's APN -- if so the date is right and the transfers "
+            "belong on a tract_spine ancestor node, not on this parcel"),
+        "future_date": as_dicts(future),
+    }
+    total = sum(len(v) for v in findings.values())
+    return {"covid": covid, "checked": session.execute(text(
+                f"SELECT count(*) FROM parcel p WHERE p.formed_date IS NOT NULL {scope}"),
+                params).scalar(),
+            "implausible": total, "plausible": total == 0, **findings}
