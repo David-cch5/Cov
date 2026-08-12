@@ -247,7 +247,8 @@ def get_deed_text(session, covid: int, legal_description_raw: str | None = None)
     it in either one would be a circular import. This module already owns
     TEXTCACHE and imports nothing from app.gis.
 
-    SEARCHES EVERY CACHE A DOCUMENT'S TEXT CAN LIVE IN, not just the corpus one.
+    PREFERS A CORRECTED READING over any machine one, then searches every cache a
+    document's text can live in, not just the corpus one.
     Confirmed the hard way on the first live drag-and-drop run: this looked only
     in _textcache_final, so a covenant that arrived as a dropped file -- whose
     text app/ingestion/intake.py caches under _intake_text/ -- fell through to
@@ -260,6 +261,19 @@ def get_deed_text(session, covid: int, legal_description_raw: str | None = None)
     The corpus path had been fixed for it; the drop path silently had not, and
     would have hit it on every covenant.
     """
+    # A CORRECTED READING OUTRANKS EVERY MACHINE ONE. _textcache*, _intake_text/ and
+    # _ocr_escalated/ are all machine readings of the same scan, so a fault fixed by
+    # hand today is re-read tomorrow unless the correction is preferred here. Only a
+    # whole-DOCUMENT correction is returned: a corrected tract description covers one
+    # tract of a document that may hold several, and handing it back where the whole
+    # text was asked for would silently discard the others
+    # (app/ingestion/corrected_text.py).
+    from app.ingestion.corrected_text import corrected_document_text
+
+    corrected = corrected_document_text(covid)
+    if corrected:
+        return corrected
+
     doc = session.execute(
         text("SELECT relpath FROM covenant_document WHERE covid = :covid AND doc_type = 'original'"),
         {"covid": covid},
