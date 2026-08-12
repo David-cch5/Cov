@@ -362,3 +362,54 @@ A disagreement between stated and derived is a FINDING, not an error to average
 away, and its commonest cause is exactly this: the conveyance reached outside the
 tract. Chase it to the deed -- the same rule CLAUDE.md already applies to a traverse
 that fails to close. Never reconcile by adjusting a number nobody recorded.
+
+
+## Three readings of every legal description, matched by CONTENT not position
+
+Three independent transcriptions exist for each covenant, and none of them is the
+referee -- each is a witness with its own failure mode:
+
+    _textcache*              the original OCR. Can be silently empty: covid 4956's
+                             was 100% vendor page-stamps, 0 body chars.
+    a fresh read             app/ingestion/text_extract.py, escalating to vision OCR
+                             where the free tiers fail. Rotation and DPI faults.
+    COV_EXHA_EXTRACT.xlsx    OCR reviewed by the stakeholder's team. Human slips, and
+                             reviewer normalisation that can quietly "correct" a real
+                             typo out of existence.
+
+TRACT ORDER IN THE SHEET DOES NOT MATCH THE DOCUMENT (stated by the stakeholder,
+2026-08-12). So sheet row N is NEVER tract N. Every match must be made on CONTENT --
+stated acreage, survey and abstract number, lot and block, subdivision name -- and a
+row that matches nothing is a finding, not a row to assign by elimination. Matching by
+position would silently attach one tract's text to another tract's boundary, which is
+the same class of error as attaching one filing's date to another filing's lots.
+
+A ROW IS NOT ALWAYS A TRACT. The sheet's rows come in at least three kinds, and the
+same land can appear twice in two notations -- covid 5839 carries both a 43.354-acre
+field-note description AND "R373270 HALL E SUR 588 LS 227 ..., 43.354 ACS", the CAD
+account for that same land:
+
+    metes-and-bounds     a full field-note description
+    account reference    "R357940 GULF SIDE ESTATES 31.14 ACS OUT LT 5 BLK 1"
+    lot list             "R376672 LT 1 BLK 1; R376673 LT 2 BLK 1; ..."
+
+So a row count is not a tract count, and disagreement with our own tract count is a
+question to answer by reading, not a defect on either side. Confirmed both ways:
+covid 4981's document really does hold a second tract we lack (11.878 ac, Andrew S.
+Young Survey A-1037, alongside the 16.865-acre Cox tract), while covid 5838's
+"missing" third tract is already inside our tract 2 -- the sheet's 2.454 and 31.140
+sum to exactly our 33.594, so adding it would have double-counted 33.6 encumbered
+acres.
+
+AN ABSENT MARKER IS EVIDENCE ABOUT OUR COPY, NOT ABOUT THE LAND. Searching covid
+4981's text for "55.73" found nothing, and the figure is there as "55 73" with the
+decimal lost to OCR; "Heights at Westridge" appears 8 times, twice as "Phase lI" and
+"Phase J". Confirm a tract's absence by reading the description, never by a string
+match failing -- and never for a covenant whose own copy is known short (covid 8386
+holds 11 of 18 recorded pages, covid 4781's raw description is the placeholder
+"[metes and bounds courses follow]").
+
+A TRACT NEEDS A BOUNDARY, NOT AN ACREAGE. tract_geom_or_approximate_geom_present
+refuses a row carrying only a stated figure, which is correct: this project does not
+hold land it cannot locate. Adding a newly-found tract therefore means traversing and
+anchoring its description, not inserting a row.

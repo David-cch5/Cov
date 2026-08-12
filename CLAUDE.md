@@ -143,6 +143,15 @@ grantor->grantee name chain breaks there), which is a lead rather than a dead en
 CONFIGURATION -- as of 2026-08-12 only Bexar has an assessor deed-history URL
 registered, so every other county silently falls back to a name walk.
 
+## Three readings exist per legal description, and none is the referee
+`_textcache*` (original OCR), a fresh read, and `COV_EXHA_EXTRACT.xlsx` (OCR reviewed
+by the team). **Tract order in the sheet does NOT match the document** -- match on
+content (acreage, survey/abstract, lot/block), never on row position. A sheet row is
+not always a tract: some rows are CAD account references or lot lists, and the same
+land can appear twice in two notations. An absent string is evidence about our COPY,
+not about the land -- covid 4981's "55.73" is in the text as "55 73". Full rules in
+BUILD_SPEC.md.
+
 ## Non-negotiables
 - **Accuracy over completeness.** Every covenant passes a reconciliation check before it is
   considered done: classified acreage must reconcile with the covenant's stated acreage, and
