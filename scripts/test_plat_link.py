@@ -226,10 +226,22 @@ def test_a_plat_that_created_one_lot_is_matched_by_that_lot() -> None:
     # block 9 is a different parcel entirely.
     assert not plat_matches_parcel(parcel, {**lot_plat, "block": "9"})
     assert not plat_matches_parcel(parcel, {**lot_plat, "block": ""})
-    # A multi-lot list matches only the lots it lists.
-    assert plat_matches_parcel(
+    # A PLAIN NUMERIC LOT IS REFUSED, list or not. Block numbering restarts inside
+    # each UNIT here ("UNIT 7 BLK 2 LOT 9", "UNIT 1B BLK 6 LOT 31A1"), so an index row
+    # saying "Lot: 9 Block: 2" with no unit of its own matches lot 9 block 2 in EVERY
+    # unit -- and a lot-specific match outranks the phase plat, so the wrong date
+    # would win. Only a replat-shaped designation (one carrying a letter) is trusted,
+    # which is what every single-lot replat in this corpus actually looks like.
+    assert not plat_matches_parcel(
         parse_subdivision_and_section("PALMILLA BEACH BLK 1 LOT 5"),
         {"subdivision_name": "PALMILLA BEACH", "section": "", "lot": "1,2,3,4,5", "block": "1"})
+    assert not plat_matches_parcel(
+        parse_subdivision_and_section("PALMILLA BEACH UNIT 7 BLK 2 LOT 9"),
+        {"subdivision_name": "PALMILLA BEACH", "section": "", "lot": "9", "block": "2"})
+    # But a letter-bearing replat designation still matches its own parcel.
+    assert plat_matches_parcel(
+        parse_subdivision_and_section("PALMILLA BEACH UNIT 1B BLK 6 LOT 31A1"),
+        {"subdivision_name": "PALMILLA BEACH", "section": "", "lot": "31A1", "block": "6"})
     # "ET AL" and a lot RANGE state no single lot, so neither is matched to one.
     for indeterminate in ("5A ET AL", "101A-601A"):
         assert not plat_matches_parcel(parcel, {**lot_plat, "lot": indeterminate}), indeterminate

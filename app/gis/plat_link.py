@@ -26,10 +26,11 @@ So this module does two jobs, and the second is the one that unblocks the first:
 SPELLING VARIANCE IS THE NORM, not an edge case. Nueces' own GIS calls one place
 "PALMILLA BEACH P.U.D.", "PALMILLA BEACH PUD" and "PALMILLA BEACH"; Collin writes
 "HEIGHTS AT WESTRIDGE PHASE III" and "HEIGHTS AT WESTRIDGE PHASE III THE". Matching
-therefore reuses app/title/chain.py's _subdivisions_match -- a keyword-subset
-comparison already hardened on this corpus's real variance ("CRECENT COVE" vs
-"CRESCENT COVE", confirmed on covid 4780's own recorder index) -- rather than a
-second, weaker matcher written from scratch here.
+absorbs that variance by normalising both sides and dropping connectors and the PUD
+designation, then comparing for EQUALITY -- see plat_matches_parcel. It deliberately
+does NOT reuse app/title/chain.py's _subdivisions_match, whose keyword-subset test is
+right for a lookup hint and wrong for writing a formation date (see the note below
+the imports).
 
 AMBIGUITY IS REFUSED, NEVER RESOLVED BY PICKING. A parcel whose description
 matches two plats gets no plat_id and is reported. Guessing a section would put a
@@ -52,7 +53,7 @@ risks a wrong one.
 WHAT IT IS CHECKED AGAINST. Every plat link in the database was written by
 resolve_subdivision_plat_tract, which shares no code with this matcher -- so
 re-deriving them here is a real cross-check rather than a tautology. It reproduces
-all 4,990 plattable links exactly, disagreeing on none
+every plattable link exactly, disagreeing on none
 (scripts/test_plat_link.py). That agreement is the evidence the section reading
 below is right, and the reason a disagreement must fail loudly.
 
@@ -426,8 +427,10 @@ def plat_matches_parcel(parsed: dict, plat_row: dict) -> bool:
     is Collin's index's "HEIGHTS WESTRIDGE"), but by EQUALITY, never prefix or
     subset: "CANOPIES" must not equal "CANOPIES PARKWAY & WOODWARD BOULEVARD AT
     TIMBER EDGE", which is a separate real plat with its own lots."""
-    if (_comparison_tokens(parsed["subdivision"])
-            != _comparison_tokens(plat_row["subdivision_name"])):
+    plat_tokens = plat_row.get("_tokens")
+    if plat_tokens is None:
+        plat_tokens = tuple(_comparison_tokens(plat_row["subdivision_name"]))
+    if tuple(_comparison_tokens(parsed["subdivision"])) != plat_tokens:
         return False
 
     # A PLAT THAT NAMES ONE LOT IS MATCHED BY THAT LOT, not by a section it has
@@ -439,6 +442,20 @@ def plat_matches_parcel(parsed: dict, plat_row: dict) -> bool:
     plat_lot, plat_block = (plat_row.get("lot") or ""), (plat_row.get("block") or "")
     if plat_lot:
         if not plat_block:
+            return False
+        # BLOCK NUMBERING RESTARTS INSIDE EACH UNIT, not just each subdivision. This
+        # corpus's own parcels are "PALMILLA BEACH UNIT 7 BLK 2 LOT 9" and "UNIT 1B BLK
+        # 6 LOT 31A1", so an index row saying "Lot: 9 Block: 2" with no unit of its own
+        # matches lot 9 block 2 in EVERY unit -- and because a lot-specific match
+        # outranks the phase plat, whichever parcel it hit would take the replat's date
+        # instead of its own phase's.
+        #
+        # So a lot-specific match is accepted only for a REPLAT-SHAPED designation: one
+        # carrying a letter, like 14C, 31A1, 12A, 1BR, 5A. Every single-lot replat row
+        # this corpus actually publishes looks like that, because a replat renames the
+        # lot it creates. A plain numeric lot is exactly the ambiguous case and is
+        # refused -- the parcel keeps its phase plat, which is unit-verified.
+        if not any(c.isalpha() for c in plat_lot):
             return False
         own = parse_lot_block(parsed.get("legal"))
         if not own["lot"] or not own["block"] or own["block"] != plat_block:
@@ -482,7 +499,16 @@ def _candidate_plats(session, county_fips: str) -> list[dict]:
          WHERE county_fips = :cf AND lookup_status = 'found'
            AND recording_date IS NOT NULL AND recording_instrument IS NOT NULL
     """), {"cf": county_fips}).fetchall()
-    return [dict(r._mapping) for r in rows]
+    out = []
+    for r in rows:
+        row = dict(r._mapping)
+        # Precomputed once per plat rather than once per (parcel, plat): link_parcels_to_plats
+        # compares ~5,000 parcels against a county's whole candidate list, and
+        # normalize_subdivision is six regex substitutions -- ~500,000 repeat
+        # normalisations of the same ~100 names before this.
+        row["_tokens"] = tuple(_comparison_tokens(row["subdivision_name"]))
+        out.append(row)
+    return out
 
 
 def _sections_match(parcel_section: str | None, plat_section: str | None) -> bool:

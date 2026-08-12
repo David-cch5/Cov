@@ -91,6 +91,20 @@ def _flag_plat_lookup_note(session, covid: int, tract_no: int, note: str) -> Non
     )
 
 
+def _canon_section(value: str | None) -> str:
+    """One spelling for a section, so '06B' and '6B' name the same filing.
+
+    Deliberately the same canonicalisation plat_link._sections_match applies, because
+    comparing a plat's verbatim '6B' against the parcel side's '06B' as raw strings
+    declared every zero-padded section still-missing and re-searched it live on every
+    run."""
+    v = (value or "").strip().upper()
+    if v in ("N/A", "NONE"):
+        return ""
+    m = re.fullmatch(r"0*(\d+)([A-Z]?)", v)
+    return f"{m.group(1)}{m.group(2)}" if m else v
+
+
 def _sections_still_missing(session, county_fips: str,
                             recited_legals: list[str]) -> list[tuple[str, str]]:
     """(searchable name, section) pairs this tract needs and no held plat covers.
@@ -104,7 +118,11 @@ def _sections_still_missing(session, county_fips: str,
     Deduplicated, so one search per section however many lots recite it, and only
     for sections that are actually named -- a parcel reciting no section at all has
     nothing to search for and is left to the lot/block match instead."""
-    held = {(tuple(_comparison_tokens(r.subdivision_name)), (r.section or "").upper())
+    # Sections compared through plat_link's own canonical form, not raw .upper():
+    # 'held' carries the plat's verbatim '6B'/'1' while the parcel side yields
+    # Montgomery's '06B' and '01', so a string compare declared every zero-padded
+    # section still-missing and fired two live recorder searches for it on every run.
+    held = {(tuple(_comparison_tokens(r.subdivision_name)), _canon_section(r.section))
             for r in session.execute(
                 text("SELECT subdivision_name, section FROM plat "
                      "WHERE county_fips = :cf AND lookup_status = 'found'"),
@@ -117,7 +135,7 @@ def _sections_still_missing(session, county_fips: str,
         query, section = plat_search_name(legal), own["section"]
         if not query or not section:
             continue
-        if (tuple(_comparison_tokens(query)), section.upper()) in held:
+        if (tuple(_comparison_tokens(query)), _canon_section(section)) in held:
             continue
         wanted.setdefault((query, section), None)
     return list(wanted)
@@ -148,6 +166,11 @@ def _plat_row_identity(row: dict) -> str:
 # other book series, and looking up "46201" returns a BACKFILE OIL GAS LEASE.
 _FULL_DOC_NUMBER = re.compile(r"^(19|20)\d{2}\d{5,}$")
 
+# doc number -> the section its own record names, or None. A document's identity does
+# not change between searches, so this is safe to keep for the life of the process.
+_DOC_SECTION_CACHE: dict[str, str | None] = {}
+_MAX_DOC_DETAIL_FETCHES = 60
+
 
 def _row_section(base_url: str, county_fips: str, covid: int, row: dict) -> str | None:
     """The section this index row plats, re-reading the document itself if the row
@@ -168,6 +191,15 @@ def _row_section(base_url: str, county_fips: str, covid: int, row: dict) -> str 
     doc = str(row.get("FILE NUMBER") or row.get("DOC NUMBER") or "").strip()
     if not _FULL_DOC_NUMBER.match(doc):
         return None
+    # MEMOISED, AND CAPPED. This runs inside a comprehension over every row of every
+    # phrasing of every missing section: a subdivision with 12 unaccounted sections
+    # and 50 rows a search would have re-fetched the same documents up to 1,200 times.
+    # The cache is process-wide because the answer is a property of the document, and
+    # the cap keeps one tract's worth of lookups bounded however many sections miss.
+    if doc in _DOC_SECTION_CACHE:
+        return _DOC_SECTION_CACHE[doc]
+    if len(_DOC_SECTION_CACHE) >= _MAX_DOC_DETAIL_FETCHES:
+        return None
     def _call():
         with recorder_context() as context:
             return publicsearch.search_by_document_number(context, base_url, doc)
@@ -177,9 +209,10 @@ def _row_section(base_url: str, county_fips: str, covid: int, row: dict) -> str 
             payload={"base_url": base_url, "doc_number": doc})
     except Exception:
         return None  # the row stays unidentified rather than guessed at
-    if not detail:
-        return None
-    return parse_subdivision_and_section(_plat_row_identity(detail))["section"]
+    resolved = (parse_subdivision_and_section(_plat_row_identity(detail))["section"]
+                if detail else None)
+    _DOC_SECTION_CACHE[doc] = resolved
+    return resolved
 
 
 def _row_is_for(row: dict, query: str) -> bool:
@@ -299,8 +332,16 @@ def resolve_plats_for_tract(session, covid: int, tract_no: int) -> dict:
         text("SELECT DISTINCT subdivision_name FROM plat WHERE county_fips = :cf"),
         {"cf": county_fips}).fetchall()}
     held_tokens = {tuple(_comparison_tokens(name)) for name in held}
-    to_search = sorted(q for q in queries
-                       if tuple(_comparison_tokens(q)) not in held_tokens)
+    # A held name SATISFIES a longer query it is a prefix of. When the two-word retry
+    # succeeds, plats are stored under the short name ("CANOPIES PARKWAY") while the
+    # recitation keeps yielding the long one, so an equality test never suppressed it
+    # and both searches re-fired on every single run -- permanently, for exactly the
+    # subdivisions the retry exists to rescue.
+    def _already_held(query: str) -> bool:
+        q = tuple(_comparison_tokens(query))
+        return any(h == q[:len(h)] for h in held_tokens if h)
+
+    to_search = sorted(q for q in queries if not _already_held(q))
 
     plats_found, plats_not_found = 0, 0
     def _search(name):
@@ -400,6 +441,13 @@ def resolve_plats_for_tract(session, covid: int, tract_no: int) -> dict:
             # ON CONFLICT is last-write-wins, so iterating rows in an arbitrary order
             # could silently keep the LATER date instead.
             earliest = min(section_rows, key=lambda r: _parse_slash_date(r.get("RECORDED DATE")) or date.max)
+            # A section whose every row carries a placeholder date (Nueces' 1/1/1800,
+            # Collin's 1/1/1900) would be written 'found' with recording_date NULL --
+            # a row that asserts nothing, is skipped by plat_link's candidate query,
+            # and yet puts the subdivision into `held` so it is never searched again.
+            # Leaving it unwritten keeps the section findable on the next run.
+            if _parse_slash_date(earliest.get("RECORDED DATE")) is None:
+                continue
             upsert_plat(
                 # Keyed on the PLAT's own collapsed name, not the reciting parcel's
                 # string. Storing it under the recited name conflated two different

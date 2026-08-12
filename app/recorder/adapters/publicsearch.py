@@ -17,9 +17,11 @@ confirmed by a different leading document -- so the "~50-row result cap" describ
 in app/title/chain.py is really page 1 of N. Every conclusion drawn from a result
 set of exactly 50 rows should be treated as truncated until it is paged; that is
 how a real unit-4A plat went unfound while an unrelated document was accepted in
-its place. Paging is NOT implemented here yet, deliberately: widening what
-search_by_name returns changes which documents a chain-of-title walk considers,
-and that deserves its own verified change rather than a footnote to this one.
+its place. Paging IS implemented (see _collect_pages), bounded by DEFAULT_MAX_ROWS
+and loud when it stops short of the portal's own total. What is deliberately NOT
+changed is app/title/chain.py's seeding strategy, which was designed around the
+false cap: re-testing that premise changes which documents become recorded
+transfers, and the fees computed from them, so it needs its own verified pass.
 
 A SHORT PLAT NUMBER IS NOT A UNIQUE DOCUMENT NUMBER. Nueces plat rows carry file
 numbers like 46201, 55219, 30286, while its deeds carry 2022003773. Looking up
@@ -113,6 +115,22 @@ def _with_offset(url: str, offset: int) -> str:
     return f"{base}{joiner}offset={offset}"
 
 
+def _row_key(row: dict, page_tag: str, index: int) -> str:
+    """A stable identity for dedup across offset pages.
+
+    DOC NUMBER alone was not enough: Nueces' and Montgomery's PLAT rows carry FILE
+    NUMBER instead, so every key fell back to a per-page index -- distinct by
+    construction, which meant the dedup never fired and a portal ignoring &offset
+    would have returned the same 50 rows five times as 250 "distinct" ones. Falling
+    back to the row's own values keeps identical rows colliding, which is the point."""
+    for field in ("DOC NUMBER", "FILE NUMBER"):
+        value = (row.get(field) or "").strip()
+        if value:
+            return f"doc:{value}"
+    fingerprint = "|".join(f"{k}={row.get(k)}" for k in sorted(row) if row.get(k))
+    return f"row:{fingerprint}" if fingerprint else f"blank:{page_tag}:{index}"
+
+
 def _collect_pages(page, base_url: str, query: str, max_rows: int) -> list[dict]:
     """Page 1 is already rendered; walk the rest by offset.
 
@@ -128,7 +146,7 @@ def _collect_pages(page, base_url: str, query: str, max_rows: int) -> list[dict]
     if total is not None and total <= len(rows):
         return rows
 
-    by_doc = {r.get("DOC NUMBER") or f"_row{i}": r for i, r in enumerate(rows)}
+    by_doc = {_row_key(r, "p0", i): r for i, r in enumerate(rows)}
     results_url = page.url
     offset = PAGE_SIZE
     while len(by_doc) < min(max_rows, total or max_rows):
@@ -143,7 +161,7 @@ def _collect_pages(page, base_url: str, query: str, max_rows: int) -> list[dict]
             break
         before = len(by_doc)
         for i, r in enumerate(batch):
-            by_doc.setdefault(r.get("DOC NUMBER") or f"_off{offset}_{i}", r)
+            by_doc.setdefault(_row_key(r, f"off{offset}", i), r)
         if len(by_doc) == before or len(batch) < PAGE_SIZE:
             break  # nothing new, or the last page
         offset += PAGE_SIZE
@@ -300,6 +318,16 @@ def search_plats_by_subdivision(context: BrowserContext, base_url: str, subdivis
         page.wait_for_timeout(300)
         departments = [o.inner_text().strip()
                        for o in page.query_selector_all("div[id*='option']")]
+        if not departments:
+            # An empty option list is the react-select markup changing or rendering
+            # late -- NOT a county without a Plats department. Treating it as the
+            # latter reroutes a Plats county to a doc-type-filtered general search
+            # whose empty result gets written as lookup_status='not_found', and that
+            # row then suppresses the next search for the subdivision. A raise is
+            # recoverable; a durable wrong "no plat exists" is not.
+            raise RecorderSearchUnanswered(
+                f"{base_url}: the Department control listed no options, so whether this "
+                f"county has a Plats department is unknown -- not assumed absent")
         if "Plats" not in departments:
             # NOT EVERY COUNTY ON THIS VENDOR HAS A PLATS DEPARTMENT. Confirmed
             # live 2026-08-11: Denton and Collin both offer one; Nueces offers

@@ -104,10 +104,23 @@ def _next_child_path(session, parent_node_id: int) -> str:
         raise ValueError(f"no tract_node {parent_node_id}")
     prefix = f"{row.covid}-T{row.tract_no}"
     parent_path = row.node_label[len(prefix):].lstrip(".")
+    # Numbered by the child PATHS already in use, not by distinct instruments: two
+    # plat rows legitimately share one recording instrument (a lot-keyed row and a
+    # section-keyed row from the same filing), so counting instruments handed both
+    # groups the same step and the second insert collided on tract_node_label_unique,
+    # aborting the whole back-fill.
     used = session.execute(
-        text("""SELECT count(DISTINCT split_instrument_number) FROM tract_node
-                 WHERE parent_node_id = :n"""), {"n": parent_node_id}).scalar() or 0
-    step = used + 1
+        text("""SELECT DISTINCT node_label FROM tract_node WHERE parent_node_id = :n"""),
+        {"n": parent_node_id}).fetchall()
+    steps = set()
+    for row in used:
+        tail = row.node_label[len(prefix):].lstrip(".")
+        segment = tail[len(parent_path):].lstrip(".") if parent_path else tail
+        head = segment.split(".")[0]
+        digits = "".join(c for c in head if c.isdigit())
+        if digits:
+            steps.add(int(digits))
+    step = (max(steps) + 1) if steps else 1
     return f"{parent_path}.{step}" if parent_path else str(step)
 
 
@@ -166,7 +179,15 @@ def record_split(session, parent_node_id: int, *, county_fips: str,
         set_acreage(session, conveyed, "encumbered", conveyed_encumbered_acreage,
                     source_id=source_id)
 
-    _derive_retained(session, parent_node_id, made["retained"], source_id)
+    # EVERY retained sibling is recomputed, not just the new one. Splitting a
+    # 100-acre parent by 40 and then by 30 left the first remainder reading 60 while
+    # the second read 30 -- 70 conveyed plus 90 retained out of 100 acres, and
+    # reconcile could not see it because it sums only what left the parent.
+    for sibling in session.execute(
+            text("""SELECT node_id FROM tract_node
+                     WHERE parent_node_id = :p AND disposition = 'retained'"""),
+            {"p": parent_node_id}).fetchall():
+        _derive_retained(session, parent_node_id, sibling.node_id, source_id)
     return made
 
 
@@ -187,7 +208,8 @@ def _derive_retained(session, parent_node_id: int, retained_node_id: int,
 
     siblings = session.execute(
         text("""SELECT n.node_id FROM tract_node n
-                 WHERE n.parent_node_id = :p AND n.disposition = 'conveyed'"""),
+                 WHERE n.parent_node_id = :p
+                   AND n.disposition IN ('conveyed', 'platted')"""),
         {"p": parent_node_id}).fetchall()
     total_out = 0.0
     for sib in siblings:
@@ -273,8 +295,24 @@ def sync_acreage_from_gis(session, covid: int, tract_no: int = 1) -> dict:
             continue
         set_acreage(session, r.node_id, "gis", own,
                     note="parcel polygon area, county GIS")
-        set_acreage(session, r.node_id, "encumbered", inside,
-                    note="intersection with this covenant's anchored tract boundary")
+        # A DEED-DERIVED ENCUMBERED FIGURE IS NOT OVERWRITTEN. If record_split already
+        # recorded what an instrument said lies inside this tract, replacing it with the
+        # measured intersection destroys exactly the disagreement the ledger exists to
+        # surface -- a deed reciting 30 encumbered acres against a measured 24.5 would
+        # leave no trace of the 5.5-acre gap. The measurement is still available as
+        # 'gis'; the conflict is flagged on the node instead of resolved silently.
+        existing = acreages(session, r.node_id)
+        if "encumbered" in existing and abs(existing["encumbered"] - inside) > ACREAGE_TOLERANCE_ACRES:
+            session.execute(
+                text("""UPDATE tract_node SET review_reason = :why, updated_at = now()
+                         WHERE node_id = :n"""),
+                {"n": r.node_id,
+                 "why": (f"deed-derived encumbered {existing['encumbered']} ac vs measured "
+                         f"intersection {inside} ac -- read the deed; the measurement is "
+                         f"recorded as 'gis' and the deed's figure is kept")})
+        elif "encumbered" not in existing:
+            set_acreage(session, r.node_id, "encumbered", inside,
+                        note="intersection with this covenant's anchored tract boundary")
         measured += 1
 
     unmeasurable = session.execute(text("""
@@ -301,9 +339,12 @@ def backfill_from_plats(session, covid: int, tract_no: int = 1, *,
     each lot, already established and dated (app/gis/plat_link.py).
 
     One 'retained' node per plat carries what that filing left unplatted, so the
-    remainder is a node in the spine rather than only a number on the tract. Its
-    acreage is derived ONLY where the tract's own encumbered total is known and the
-    arithmetic stays non-negative -- the same refusal as record_split.
+    remainder is a node in the spine rather than only a number on the tract. The node
+    is always created -- the plat did leave a remainder -- but its ACREAGE is derived
+    only where the parent's encumbered total is known and every sibling is measured,
+    the same refusal as record_split. On a tract whose census still holds unplatted
+    parcels that derivation is unavailable, and an unmeasured remainder is the honest
+    answer rather than arithmetic on an incomplete set.
 
     Idempotent: a parcel appears once per tract (tract_node_one_node_per_parcel_per_tract).
     """
@@ -315,6 +356,13 @@ def backfill_from_plats(session, covid: int, tract_no: int = 1, *,
           JOIN parcel p ON p.county_fips = pc.county_fips AND p.apn = pc.apn
           JOIN plat pl ON pl.plat_id = p.plat_id
          WHERE pc.covid = :covid AND pc.tract_no = :tract_no
+           -- Latest classification run only, as every other consumer of this table
+           -- does (app/pipeline/stages.py, app/web/queries.py, app/gis/formation.py).
+           -- Without it a parcel matched in run 3 and dropped in run 5 -- exactly what
+           -- re-anchoring a tract produces -- still gets a node, and then a measured
+           -- encumbered acreage that a fee would accrue on.
+           AND pc.run_seq = (SELECT max(run_seq) FROM parcel_covenant
+                              WHERE covid = pc.covid AND tract_no = pc.tract_no)
            AND p.plat_id IS NOT NULL AND p.formed_by_instrument IS NOT NULL
            AND NOT EXISTS (SELECT 1 FROM tract_node n
                             WHERE n.covid = pc.covid AND n.tract_no = pc.tract_no
@@ -343,8 +391,50 @@ def backfill_from_plats(session, covid: int, tract_no: int = 1, *,
                    "plat_id": plat_id, "source_id": source_id})
             made += 1
 
+    # THE REMAINDER EACH PLAT LEFT RAW, ensured over EVERY plat event on this tract --
+    # not only ones this call added. Creating it inside the insert loop meant an
+    # already-back-filled tract got none, because that loop only sees parcels without
+    # nodes: 11 tracts came out with 5,800 platted lots and zero remainders, so "how
+    # much of this covenant's land is still unplatted" -- the quantity
+    # app/gis/monitor.py watches and the reason this spine exists -- still had nowhere
+    # to live.
+    remainders = 0
+    events = session.execute(text("""
+        SELECT split_instrument_number AS instrument, min(split_recording_date) AS recorded,
+               min(split_county_fips) AS cf, min(node_label) AS sample_label
+          FROM tract_node
+         WHERE parent_node_id = :root AND disposition = 'platted'
+         GROUP BY split_instrument_number
+    """), {"root": root}).fetchall()
+    for ev in events:
+        # The platted children of one filing share a path segment ("...T1.3P18"); the
+        # remainder is that segment's own R sibling ("...T1.3R").
+        prefix = f"{covid}-T{tract_no}"
+        segment = ev.sample_label[len(prefix):].lstrip(".").split("P")[0]
+        label = _label_for(covid, tract_no, f"{segment}R")
+        made_one = session.execute(text("""
+            INSERT INTO tract_node
+                (node_label, covid, tract_no, parent_node_id, disposition,
+                 split_county_fips, split_instrument_number, split_recording_date, source_id)
+            VALUES (:label, :covid, :tract_no, :root, 'retained',
+                    :cf, :instrument, :recorded, :source_id)
+            ON CONFLICT DO NOTHING
+            RETURNING node_id
+        """), {"label": label, "covid": covid, "tract_no": tract_no, "root": root,
+               "cf": ev.cf, "instrument": ev.instrument, "recorded": ev.recorded,
+               "source_id": source_id}).scalar()
+        if made_one is not None:
+            remainders += 1
+
+    for sibling in session.execute(
+            text("""SELECT node_id FROM tract_node
+                     WHERE parent_node_id = :p AND disposition = 'retained'"""),
+            {"p": root}).fetchall():
+        _derive_retained(session, root, sibling.node_id, source_id)
+
     return {"covid": covid, "tract_no": tract_no, "root_node_id": root,
-            "plat_events": len(by_plat), "lots_added": made}
+            "plat_events": len(by_plat), "lots_added": made,
+            "remainder_nodes": remainders}
 
 
 def walk_down(session, node_id: int) -> list[dict]:
@@ -434,7 +524,9 @@ def reconcile(session, covid: int, tract_no: int = 1) -> dict:
     interior = {r.apn for r in session.execute(
         text("""SELECT DISTINCT pc.apn FROM parcel_covenant pc
                  WHERE pc.covid = :covid AND pc.tract_no = :tract_no
-                   AND pc.classification = 'interior'"""),
+                   AND pc.classification = 'interior'
+                   AND pc.run_seq = (SELECT max(run_seq) FROM parcel_covenant
+                                      WHERE covid = pc.covid AND tract_no = pc.tract_no)"""),
         {"covid": covid, "tract_no": tract_no}).fetchall()}
     node_apn = {n.node_id: n.apn for n in session.execute(
         text("""SELECT node_id, apn FROM tract_node
@@ -465,7 +557,11 @@ def reconcile(session, covid: int, tract_no: int = 1) -> dict:
             continue
         out = 0.0
         for kid in kids:
-            if kid.disposition != "conveyed":
+            # 'platted' counts as land that left the parent, same as 'conveyed'.
+            # Checking only 'conveyed' predated migration 0047 and made every
+            # back-filled tract reconcile by construction: with nothing but platted
+            # children, `out` stayed 0.0 and no excess could ever be reported.
+            if kid.disposition not in ("conveyed", "platted"):
                 continue
             kid_acres = acres.get(kid.node_id, {})
             out += kid_acres.get("encumbered", kid_acres.get("stated", 0.0))
