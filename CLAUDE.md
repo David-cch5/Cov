@@ -34,6 +34,16 @@ Practical order for a new covenant: full text → named features (roads, plat co
 monuments) → deterministic anchoring against those → only then LLM escalation. Escalating first
 is both slower and far more expensive.
 
+**LOOK IN `<covid>/` BEFORE REACHING FOR A RECORDER PORTAL.** The covenant PDFs are already
+on disk, keyed by covid, with their OCR in `_textcache_final/`. A thin or placeholder
+`legal_description_raw` means the INGESTION PARSE dropped the exhibit — not that the
+document is missing. Confirmed the expensive way: covid 4781 was carried as "blocked, needs
+a better document copy" and then retrieved from Montgomery's portal — sign-in, cost guard,
+a row-matcher bug, several turns — when `4781/4781_D1454.pdf` had been sitting there since
+July. Read the local file with the Read tool, exactly as covid 4981's instrument was read.
+Go to the recorder only for a document this folder does not have: a PLAT, an adjoining
+plat, a chain-of-title deed, or a termination.
+
 **Read the legal description from the DOCUMENT ITSELF, not a summary — and fix it when it's
 wrong.** `covenant.legal_description_raw` is an ingestion-time summary and routinely omits the
 field notes (covid 4781's literally contains the placeholder "[metes and bounds courses follow]").

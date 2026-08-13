@@ -188,14 +188,44 @@ def _run_search(page, base_url: str, query: str, department: str | None) -> bool
         return False
 
 
+def _same_number(a: str, b: str) -> bool:
+    """Document numbers compare on their digits and letters only: the covenant
+    table stores Montgomery's as 2009-089678 and the portal indexes it as
+    2009089678."""
+    strip = lambda v: re.sub(r"[^A-Za-z0-9]", "", v or "")       # noqa: E731
+    return bool(strip(a)) and strip(a) == strip(b)
+
+
 def _matching_row(page, doc_number: str):
-    """The result row whose text carries this document number."""
-    for row in page.query_selector_all("tbody tr"):
+    """The row whose DOC NUMBER CELL is this document -- not merely a row whose
+    text contains the number somewhere.
+
+    The distinction is not pedantic, it returned the wrong document. Searching
+    Montgomery for 2009089678 matched the row of instrument 2012114719, a
+    TERMINATION whose own indexed legal description reads "/ FILE #2009089678
+    REAL PROPERTY" -- it cites the declaration it terminates. Matching on full
+    row text picked the citing document over the cited one and reported success.
+    Any document that references another can be found this way, which makes
+    whole-row matching actively unsafe for identity.
+    """
+    table = page.query_selector("table")
+    if table is None:
+        return None
+    headers = [h.strip().upper() for h in table.eval_on_selector_all(
+        "thead th", "els => els.map(e => e.innerText)")]
+    column = next((i for i, h in enumerate(headers) if "DOC" in h and "NUMBER" in h), None)
+    for row in table.query_selector_all("tbody tr"):
         try:
-            if doc_number in (row.inner_text() or ""):
-                return row
+            cells = row.eval_on_selector_all("td", "els => els.map(e => e.innerText.trim())")
         except Exception:                                        # noqa: BLE001
             continue
+        if column is not None and column < len(cells):
+            if _same_number(cells[column], doc_number):
+                return row
+        elif any(_same_number(cell, doc_number) for cell in cells):
+            # No recognisable header: compare whole CELLS rather than the whole
+            # row, so a number embedded in a legal description still cannot match.
+            return row
     return None
 
 
@@ -248,6 +278,15 @@ def open_document(page, base_url: str, doc_number: str,
                 f"{base_url}: clicking document {doc_number}'s row did not open a viewer "
                 f"(landed on {page.url})") from exc
     page.wait_for_timeout(5000)
+    # IDENTITY CHECK. The viewer states its own document number; if it is not the
+    # one asked for, this is the wrong document however it was reached. Returning
+    # it would be worse than failing -- the caller would read a different
+    # instrument believing it was this one.
+    shown = re.search(r"Document Number:?\s*([A-Za-z0-9-]+)", page.inner_text("body") or "")
+    if shown and not _same_number(shown.group(1), doc_number):
+        raise DocumentImageUnavailable(
+            f"{base_url}: asked for document {doc_number} but the viewer opened "
+            f"{shown.group(1)} -- refusing to return a different instrument")
     return page.url
 
 
