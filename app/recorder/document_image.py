@@ -76,8 +76,15 @@ def sign_in(page, base_url: str) -> bool:
     if credentials is None:
         return False
     username, password = credentials
+    # MEASURED, NOT ASSUMED: /login and /sign-in on collin.tx.publicsearch.us both
+    # resolve but contain ZERO input elements -- they are not the login form. The
+    # only inputs anywhere on the site are the search box, the department combobox
+    # and a withOcr/withoutOcr radio pair whose test id is
+    # "checkoutAllPagesRadioButton". So the account entry point is a header modal
+    # or a separate GovOS host, and it still has to be found. Until it is, this
+    # raises with that fact rather than guessing another URL.
     page.goto(base_url.rstrip("/") + "/login", wait_until="domcontentloaded")
-    page.wait_for_timeout(1500)
+    page.wait_for_timeout(2500)
     for user_selector in ("input[name='email']", "input[type='email']",
                           "input[name='username']", "#email", "#username"):
         if page.query_selector(user_selector):
@@ -109,16 +116,49 @@ def sign_in(page, base_url: str) -> bool:
     return True
 
 
+def _select_department(page, department: str) -> bool:
+    """Switch the portal's Department combobox, the way it actually works.
+
+    Not a `text=Plats` click, which is what I wrote first and what silently
+    no-ops: the control is a react-select combobox with no native <select>, and
+    the option elements do not exist in the DOM until the control is OPENED. The
+    clickable element is the DIV whose class ends in "-control" -- several other,
+    non-clickable DIVs carry the same label text, so a plain text locator can
+    match one of those instead and do nothing at all.
+
+    publicsearch.py's search_plats_by_subdivision discovered all of this against
+    the live DOM and documents it at length; this is the same sequence, and the
+    right long-term move is for both to share one helper rather than agree by
+    inspection.
+
+    Returns False rather than raising when the department is absent -- not every
+    county on this vendor has a Plats department (Nueces files plats in its
+    default department as MAP and PLAT doc types), and a caller that gets False
+    can search elsewhere.
+    """
+    control = page.query_selector("div[class$='-control']")
+    if control is None:
+        return False
+    control.click()
+    page.wait_for_timeout(400)
+    options = [o.inner_text().strip() for o in page.query_selector_all("div[id*='option']")]
+    if department not in options:
+        page.keyboard.press("Escape")
+        return False
+    try:
+        page.click(f"text={department}", timeout=5000)
+    except Exception:                                            # noqa: BLE001
+        return False
+    page.wait_for_timeout(400)
+    return True
+
+
 def _run_search(page, base_url: str, query: str, department: str | None) -> bool:
     """Type a query into the portal's own form. True if a result table appeared."""
     page.goto(base_url, wait_until="networkidle")
     page.wait_for_timeout(1200)
-    if department:
-        try:
-            page.click(f"text={department}", timeout=6000)
-            page.wait_for_timeout(800)
-        except Exception:                                        # noqa: BLE001
-            return False
+    if department and not _select_department(page, department):
+        return False
     page.fill(f"#{SEARCH_BOX_ID}", query)
     page.click(_SUBMIT)
     try:
@@ -128,12 +168,12 @@ def _run_search(page, base_url: str, query: str, department: str | None) -> bool
         return False
 
 
-def _row_link_for(page, doc_number: str):
-    """The viewer link on the row whose text carries this document number."""
+def _matching_row(page, doc_number: str):
+    """The result row whose text carries this document number."""
     for row in page.query_selector_all("tbody tr"):
         try:
             if doc_number in (row.inner_text() or ""):
-                return row.query_selector("a[href*='/doc/']") or row.query_selector("a")
+                return row
         except Exception:                                        # noqa: BLE001
             continue
     return None
@@ -163,15 +203,32 @@ def open_document(page, base_url: str, doc_number: str,
                 + (f" (nor for {fallback_query!r} in Plats)" if fallback_query else
                    " -- pass fallback_query with the subdivision name if this document "
                    "is only reachable through a department search"))
-    link = _row_link_for(page, doc_number) or page.query_selector(_DOC_LINK)
-    if link is None:
+    # THE ROW IS THE LINK. GovOS result rows carry no <a> at all -- the <tr>
+    # itself is clickable and the app routes to /doc/<id> in JavaScript. Looking
+    # for an anchor finds nothing and reads like "the document has no image",
+    # which is a very different and much more alarming conclusion than "this
+    # table is built differently than I assumed".
+    row = _matching_row(page, doc_number)
+    if row is None:
         raise DocumentImageUnavailable(
-            f"{base_url}: document {doc_number} returned rows but none links to a viewer")
-    href = link.get_attribute("href") or ""
-    url = href if href.startswith("http") else base_url.rstrip("/") + href
-    page.goto(url, wait_until="domcontentloaded")
+            f"{base_url}: searched successfully but no result row carries document "
+            f"{doc_number}")
+    link = row.query_selector("a[href*='/doc/']")
+    if link is not None:
+        href = link.get_attribute("href") or ""
+        url = href if href.startswith("http") else base_url.rstrip("/") + href
+        page.goto(url, wait_until="domcontentloaded")
+    else:
+        row.click()
+        page.wait_for_timeout(1500)
+        try:
+            page.wait_for_url("**/doc/**", timeout=20000)
+        except Exception as exc:                                 # noqa: BLE001
+            raise DocumentImageUnavailable(
+                f"{base_url}: clicking document {doc_number}'s row did not open a viewer "
+                f"(landed on {page.url})") from exc
     page.wait_for_timeout(5000)
-    return url
+    return page.url
 
 
 def save_document_pages(page, county_fips: str, doc_number: str) -> list[str]:
