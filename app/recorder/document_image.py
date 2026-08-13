@@ -1,0 +1,234 @@
+"""Retrieve a recorded document's IMAGE, not just its index row.
+
+The missing half of document acquisition. This project could search recorder
+portals and read index rows from the day the adapters were written, but it had
+never fetched a page image -- `recorder_document_image` has existed unwritten
+since the initial schema. Everything that needs to READ a document rather than
+merely cite it waits on this: covid 4981 tract 3's omitted arc call, the Parcels
+1201-09 plat that would settle its Phase III tie, and the 8386/4781/3428 tracts
+whose readings are blocked on a better copy.
+
+TWO RULES ABOUT CREDENTIALS, both structural rather than advisory.
+
+  THE SECRET NEVER LEAVES .env. Credentials are read from the environment at the
+  moment they are typed into the portal and are never logged, echoed into an
+  error message, stored in the database, or written to a job payload. Every
+  diagnostic in this module reports WHETHER a login was configured, never what
+  it was.
+
+  SEARCHING IS A GUEST OPERATION; ONLY IMAGES NEED A LOGIN. So this signs in
+  lazily -- it walks to the document as a guest and authenticates only when the
+  portal actually withholds the image. A pipeline that logs in on every search
+  burns a shared account's session for no reason, and on these portals a
+  concurrent-session limit is a real constraint (county_recorder_registry
+  carries workers_allowed=1 for exactly this reason).
+
+Credentials are keyed by VENDOR, not county: one GovOS PublicSearch account
+covers Collin, Denton, Montgomery, Nueces and Ellis alike, which is why
+app/config.py exposes a single PUBLICSEARCH_* pair rather than a per-county map.
+"""
+import os
+import re
+
+from app.config import OBJECT_STORAGE_ROOT, publicsearch_credentials
+# Imported, never re-declared: the search box id is portal knowledge that was
+# discovered once and belongs in one place. A second copy of it here would drift
+# silently, and the first symptom would be a 30-second timeout that looks like an
+# outage -- which is exactly how the first run of this module failed.
+from app.recorder.adapters.publicsearch import SEARCH_BOX_ID
+_SUBMIT = '[data-testid="searchSubmitButton"]'
+_DOC_LINK = "a[href*='/doc/']"
+_PAGE_IMAGE = "img[src*='/image'], img[src*='page'], canvas"
+# Phrases these portals use when an image is behind the login or a purchase.
+_GATED_RE = re.compile(
+    r"sign\s*in|log\s*in|subscribe|purchase|unofficial\s+copy\s+unavailable|"
+    r"create\s+an\s+account", re.IGNORECASE)
+
+
+class DocumentImageUnavailable(Exception):
+    """The image could not be retrieved. Carries WHY, so a caller can tell a
+    login problem from a missing document from an outage -- the same distinction
+    app/gis/ngs.py draws, and for the same reason: the three call for completely
+    different responses and conflating them wastes money."""
+
+
+class PortalLoginRequired(DocumentImageUnavailable):
+    """The portal is withholding the image pending authentication, and no
+    credentials are configured. Reports the env var names to set, never a value."""
+
+
+def _document_dir(county_fips: str, doc_number: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", doc_number)
+    path = os.path.join(OBJECT_STORAGE_ROOT, "recorder_images", county_fips, safe)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def sign_in(page, base_url: str) -> bool:
+    """Authenticate against a GovOS PublicSearch portal.
+
+    Returns True on success, False when no credentials are configured. Raises
+    only on a portal that accepted neither. NOTHING here logs either credential:
+    the values pass from the environment into page.fill and are never formatted
+    into a string.
+    """
+    credentials = publicsearch_credentials()
+    if credentials is None:
+        return False
+    username, password = credentials
+    page.goto(base_url.rstrip("/") + "/login", wait_until="domcontentloaded")
+    page.wait_for_timeout(1500)
+    for user_selector in ("input[name='email']", "input[type='email']",
+                          "input[name='username']", "#email", "#username"):
+        if page.query_selector(user_selector):
+            page.fill(user_selector, username)
+            break
+    else:
+        raise DocumentImageUnavailable(
+            f"{base_url}: no username field found on the sign-in page -- the portal's "
+            f"login form has changed shape, so this needs re-discovery (credentials WERE "
+            f"configured, so this is not a missing-login problem)")
+    for password_selector in ("input[name='password']", "input[type='password']", "#password"):
+        if page.query_selector(password_selector):
+            page.fill(password_selector, password)
+            break
+    else:
+        raise DocumentImageUnavailable(f"{base_url}: no password field on the sign-in page")
+    for submit in ("button[type='submit']", "[data-testid='loginSubmitButton']",
+                   "text=Sign in", "text=Log in"):
+        if page.query_selector(submit):
+            page.click(submit)
+            break
+    page.wait_for_timeout(4000)
+    signed_in = not _GATED_RE.search(page.inner_text("body")[:4000] or "")
+    if not signed_in:
+        raise DocumentImageUnavailable(
+            f"{base_url}: sign-in did not take -- the credentials in "
+            f"PUBLICSEARCH_USERNAME/PUBLICSEARCH_PASSWORD were rejected, or the portal "
+            f"is showing a further gate (a concurrent-session limit looks like this too)")
+    return True
+
+
+def _run_search(page, base_url: str, query: str, department: str | None) -> bool:
+    """Type a query into the portal's own form. True if a result table appeared."""
+    page.goto(base_url, wait_until="networkidle")
+    page.wait_for_timeout(1200)
+    if department:
+        try:
+            page.click(f"text={department}", timeout=6000)
+            page.wait_for_timeout(800)
+        except Exception:                                        # noqa: BLE001
+            return False
+    page.fill(f"#{SEARCH_BOX_ID}", query)
+    page.click(_SUBMIT)
+    try:
+        page.wait_for_selector("table", timeout=25000)
+        return True
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _row_link_for(page, doc_number: str):
+    """The viewer link on the row whose text carries this document number."""
+    for row in page.query_selector_all("tbody tr"):
+        try:
+            if doc_number in (row.inner_text() or ""):
+                return row.query_selector("a[href*='/doc/']") or row.query_selector("a")
+        except Exception:                                        # noqa: BLE001
+            continue
+    return None
+
+
+def open_document(page, base_url: str, doc_number: str,
+                  fallback_query: str | None = None) -> str:
+    """Walk to a document's viewer THROUGH THE SEARCH FORM and return its URL.
+
+    Deliberately not a constructed /results?q=... URL: measured against Collin,
+    a bare results URL answers with a page titled "Error" and no document links
+    at all, while the same query typed into the form works. These portals are
+    single-page apps that build their result state client-side, so the form is
+    the supported entry point and a hand-made URL is not.
+    """
+    if not _run_search(page, base_url, doc_number, department=None):
+        # A DOCUMENT NUMBER IS NOT ALWAYS SEARCHABLE. Collin's quick search
+        # returns nothing for plat 20021119001712550 while its Plats department
+        # returns that very row -- the number is in the index but not in the
+        # field the default search covers. So fall back to the department search
+        # that found the document in the first place and pick the row out by
+        # number, rather than concluding the document does not exist.
+        if not (fallback_query and _run_search(page, base_url, fallback_query,
+                                               department="Plats")):
+            raise DocumentImageUnavailable(
+                f"{base_url}: no result table for document {doc_number}"
+                + (f" (nor for {fallback_query!r} in Plats)" if fallback_query else
+                   " -- pass fallback_query with the subdivision name if this document "
+                   "is only reachable through a department search"))
+    link = _row_link_for(page, doc_number) or page.query_selector(_DOC_LINK)
+    if link is None:
+        raise DocumentImageUnavailable(
+            f"{base_url}: document {doc_number} returned rows but none links to a viewer")
+    href = link.get_attribute("href") or ""
+    url = href if href.startswith("http") else base_url.rstrip("/") + href
+    page.goto(url, wait_until="domcontentloaded")
+    page.wait_for_timeout(5000)
+    return url
+
+
+def save_document_pages(page, county_fips: str, doc_number: str) -> list[str]:
+    """Save every page image the viewer exposes. Returns the files written.
+
+    Falls back to a full-page screenshot of the viewer when the images are drawn
+    to a canvas rather than served as <img> -- a screenshot of a plat is worth
+    having even when it is not the archival image, because a plat's own recited
+    bearings are readable from it and that is what the geometry work needs.
+    """
+    directory = _document_dir(county_fips, doc_number)
+    written: list[str] = []
+    sources = [s for s in page.eval_on_selector_all(
+        _PAGE_IMAGE, "els => els.map(e => e.src || '')") if s and "logo" not in s.lower()]
+    for number, source in enumerate(sources, start=1):
+        try:
+            response = page.request.get(source)
+            if not response.ok:
+                continue
+            path = os.path.join(directory, f"page_{number:02d}.png")
+            with open(path, "wb") as handle:
+                handle.write(response.body())
+            written.append(path)
+        except Exception:                                        # noqa: BLE001
+            continue
+    if not written:
+        path = os.path.join(directory, "viewer_full_page.png")
+        page.screenshot(path=path, full_page=True)
+        written.append(path)
+    return written
+
+
+def fetch_document_image(context, county_fips: str, base_url: str,
+                         doc_number: str, fallback_query: str | None = None) -> dict:
+    """Retrieve a document's pages, signing in only if the portal withholds them.
+
+    Returns {"files": [...], "signed_in": bool, "viewer_url": str}. Raises
+    PortalLoginRequired when the image is gated and no credentials are set --
+    which is a configuration answer, not a dead end, and says which two
+    environment variables to fill.
+    """
+    page = context.new_page()
+    try:
+        viewer = open_document(page, base_url, doc_number, fallback_query)
+        body = page.inner_text("body")[:4000] or ""
+        signed_in = False
+        if _GATED_RE.search(body):
+            if publicsearch_credentials() is None:
+                raise PortalLoginRequired(
+                    f"{base_url}: document {doc_number}'s image is behind a login and no "
+                    f"credentials are configured. Set PUBLICSEARCH_USERNAME and "
+                    f"PUBLICSEARCH_PASSWORD in .env (one GovOS account covers every "
+                    f"*.publicsearch.us county). Searching does not need them; images do.")
+            signed_in = sign_in(page, base_url)
+            viewer = open_document(page, base_url, doc_number, fallback_query)
+        files = save_document_pages(page, county_fips, doc_number)
+        return {"files": files, "signed_in": signed_in, "viewer_url": viewer,
+                "doc_number": doc_number, "county_fips": county_fips}
+    finally:
+        page.close()
