@@ -50,6 +50,44 @@ project has turned out to be a bad reading of the legal description, not a hard 
 - **covid 8534**: the POB names a street intersection outright, after ~$45–50 of LLM escalation
   failed to find it.
 
+## A TRACT THAT WILL NOT CLOSE: the escalation ladder, in order
+A misclosure is a reading problem until proven otherwise, and there is a fixed order
+for working it. Do not stop at step 2 and hand-grind, which is what wasted days on
+covid 4981's third tract.
+1. **Run every deterministic repair.** `repair_quadrant_by_closure` (a flipped
+   East/West), `repair_bearing_by_closure` (a misread degrees/minutes),
+   `repair_distance_by_closure` (a transposed or OCR-confused distance — the
+   misclosure's own BEARING says which courses can be at fault, so it is a solve),
+   and `app/parsing/legal_description/curve_siblings.py` (a curve recital whose chord
+   line was lost, reconstructed from structurally identical recitals in the same
+   deed). Each refuses unless exactly one candidate satisfies **both** closure and
+   the deed's stated acreage.
+2. **Still open → RE-READ the document**, don't reason harder about the text you
+   have. Get a fresh read (Fable 5, or Opus 5), save it via
+   `app/ingestion/corrected_text.py`, and compare it against the other readings
+   content-keyed with `app/ingestion/text_compare.py`.
+3. **Still open → escalate WITH THE FULL TEXT IN CONTEXT** and ask for the boundary
+   to be built, not for an opinion about a call. That is what produced a
+   survey-grade reconstruction of 4981's tract 3 where per-call analysis did not.
+4. **Then harvest.** Take the fixes it found, re-derive each in plain code, and where
+   a fix generalises **add it as a deterministic technique** so the next covenant
+   costs nothing. Both `repair_distance_by_closure` and `curve_siblings.py` came out
+   of this step; neither needed to be an LLM call after the first time.
+
+**NO API CREDITS DOES NOT MEAN NO ESCALATION.** When the API is unfunded, the ladder
+still runs — relay the text through the operator and bring the answer back. Treating
+an unfunded key as "escalation unavailable" turned a one-shot escalation into days of
+hand-analysis, and produced a wrong conclusion on the way (see below).
+
+**And check the SIBLING RECITALS before concluding anything about a lone call.** Twice
+the answer was in the same paragraph: covid 5838's bearing-less arc takes its direction
+from the radius bearing in the previous sentence, and covid 4981's chord-less curve
+takes its direction from three intact street crossings on the same line. A tangency
+assumption looked reasonable there and was wrong — the deed says "to a point on a
+curve" (non-tangent, which it distinguishes from its own "point of curvature"), and
+tangency would exit S 01°36'23" W where the next call reads S 00°25'11" W. R and Δ fix
+a chord's LENGTH only; direction has to come from the document.
+
 Corollary: **the closure error tells you what you failed to read.** A traverse that closes at
 1:674 instead of 1:800,000 is not "a rough survey" — on covid 5838 the 31.95 ft closure error was
 exactly the length of the one course the parser had dropped. Chase the discrepancy to its cause
