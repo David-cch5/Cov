@@ -299,7 +299,8 @@ def _state_plane_epsg_for_county(session, county_fips: str) -> tuple[int, str] |
                   f"area of use (Texas {name.replace('_', ' ')}, EPSG {epsg})")
 
 
-def _adjoiner_footprint(session, county_fips: str, name: str, epsg: int):
+def _adjoiner_footprint(session, county_fips: str, name: str, epsg: int,
+                        buffer_ft: float = _ADJOINER_BUFFER_FT):
     """The adjoining plat's outer boundary, in State Plane feet, or None.
 
     Matched on adjoiner_name_key rather than the string: the deed's spelling and
@@ -337,11 +338,44 @@ def _adjoiner_footprint(session, county_fips: str, name: str, epsg: int):
                 session.execute(text(
                     "INSERT INTO _adjoiner VALUES "
                     "(ST_Transform(ST_GeomFromText(:g, 4326), :e))"), {"g": geom_wkt, "e": epsg})
+        # A buffer of zero means "the union's own outer line". ST_Union already
+        # dissolves the shared lot lines inside a subdivision; the buffer exists
+        # only to bridge STREET gaps, which are separate parcels. So it is needed
+        # when a deed crosses a street and actively harmful when a deed runs along
+        # an outer boundary: 45 ft of smoothing erases covid 4981 tract 3's 3.89 ft
+        # ell jog along Heights at Westridge Phase III's west line, which is
+        # precisely the feature the tie is meant to land on.
         outline = session.execute(text(
-            "SELECT ST_AsText(ST_Buffer(ST_Buffer(ST_Union(g), :b), -:b)) FROM _adjoiner"),
-            {"b": _ADJOINER_BUFFER_FT}).scalar()
+            "SELECT ST_AsText(CASE WHEN :b > 0 "
+            "THEN ST_Buffer(ST_Buffer(ST_Union(g), :b), -:b) ELSE ST_Union(g) END) "
+            "FROM _adjoiner"),
+            {"b": buffer_ft}).scalar()
         session.execute(text("DROP TABLE IF EXISTS _adjoiner"))
         return (shapely_wkt.loads(outline) if outline else None), len(kept)
+
+    # THE LIVE LAYER FIRST, and the local table only as a fallback. `parcel` is a
+    # census of ENCUMBERED land, so for an ADJOINING plat -- which by definition is
+    # not the encumbered land -- it holds whatever happened to fall inside a
+    # covenant's footprint and nothing more. Covid 4981 tract 3 tied to Heights at
+    # Westridge Phase III, of which our table holds 34 lots against the plat's ~290;
+    # that fragment cleared the minimum count, the fit ran against a third of a
+    # subdivision, and the tie was refused at a 114 ft residual. A fragment is worse
+    # than nothing here, because it looks like an answer.
+    adapter = COUNTY_ADAPTERS.get(county_fips)
+    field = getattr(adapter, "FIELD_MAPPING", {}).get("abs_sub_name") if adapter else None
+    if field:
+        try:
+            live = [(p.get("recited_legal_description"), p.get("geojson"), None)
+                    for p in adapter.iter_parcels(where=f"UPPER({field}) LIKE '%{probe}%'")
+                    if p.get("geojson")]
+        except Exception as exc:                                   # noqa: BLE001
+            print(f"  [anchor_resolver] live parcel query for {name!r} failed "
+                  f"({type(exc).__name__}); falling back to the local census",
+                  flush=True)
+            live = []
+        poly, kept = _footprint_from(live)
+        if poly is not None:
+            return poly
 
     local = session.execute(text("""
         SELECT recited_legal_description, ST_AsText(geom)
@@ -350,17 +384,6 @@ def _adjoiner_footprint(session, county_fips: str, name: str, epsg: int):
            AND upper(recited_legal_description) LIKE :probe
     """), {"fips": county_fips, "probe": f"%{probe}%"}).fetchall()
     poly, kept = _footprint_from([(r[0], None, r[1]) for r in local])
-    if poly is not None:
-        return poly
-
-    adapter = COUNTY_ADAPTERS.get(county_fips)
-    field = getattr(adapter, "FIELD_MAPPING", {}).get("abs_sub_name") if adapter else None
-    if not field:
-        return None
-    live = [(p.get("recited_legal_description"), p.get("geojson"), None)
-            for p in adapter.iter_parcels(where=f"UPPER({field}) LIKE '%{probe}%'")
-            if p.get("geojson")]
-    poly, kept = _footprint_from(live)
     return poly
 
 
@@ -388,19 +411,36 @@ def _try_parcel_tie(session, covid: int, tract_no: int, county_fips: str,
         return None
     epsg, zone_basis = zone
 
-    footprint = _adjoiner_footprint(session, county_fips, contact["adjoiner"], epsg)
-    if footprint is None or footprint.is_empty:
+    # Try the exact outer line first, then the street-bridged one. Which is right
+    # depends on whether the deed runs ALONG the plat's boundary or ACROSS its
+    # streets, and the deed does not say -- so both are offered to the fit, and
+    # its own checks decide. Ordered exact-first so a boundary-running deed is
+    # never judged against a smoothed corner.
+    attempts = []
+    for buffer_ft in (0.0, _ADJOINER_BUFFER_FT):
+        footprint = _adjoiner_footprint(session, county_fips, contact["adjoiner"], epsg,
+                                        buffer_ft=buffer_ft)
+        if footprint is None or footprint.is_empty:
+            continue
+        attempts.append((buffer_ft, footprint))
+    if not attempts:
         return None
 
     stated = session.execute(text(
         "SELECT stated_acreage FROM tract WHERE covid = :c AND tract_no = :t"),
         {"c": covid, "t": tract_no}).scalar()
-    placed = anchor_by_adjoining_plat(
-        walk_traverse(courses)["vertices"], footprint, contact["contact_indices"],
-        epsg=epsg, stated_acres=float(stated) if stated else None)
-    if not placed.get("anchored"):
-        print(f"  [anchor_resolver] adjoining-plat tier declines: {placed.get('reason')}",
-              flush=True)
+    placed, buffer_used = None, None
+    for buffer_ft, footprint in attempts:
+        trial = anchor_by_adjoining_plat(
+            walk_traverse(courses)["vertices"], footprint, contact["contact_indices"],
+            epsg=epsg, stated_acres=float(stated) if stated else None)
+        if trial.get("anchored"):
+            placed, buffer_used = trial, buffer_ft
+            break
+        print(f"  [anchor_resolver] adjoining-plat tier declines against the "
+              f"{'exact outer line' if not buffer_ft else f'{buffer_ft:.0f} ft street-bridged'} "
+              f"footprint: {trial.get('reason')}", flush=True)
+    if placed is None:
         return None
 
     return {
@@ -408,7 +448,9 @@ def _try_parcel_tie(session, covid: int, tract_no: int, county_fips: str,
         "reasoning": (
             f"deed's POB is a corner of {contact['adjoiner']}, and courses "
             f"{contact['contact_courses']} run with that plat's line. Fitted against the "
-            f"county's published footprint on {zone_basis}: residual "
+            f"county's published footprint ("
+            f"{'exact outer line' if not buffer_used else f'{buffer_used:.0f} ft street-bridged'}"
+            f") on {zone_basis}: residual "
             f"{placed['rms_ft']:.2f} ft over {placed['contact_span_ft']:.0f} ft of "
             f"frontage, {placed['overlap_sqft']:,.0f} sq ft overlap, area "
             f"{placed['area_acres']:.3f} ac, best rotation "
