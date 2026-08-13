@@ -257,7 +257,13 @@ def _try_sibling_tract_tie(session, covid: int, tract_no: int) -> dict | None:
 
 _ADJOINER_BUFFER_FT = 45.0        # dissolve lot lines and fill streets: a plat's
                                   # outer line is not carried by any one tax parcel
-_MIN_ADJOINER_PARCELS = 8         # fewer than this is not a subdivision footprint
+_MIN_ADJOINER_PARCELS = 8
+# TRIED AND REJECTED: dropping contact courses under 10 ft as "below the tax
+# fabric's noise level". Covid 4981 tract 3's contact run opens with a 3.89 ft ell
+# leg, and it was a reasonable guess that a sub-foot error on a leg that short was
+# reading as rotation. Measured, it is not: dropping the leg moved the residual
+# from 10.78 ft to 12.09 ft and left the -0.75 deg preference untouched. A short
+# leg carries real shape information, and the fit uses it.         # fewer than this is not a subdivision footprint
 _MAX_ADJOINER_PARCELS = 4000
 
 
@@ -429,28 +435,32 @@ def _try_parcel_tie(session, covid: int, tract_no: int, county_fips: str,
     stated = session.execute(text(
         "SELECT stated_acreage FROM tract WHERE covid = :c AND tract_no = :t"),
         {"c": covid, "t": tract_no}).scalar()
-    placed, buffer_used = None, None
+    # Evaluate every footprint and keep the BEST passing fit, not the first. The
+    # exact outer line and the street-bridged one are different references, not a
+    # preference order: tract 2 fits the exact line to 1.37 ft and the bridged one
+    # to 6.36 ft, and first-wins would have been fine there only by luck.
+    passing = []
     for buffer_ft, footprint in attempts:
         trial = anchor_by_adjoining_plat(
             walk_traverse(courses)["vertices"], footprint, contact["contact_indices"],
             epsg=epsg, stated_acres=float(stated) if stated else None)
+        label = "exact outer line" if not buffer_ft else f"{buffer_ft:.0f} ft street-bridged"
         if trial.get("anchored"):
-            placed, buffer_used = trial, buffer_ft
-            break
-        print(f"  [anchor_resolver] adjoining-plat tier declines against the "
-              f"{'exact outer line' if not buffer_ft else f'{buffer_ft:.0f} ft street-bridged'} "
-              f"footprint: {trial.get('reason')}", flush=True)
-    if placed is None:
+            passing.append((trial["rms_ft"], buffer_ft, label, trial))
+        else:
+            print(f"  [anchor_resolver] adjoining-plat tier declines against the {label} "
+                  f"footprint: {trial.get('reason')}", flush=True)
+    if not passing:
         return None
+    passing.sort(key=lambda p: p[0])
+    _, buffer_used, buffer_label, placed = passing[0]
 
     return {
         "geojson": placed["geojson"], "method": "adjoining_plat_tie", "confidence": 0.9,
         "reasoning": (
             f"deed's POB is a corner of {contact['adjoiner']}, and courses "
             f"{contact['contact_courses']} run with that plat's line. Fitted against the "
-            f"county's published footprint ("
-            f"{'exact outer line' if not buffer_used else f'{buffer_used:.0f} ft street-bridged'}"
-            f") on {zone_basis}: residual "
+            f"county's published footprint ({buffer_label}) on {zone_basis}: residual "
             f"{placed['rms_ft']:.2f} ft over {placed['contact_span_ft']:.0f} ft of "
             f"frontage, {placed['overlap_sqft']:,.0f} sq ft overlap, area "
             f"{placed['area_acres']:.3f} ac, best rotation "
