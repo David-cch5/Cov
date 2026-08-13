@@ -147,7 +147,12 @@ _COMPOUND_BEARING_RE = re.compile(
 # before the bearing may not cross a semicolon, so a call cannot borrow the next
 # one's bearing.
 _COMPACT_COURSE_RE = re.compile(
-    _THENCE + r"[,;:]?\s*(?:[^;]{0,160}?)?\b" + _NS + r"\s*" + _DMS_ANY + r"\s*" + _EW +
+    # The lead-in may not cross the next THENCE either. The gap below the
+    # bearing was guarded from the start; this one was not, so a call could
+    # reach past its own THENCE and read the FOLLOWING call's bearing and
+    # distance -- consuming two calls into one match and leaving covid 4981's
+    # 55.73 ac tract closing at 1:159 with 33 courses read from 34 calls.
+    _THENCE + r"[,;:]?\s*(?:(?!" + _THENCE + r")[^;]){0,160}?\b" + _NS + r"\s*" + _DMS_ANY + r"\s*" + _EW +
     # The distance does not always follow the bearing immediately: "EAST along
     # the easterly line of said lands 100.00 feet;" and "East along lands
     # reputedly of Isidore Dobris for a distance of 226.71 feet" both describe
