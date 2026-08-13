@@ -917,3 +917,145 @@ def repair_quadrant_by_closure(
         "area_before_acres": base["area_acres"],
         "area_after_acres": r["area_acres"],
     }
+
+
+# Digit pairs OCR actually confuses in this corpus's scans, and the transposition
+# of adjacent digits a typist makes. Deliberately a short, closed list: the point
+# is to test whether a corrected distance is a PLAUSIBLE MISREADING of what the
+# deed says, not to search freely for a number that closes the traverse.
+_DIGIT_CONFUSIONS = {"3": "8", "8": "3", "5": "6", "6": "5", "1": "7", "7": "1",
+                     "0": "8", "9": "4", "4": "9", "2": "7"}
+
+
+def _distance_misreadings(distance_ft: float) -> list[tuple[float, str]]:
+    """Every plausible misreading of one distance, with how it arose."""
+    text = f"{distance_ft:.2f}"
+    whole, _, frac = text.partition(".")
+    out: list[tuple[float, str]] = []
+    for i in range(len(whole) - 1):
+        if whole[i] != whole[i + 1]:
+            swapped = whole[:i] + whole[i + 1] + whole[i] + whole[i + 2:]
+            out.append((float(f"{swapped}.{frac}"),
+                        f"digits {whole[i]}{whole[i+1]} transposed to {whole[i+1]}{whole[i]}"))
+    for i, digit in enumerate(whole):
+        other = _DIGIT_CONFUSIONS.get(digit)
+        if other:
+            out.append((float(f"{whole[:i]}{other}{whole[i+1:]}.{frac}"),
+                        f"digit {digit} read for {other}"))
+    seen, unique = set(), []
+    for value, why in out:
+        if value not in seen and value > 0 and abs(value - distance_ft) > 0.005:
+            seen.add(value)
+            unique.append((value, why))
+    return unique
+
+
+def repair_distance_by_closure(
+    courses: list[Course],
+    stated_acres: float | None = None,
+    max_closure_ft: float = 1.0,
+    min_closure_ratio_denominator: float = 20_000.0,
+    max_area_deviation: float = 0.01,
+    parallel_tolerance_deg: float = 3.0,
+) -> tuple[list[Course], dict | None]:
+    """Recover ONE misread DISTANCE, the sibling repair_bearing_by_closure and
+    repair_quadrant_by_closure were missing.
+
+    The direction of the misclosure says which course can be at fault. Changing
+    one course's distance moves the closure vector along that course's own
+    bearing and nowhere else, so a single-distance defect is only possible where
+    the residual runs PARALLEL to the course -- which usually leaves one or two
+    candidates out of thirty, not thirty. The magnitude then says by how much.
+    That is a solve, not a search.
+
+    Two things keep it from inventing a number, and both are the discipline the
+    other two repairs already use. The correction must be a plausible MISREADING
+    of what the deed says -- an adjacent-digit transposition or a known OCR digit
+    confusion, never an arbitrary value that happens to close. And exactly one
+    candidate must satisfy BOTH constraints, closure and the deed's own stated
+    acreage; a fix that satisfies one is not a finding.
+
+    Confirmed against covid 4981's 55.73 ac tract, where Fable found by hand
+    what this does deterministically: call 3's "534.00" is "543.00", which takes
+    the closure from 56.17 ft to 47.18 ft and the area from 55.393 ac to 55.766
+    against a stated 55.73. Note what that case also shows -- a repair can be
+    right and still leave the traverse open, because a description can carry
+    more than one defect. This returns the repair it can prove and reports the
+    closure it reached, never claiming the traverse is sound.
+    """
+    if len(courses) < 3:
+        return courses, None
+    base = walk_traverse(courses)
+    if base["closure_error_ft"] <= max_closure_ft:
+        return courses, None
+
+    # The gap the traverse must absorb, as a bearing.
+    vertices = base["vertices"]
+    gap_x = vertices[0][0] - vertices[-1][0]
+    gap_y = vertices[0][1] - vertices[-1][1]
+    gap_az = (math.degrees(math.atan2(gap_x, gap_y)) + 360) % 360
+    gap_len = math.hypot(gap_x, gap_y)
+
+    candidates, leads = [], []
+    for index, course in enumerate(courses):
+        offset = abs((course.azimuth_degrees - gap_az + 180) % 360 - 180)
+        if min(offset, abs(offset - 180)) > parallel_tolerance_deg:
+            continue                      # the gap cannot lie along this course
+        for value, why in _distance_misreadings(course.distance_ft):
+            trial = list(courses)
+            trial[index] = replace(course, distance_ft=value)
+            walked = walk_traverse(trial)
+            if walked["closure_error_ft"] < base["closure_error_ft"] * 0.9:
+                # Improves closure materially without closing it. Kept as a LEAD
+                # rather than discarded: a description can carry more than one
+                # defect, and covid 4981's 55.73 ac tract is exactly that case --
+                # the 534.00/543.00 transposition is real and still leaves the
+                # traverse 47.18 ft open. Reporting it is what lets the next
+                # defect be hunted; silence would hide a true finding.
+                leads.append({
+                    "course_index": index, "was_ft": course.distance_ft, "now_ft": value,
+                    "how": why, "closure_error_ft": walked["closure_error_ft"],
+                    "area_acres": walked["area_acres"],
+                    "area_deviation": (abs(walked["area_acres"] - stated_acres) / stated_acres
+                                       if stated_acres else None),
+                })
+            if walked["closure_error_ft"] > max_closure_ft:
+                continue
+            if walked["closure_ratio"] and 1.0 / walked["closure_ratio"] < min_closure_ratio_denominator:
+                continue
+            if stated_acres:
+                deviation = abs(walked["area_acres"] - stated_acres) / stated_acres
+                if deviation > max_area_deviation:
+                    continue
+            candidates.append((index, value, why, walked, trial))
+
+    if len(candidates) != 1:
+        # Nothing provable. Report what was seen so a caller can say WHY it
+        # declined -- no candidate at all is a different problem from several,
+        # and the second must never be resolved by preferring one.
+        return courses, {
+            "repaired": False,
+            "closure_error_ft": base["closure_error_ft"],
+            "gap_bearing_azimuth": gap_az,
+            "gap_length_ft": gap_len,
+            "candidates": len(candidates),
+            "reason": ("no plausible single-distance misreading satisfies both closure and "
+                       "area" if not candidates else
+                       f"{len(candidates)} distinct misreadings each satisfy both, so none "
+                       f"is proven"),
+            # Ranked by the area they reconcile to, not by closure: a second
+            # defect still in the traverse keeps every closure figure wrong,
+            # while area is the constraint a single good repair already moves.
+            "leads": sorted(leads, key=lambda l: (l["area_deviation"] is None,
+                                                  l["area_deviation"] or 0))[:5],
+        }
+
+    index, value, why, walked, trial = candidates[0]
+    return trial, {
+        "repaired": True, "course_index": index,
+        "was_ft": courses[index].distance_ft, "now_ft": value, "how": why,
+        "closure_error_ft": walked["closure_error_ft"],
+        "closure_ratio_denominator": 1.0 / walked["closure_ratio"] if walked["closure_ratio"] else None,
+        "area_acres": walked["area_acres"], "stated_acres": stated_acres,
+        "gap_bearing_azimuth": gap_az,
+    }
