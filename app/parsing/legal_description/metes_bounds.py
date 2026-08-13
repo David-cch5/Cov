@@ -41,6 +41,14 @@ _SEP = r"[\s:;|,]*"
 
 _SECONDS_MARK = r"(?:seconds?|sec\.?|[\"”'’]+)?"
 
+# THE DEGREE SIGN IS SOMETIMES OCR'd AS A DOUBLE QUOTE, which is the seconds
+# mark, so a bearing arrives wearing two of them: covid 4981's 55.73 ac tract
+# recites `South 46"35'58" West` for South 46°35'58" West. That call -- 21.33 ft
+# -- was the one course of 34 the parser could not read, and it is worth exactly
+# what a missing course is always worth: the traverse closed 47.18 ft out
+# instead of 34.29. Accepting the quote in the DEGREES position is safe because
+# the position is structural: a full deg/min/sec run must follow it.
+
 # Surveyors abbreviate, and this corpus does it constantly: "S 23-03-50 W",
 # "N 36°43'02\" W", "N32°07'". Requiring the words North/South/East/West missed
 # every one of them. The single letters are safe here only because a bearing is
@@ -52,7 +60,7 @@ _EW = r"(East|West|E|W)\.?"
 # "23°03'50\"", or the compact dashed "23-03-50". Named apart from the _DMS
 # defined further down, which this must not shadow -- that one is the chord-curve
 # reader's and does not accept the dashed form.
-_DMS_ANY = (r"(\d{1,3})\s*(?:degrees?|deg\.?|[°º˚]|-)" + _SEP +
+_DMS_ANY = (r"(\d{1,3})\s*(?:degrees?|deg\.?|[°º˚\"”]|-)" + _SEP +
             r"(\d{1,2})\s*(?:minutes?|min\.?|['’]|-)" + _SEP +
             r"(\d{1,2})\s*" + _SECONDS_MARK)
 
@@ -72,7 +80,7 @@ def _cardinal(token: str, axis: str) -> str:
 _FEET = r"(?:feet|fe?et|[“”‘’]e{1,2}t|ft\.?)"
 
 _COURSE_RE = re.compile(
-    _THENCE + r"[,;:]?\s+(North|South)\s*(\d{1,3})\s*(?:degrees?|deg\.?|[°º˚])" + _SEP + r"(\d{1,2})\s*(?:minutes?|min\.?|'|’)" + _SEP + r"(\d{1,2})\s*" + _SECONDS_MARK + r"" + _SEP + r"\s*(East|West)"
+    _THENCE + r"[,;:]?\s+(North|South)\s*(\d{1,3})\s*(?:degrees?|deg\.?|[°º˚\"”])" + _SEP + r"(\d{1,2})\s*(?:minutes?|min\.?|'|’)" + _SEP + r"(\d{1,2})\s*" + _SECONDS_MARK + r"" + _SEP + r"\s*(East|West)"
     # The intervening text lists adjoiner tracts by ACREAGE, not feet, so the first
     # "<number> feet to <something>" after the bearing is reliably the course's own
     # distance -- more robust than anchoring on the literal phrase "distance of",
@@ -118,7 +126,7 @@ _COURSE_RE = re.compile(
 # feet;" phrasing is literally present, so this never overlaps what _COURSE_RE
 # already catches (which always ends in "to", not a bare semicolon).
 _COMPOUND_BEARING_RE = re.compile(
-    r"(North|South)\s+(\d{1,3})\s*(?:degrees?|deg\.?|[°º˚])" + _SEP + r"(\d{1,2})\s*(?:minutes?|min\.?|'|’)" + _SEP + r"(\d{1,2})\s*" + _SECONDS_MARK + r"\s+(East|West)\s*,\s*a distance of\s+([\d,]+\.?\d*)\s*feet\s*(?:\(Deed[^)]*\))?\s*;",
+    r"(North|South)\s+(\d{1,3})\s*(?:degrees?|deg\.?|[°º˚\"”])" + _SEP + r"(\d{1,2})\s*(?:minutes?|min\.?|'|’)" + _SEP + r"(\d{1,2})\s*" + _SECONDS_MARK + r"\s+(East|West)\s*,\s*a distance of\s+([\d,]+\.?\d*)\s*feet\s*(?:\(Deed[^)]*\))?\s*;",
     re.IGNORECASE,
 )
 
@@ -238,10 +246,10 @@ _WEST = r"(?:W[ae]st|W\.?)"
 # "{_D}{1,2}", which matches nothing. Defining the shape once removes that whole
 # class of mistake. _DMS_OCR additionally tolerates the letter-for-digit
 # substitutions seen in radius bearings (see _D).
-_DMS = (r"(\d{1,3})\s*(?:degrees?|deg\.?|[°º˚])" + _SEP +
+_DMS = (r"(\d{1,3})\s*(?:degrees?|deg\.?|[°º˚\"”])" + _SEP +
         r"(\d{1,2})\s*(?:minutes?|min\.?|['’])" + _SEP +
         r"(\d{1,2})\s*" + _SECONDS_MARK)
-_DMS_OCR = (r"(" + _D + r"{1,3})\s*(?:degrees?|deg\.?|[°º˚])" + _SEP +
+_DMS_OCR = (r"(" + _D + r"{1,3})\s*(?:degrees?|deg\.?|[°º˚\"”])" + _SEP +
             r"(" + _D + r"{1,2})\s*(?:minutes?|min\.?|['’])" + _SEP +
             r"(" + _D + r"{1,2})\s*" + _SECONDS_MARK)
 
@@ -391,7 +399,7 @@ _TANGENT_CURVE_RE = re.compile(
 # curve that DOES state its radius bearing is never read twice.
 _PC_TANGENT_CURVE_RE = re.compile(
     r"point\s+of\s+curvature\s+of\s+(?:with\s+)?(?:a|an|another)?\s*" + _CIRCULAR + r"\s+(?:curve\s+)?(?:to|fo)\s+the\s+(right|left)"
-    r"[^;]{0,40}?" + _DELTA_KEYWORD + r"\s*(\d{1,3})\s*(?:degrees?|deg\.?|[°º˚])" + _SEP + r"(\d{1,2})\s*"
+    r"[^;]{0,40}?" + _DELTA_KEYWORD + r"\s*(\d{1,3})\s*(?:degrees?|deg\.?|[°º˚\"”])" + _SEP + r"(\d{1,2})\s*"
     r"(?:minutes?|min\.?|['\u2019])\s*(\d{1,2})\s*" + _SECONDS_MARK +
     r".{0,90}?\S*dius\s+of\s+([\d,]+\.?\d*)\s*" + _FEET +
     r".{0,260}?" + _THENCE + r"[,;:]?\s+with\s+(?:said\s+)?(?:the\s+)?" + _CIRCULAR + r"\s+curve"
