@@ -74,6 +74,44 @@ covid 4981's third tract.
    costs nothing. Both `repair_distance_by_closure` and `curve_siblings.py` came out
    of this step; neither needed to be an LLM call after the first time.
 
+## Pulling a PLAT: search the base name, and pull the RIGHT plat
+- **Pull the plat of the ADJOINER whose line the tie fits — not the plat the tract was
+  carved out of.** Those are different documents and only the first answers a tie's
+  residual. Covid 4981 tract 3 cites both: *Volume 4629, Page 272* (the parent parcels'
+  DEED) and *Volume 2007, Page 554* (Heights at Westridge Phase III's PLAT, whose west
+  line the tie is fitted against). Chasing the first cost a whole retrieval.
+- **THE PLAT INDEX SPELLS SUBDIVISIONS ITS OWN WAY.** Collin indexes phased plats as
+  `HEIGHTS WESTRIDGE #3`, while the deed says "The Heights at Westridge Phase III" and
+  the CAD says `HEIGHTS AT WESTRIDGE PHASE III THE`. Three spellings of one
+  subdivision; `adjoiner_name_key` reconciles the first two and cannot turn "PHASE III"
+  into "#3". So **search the BASE name and filter the rows** ("HEIGHTS WESTRIDGE" →
+  23 rows including #1/#2/#3/#7/#8). A zero-row result for the deed's full phrase means
+  the index spells it differently, NEVER that the plat is unrecorded — three such
+  searches returned nothing and were briefly read as "not indexed".
+- **Always check for an AMENDING plat.** `HEIGHTS WESTRIDGE #3` is PLAT/2007/554 and
+  `#3 AMND` is PLAT/2007/639, filed five weeks later; covid 4981's declaration was
+  recorded in 2009, so it runs with the AMENDED line. Reading the original alone risks
+  a confident answer from a superseded plat.
+- Volume/page is not searchable on GovOS and `search_by_document_number` misses plats
+  (Collin's quick search returns nothing for 20021119001712550 while its Plats
+  department returns that row). Use the department search and match by number.
+
+## Retrieving a document IMAGE (app/recorder/document_image.py)
+- Credentials are per VENDOR, not per county: one GovOS login covers every
+  `*.publicsearch.us` county. They live in `.env` as `PUBLICSEARCH_USERNAME` /
+  `PUBLICSEARCH_PASSWORD` and are never logged, stored, or put in a message.
+  `county_recorder_registry.auth_notes` records WHICH credential, never the value.
+- **Sign-in is at `/signin`** — `/login` and `/sign-in` both resolve with zero inputs.
+  Sign in LAZILY, only when the portal withholds an image: accounts are shared and
+  `workers_allowed=1`.
+- **IMAGE COST IS PER COUNTY** (`quirks.image_cost`). Collin is `free`; the rest are
+  `unknown` until verified. `DocumentImageCosts` refuses anything else — never complete
+  a checkout, that is the operator's decision.
+- A result row carries no `<a>`; the `<tr>` itself is clickable. The Department control
+  is a react-select combobox whose options do not exist until it is opened. And a page
+  image is not any `<img>` on the viewer — a 20 KB floor rejects site chrome, which was
+  otherwise saved as "pages" and reported as success.
+
 **NO API CREDITS DOES NOT MEAN NO ESCALATION.** When the API is unfunded, the ladder
 still runs — relay the text through the operator and bring the answer back. Treating
 an unfunded key as "escalation unavailable" turned a one-shot escalation into days of

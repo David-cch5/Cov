@@ -26,8 +26,36 @@
   },
   "chord_confirmed_by": "the traverse's own misclosure with course 7 corrected was 46.28 ft, against 2R*sin(delta/2) = 46.28 ft -- the deed demands the east chord rather than merely permitting it",
   "tangency_reading_withdrawn": "an earlier objection put the chord at azimuth 180.94 by assuming tangency to the incoming course; the instrument recites 'to a point on a curve' and tangency would exit S 01 36 23 W where the next call reads S 00 25 11 W",
-  "credit": "Fable 5 identified the course-7 misread and the tangent relabelling from the same pages, and retracted its own 543.00 hypothesis"
+  "credit": "Fable 5 identified the course-7 misread and the tangent relabelling from the same pages, and retracted its own 543.00 hypothesis",
+  "plat_references": {
+   "parent_deed_cited_by_tract_3": "Volume 4629, Page 272 -- the DEED conveying the parent parcels, not a plat. Chasing it retrieved the wrong document for the tie question.",
+   "parent_plat": {
+    "doc_number": "20021119001712550",
+    "recorded": "2002-11-19",
+    "filed_as": "Cabinet/Volume O, Pages 269-270",
+    "index_name": "PARCELS 1201-09, 1216-17 MCK O/269",
+    "covers": "COX J W SY S/160 and YOUNG A SY S/1037 -- the parent of ALL THREE of covid 4981's tracts",
+    "retrieved": "_object_store/recorder_images/48085/20021119001712550/ (23 pages, 943 KB, free with a signed-in Collin account)"
+   },
+   "the_plat_the_TIE_needs": {
+    "doc_number": "20071017010003680",
+    "recorded": "2007-10-17",
+    "filed_as": "PLAT/2007/554",
+    "index_name": "HEIGHTS WESTRIDGE #3 MCKINNEY",
+    "why": "tract 3's POB is the southwest corner of The Heights at Westridge Phase III and courses 5-7 run with its WEST LINE -- that platted line, not the assessor's rendering of it, is what the 10.78 ft tie residual and the -0.75 deg preference have to be tested against",
+    "not_yet_retrieved": true
+   },
+   "amendment_that_may_supersede_it": {
+    "doc_number": "20071127010004170",
+    "recorded": "2007-11-27",
+    "filed_as": "PLAT/2007/639",
+    "index_name": "HEIGHTS WESTRIDGE #3 AMND MCKINNEY",
+    "why_it_matters": "filed five weeks after #3; covid 4981's declaration was recorded 2009-10-12, so the covenant runs with the AMENDED line. Reading 2007/554 alone risks a confident answer from a superseded plat."
+   },
+   "index_naming_trap": "Collin's plat index spells this subdivision 'HEIGHTS WESTRIDGE #3'; the deed says 'The Heights at Westridge Phase III' and the CAD says 'HEIGHTS AT WESTRIDGE PHASE III THE'. Searches on the deed's phrasing return ZERO rows and were briefly read as 'the plat is not indexed'. Search the base name and filter."
+  },
+  "tie_status": "tract 3 is anchored but its Phase III tie is MARGINAL -- 10.78 ft residual over 414 ft of frontage, overlap at the 2,000 sq ft cap, best rotation -0.50 deg. Four hypotheses died on that residual (street buffer, footprint fragment, short contact leg, frontage) and only the fragment was a real bug. Usable for acreage; not for boundary-parcel calls until the platted west line is read."
  },
  "chars": 6235,
- "recorded_at": "2026-08-13T15:16:55.388384+00:00"
+ "recorded_at": "2026-08-13T16:54:03.105956+00:00"
 }

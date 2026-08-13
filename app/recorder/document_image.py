@@ -293,6 +293,37 @@ def save_document_pages(page, county_fips: str, doc_number: str) -> list[str]:
     return written
 
 
+_DOWNLOAD_SELECTORS = ("text=Download (Free)", "[data-testid='downloadButton']",
+                       "text=Download")
+
+
+def download_document(page, county_fips: str, doc_number: str) -> str | None:
+    """Use the viewer's own Download control, when the county serves it free.
+
+    Preferred over scraping page images: it returns the whole instrument in one
+    file at full resolution, which is what reading a plat's recited bearings
+    actually requires -- a viewer screenshot is legible for a cover sheet and not
+    for field notes. Only ever clicked when the caller has established the county
+    serves images free (see DocumentImageCosts); a control labelled "Download"
+    that turns out to cost money must not be clicked speculatively.
+    """
+    directory = _document_dir(county_fips, doc_number)
+    for selector in _DOWNLOAD_SELECTORS:
+        if page.query_selector(selector) is None:
+            continue
+        try:
+            with page.expect_download(timeout=120_000) as download:
+                page.click(selector)
+            saved = download.value
+            suggested = saved.suggested_filename or f"{doc_number}.pdf"
+            path = os.path.join(directory, suggested)
+            saved.save_as(path)
+            return path
+        except Exception:                                        # noqa: BLE001
+            continue
+    return None
+
+
 def fetch_document_image(context, county_fips: str, base_url: str, doc_number: str,
                          fallback_query: str | None = None,
                          image_cost: str | None = None) -> dict:
@@ -323,8 +354,12 @@ def fetch_document_image(context, county_fips: str, base_url: str, doc_number: s
                     f"*.publicsearch.us county). Searching does not need them; images do.")
             signed_in = sign_in(page, base_url)
             viewer = open_document(page, base_url, doc_number, fallback_query)
-        files = save_document_pages(page, county_fips, doc_number)
+        downloaded = (download_document(page, county_fips, doc_number)
+                      if (image_cost == "free") else None)
+        files = ([downloaded] if downloaded
+                 else save_document_pages(page, county_fips, doc_number))
         return {"files": files, "signed_in": signed_in, "viewer_url": viewer,
+                "downloaded": bool(downloaded),
                 "doc_number": doc_number, "county_fips": county_fips}
     finally:
         page.close()
