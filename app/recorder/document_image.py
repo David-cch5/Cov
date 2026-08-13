@@ -41,8 +41,17 @@ _DOC_LINK = "a[href*='/doc/']"
 _PAGE_IMAGE = "img[src*='/image'], img[src*='page'], canvas"
 # Phrases these portals use when an image is behind the login or a purchase.
 _GATED_RE = re.compile(
-    r"sign\s*in|log\s*in|subscribe|purchase|unofficial\s+copy\s+unavailable|"
+    r"sign\s*in|log\s*in|subscribe|unofficial\s+copy\s+unavailable|"
     r"create\s+an\s+account", re.IGNORECASE)
+# A gate that wants MONEY, not just an account. Kept separate from _GATED_RE
+# because the two call for opposite responses: one is ours to satisfy, the other
+# is the user's decision to make.
+# A recorded page image is hundreds of kilobytes. Anything smaller is site
+# chrome, and saving it as a document page is a silent corruption of the record.
+_MIN_PAGE_BYTES = 20_000
+
+_COST_RE = re.compile(
+    r"add\s+to\s+cart|checkout|purchase|\$\s*\d|price|per\s+page", re.IGNORECASE)
 
 
 class DocumentImageUnavailable(Exception):
@@ -50,6 +59,17 @@ class DocumentImageUnavailable(Exception):
     login problem from a missing document from an outage -- the same distinction
     app/gis/ngs.py draws, and for the same reason: the three call for completely
     different responses and conflating them wastes money."""
+
+
+class DocumentImageCosts(DocumentImageUnavailable):
+    """The image is behind a PURCHASE, not merely a login.
+
+    Raised rather than proceeding, always. Image cost varies by county on this
+    vendor -- Collin serves them free to a signed-in account while others charge
+    per page -- and a fetcher that completes a checkout because it could would be
+    spending money on its own initiative. county_recorder_registry.quirks carries
+    image_cost per county; anything but 'free' stops here and asks.
+    """
 
 
 class PortalLoginRequired(DocumentImageUnavailable):
@@ -76,17 +96,17 @@ def sign_in(page, base_url: str) -> bool:
     if credentials is None:
         return False
     username, password = credentials
-    # MEASURED, NOT ASSUMED: /login and /sign-in on collin.tx.publicsearch.us both
-    # resolve but contain ZERO input elements -- they are not the login form. The
-    # only inputs anywhere on the site are the search box, the department combobox
-    # and a withOcr/withoutOcr radio pair whose test id is
-    # "checkoutAllPagesRadioButton". So the account entry point is a header modal
-    # or a separate GovOS host, and it still has to be found. Until it is, this
-    # raises with that fact rather than guessing another URL.
-    page.goto(base_url.rstrip("/") + "/login", wait_until="domcontentloaded")
+    # THE PATH IS /signin. Both /login and /sign-in resolve and contain ZERO
+    # input elements -- they are not the form, and guessing at plausible paths
+    # cost two attempts before the header's own link answered it. The header
+    # carries <a href="/signin?returnPath=%2F">Sign In</a>, and that page has
+    # #email (data-testid loginEmail), #password, and a loginButton. Discovered
+    # from the live DOM rather than assumed, which is the only way these portals
+    # ever get pinned down.
+    page.goto(base_url.rstrip("/") + "/signin", wait_until="domcontentloaded")
     page.wait_for_timeout(2500)
-    for user_selector in ("input[name='email']", "input[type='email']",
-                          "input[name='username']", "#email", "#username"):
+    for user_selector in ("[data-testid='loginEmail']", "#email", "input[type='email']",
+                          "input[name='email']", "input[name='username']"):
         if page.query_selector(user_selector):
             page.fill(user_selector, username)
             break
@@ -101,8 +121,8 @@ def sign_in(page, base_url: str) -> bool:
             break
     else:
         raise DocumentImageUnavailable(f"{base_url}: no password field on the sign-in page")
-    for submit in ("button[type='submit']", "[data-testid='loginSubmitButton']",
-                   "text=Sign in", "text=Log in"):
+    for submit in ("[data-testid='loginButton']", "button[type='submit']",
+                   "text=Sign In", "text=Log in"):
         if page.query_selector(submit):
             page.click(submit)
             break
@@ -248,21 +268,34 @@ def save_document_pages(page, county_fips: str, doc_number: str) -> list[str]:
             response = page.request.get(source)
             if not response.ok:
                 continue
+            body = response.body()
+            if len(body) < _MIN_PAGE_BYTES:
+                # An icon, not a page. The viewer's <img> elements include chrome
+                # -- the first real attempt here saved a 583-byte and a 936-byte
+                # file and reported success, which is worse than failing: a
+                # caller downstream would have tried to read a plat off a button.
+                continue
             path = os.path.join(directory, f"page_{number:02d}.png")
             with open(path, "wb") as handle:
-                handle.write(response.body())
+                handle.write(body)
             written.append(path)
         except Exception:                                        # noqa: BLE001
             continue
     if not written:
+        # These viewers commonly draw pages to a <canvas> or serve them as tiles,
+        # so there is no image to fetch. A full-page screenshot of the viewer is
+        # not the archival image and is not pretending to be -- but a plat's own
+        # recited bearings and distances are legible from it, which is what the
+        # geometry work actually needs.
         path = os.path.join(directory, "viewer_full_page.png")
         page.screenshot(path=path, full_page=True)
         written.append(path)
     return written
 
 
-def fetch_document_image(context, county_fips: str, base_url: str,
-                         doc_number: str, fallback_query: str | None = None) -> dict:
+def fetch_document_image(context, county_fips: str, base_url: str, doc_number: str,
+                         fallback_query: str | None = None,
+                         image_cost: str | None = None) -> dict:
     """Retrieve a document's pages, signing in only if the portal withholds them.
 
     Returns {"files": [...], "signed_in": bool, "viewer_url": str}. Raises
@@ -275,6 +308,12 @@ def fetch_document_image(context, county_fips: str, base_url: str,
         viewer = open_document(page, base_url, doc_number, fallback_query)
         body = page.inner_text("body")[:4000] or ""
         signed_in = False
+        if _COST_RE.search(body) and (image_cost or "unknown") != "free":
+            raise DocumentImageCosts(
+                f"{base_url}: document {doc_number}'s image appears to be behind a purchase "
+                f"and this county's image_cost is {image_cost or 'unknown'!r}. Not proceeding "
+                f"-- set quirks.image_cost='free' for a county whose images are included, or "
+                f"retrieve this one manually. Nothing here will complete a checkout.")
         if _GATED_RE.search(body):
             if publicsearch_credentials() is None:
                 raise PortalLoginRequired(
