@@ -190,9 +190,27 @@ _CONTACT_NAMED_RE = re.compile(
     # a tract whose POB names a published plat corner outright.
     r"\b(?:with|in|along)\s+(?:a|an|the|said)\s+[\w\- ]{0,24}?lines?\s+of\s+(?:said\s+)?",
     re.IGNORECASE)
+# TRIED AND REJECTED: accepting "along said west line" (no "with") as a
+# continuation, to extend a run past the point where the deed drops the word.
+# The reasoning was sound and the measurement refuted it. On covid 4981's 55.73
+# ac tract it grew the Phase III run from 3 courses / 414 ft to 31 courses /
+# 2,694 ft -- 39% of the perimeter instead of 6%, which should have been a much
+# stronger tie -- and the fit went from 10.78 ft to 49.38 ft, failing outright.
+# "Said west line" does not keep meaning the same plat's line for 28 courses; the
+# phrase survives while its referent changes, so a longer run is not a better
+# constrained one. Requiring "with" keeps the chain to where the deed is
+# explicit.
 _CONTACT_CONTINUING_RE = re.compile(
     r"\b(?:continuing|along)\s+with\s+said\b|\bwith\s+said\s+[\w\- ]{0,24}?lines?\b",
     re.IGNORECASE)
+# The name that follows "line of said ...", so a run can be attributed to the
+# plat it belongs to rather than only to the one the POB names. Handles both a
+# proper name ("Heights At Westridge Phase III;") and a parcel-list plat ("Parcel
+# 1201-1209, 1216 & 1217 Plat"), stopping at whatever ends the citation.
+_LINE_OWNER_RE = re.compile(
+    r"(?P<name>[A-Z0-9][\w'’&.\-]*(?:[ ,]+[A-Za-z0-9][\w'’&.\-]*){0,8}?)"
+    r"(?=\s+Plat\b|,\s*(?:an?\s+addition|according|as\s+recorded|for\s|and\s)|[;.]|$)")
+
 _POB_ADJOINER_RE = re.compile(
     r"corner\s+of\s+(?:the\s+)?(?P<name>[A-Z][\w'’]*(?:\s+[A-Za-z][\w'’]*){0,7}?)\s*,\s*"
     r"(?:an?\s+addition|according|as\s+recorded)", re.IGNORECASE)
@@ -225,61 +243,107 @@ def point_of_beginning_adjoiner(deed_text: str) -> str | None:
     return matches[-1].strip() if matches else None
 
 
-def courses_running_with_adjoiner(deed_text: str, total_courses: int) -> dict | None:
-    """Which traverse vertices the deed places on the POB's adjoining plat.
+def _line_owner_after(segment: str, match_end: int) -> str | None:
+    owner = _LINE_OWNER_RE.match(segment[match_end:match_end + 90].lstrip())
+    return " ".join(owner.group("name").split()) if owner else None
 
-    Returns {"adjoiner", "contact_indices", "contact_courses"} or None when the
-    deed does not support the reading. Vertex i is the START of course i, so a
-    course that runs with the adjoiner puts BOTH its endpoints on that line.
 
-    Refuses rather than guessing in three cases, because a wrong contact set
-    anchors a tract onto the wrong corner and reports a residual that looks fine:
-    no adjoiner named at the POB, no course that says it runs with that plat, or
-    -- the important one -- a course count that disagrees with the caller's. This
-    function counts courses by splitting on THENCE and re-extracting per segment;
-    if that total does not match what extract_courses read from the whole text,
-    the index mapping is not trustworthy and no answer is better than a plausible
-    one.
+def adjoiner_contact_runs(deed_text: str, total_courses: int) -> list[dict]:
+    """Every adjoining plat this deed runs WITH, and which courses run with it.
+
+    The generalisation of reading only the POB's adjoiner. A deed commonly runs
+    with more than one plat, and the useful one is whichever it runs with FURTHEST
+    -- an adjoining-plat tie is only as good as its frontage, since a short
+    contact run leaves the far end of the tract unconstrained and lets a fraction
+    of a degree swing it many feet. Covid 4981's 55.73 ac tract runs 414 ft with
+    Heights at Westridge Phase III and some 3,000 ft with the Parcels 1201-1209
+    plat it was carved out of; only the second is worth fitting against.
+
+    Runs are returned longest-frontage first. Refuses the same way as before: a
+    course count that cannot be reconciled with the caller's returns nothing,
+    because indices that do not line up anchor a tract to the wrong corner while
+    reporting a residual that looks fine.
     """
     from app.parsing.legal_description.metes_bounds import (
         extract_courses, repair_ocr_decimals, repair_ocr_survey_words)
 
-    adjoiner = point_of_beginning_adjoiner(deed_text)
-    if not adjoiner:
-        return None
-    key = adjoiner_name_key(adjoiner)
-    if not key:
-        return None
-
+    if not deed_text:
+        return []
     repaired = repair_ocr_survey_words(repair_ocr_decimals(deed_text))
-    segments = _THENCE_SPLIT_RE.split(repaired)[1:]      # [0] is the POB preamble
+    segments = _THENCE_SPLIT_RE.split(repaired)
+    preamble, segments = segments[0], segments[1:]
     if not segments:
-        return None
+        return []
 
-    contact_courses: list[int] = []
-    index, previous_was_contact, counted = 0, False, 0
+    # The POB may itself name the line the first course will run with.
+    current = None
+    for m in _CONTACT_NAMED_RE.finditer(preamble):
+        named = _line_owner_after(preamble, m.end())
+        if named:
+            current = named
+    # A RUN IS CONTIGUOUS, and that is load-bearing rather than tidy. A segment
+    # that neither names a plat nor continues one ENDS the run: the phrase "said
+    # west line" outlives its referent, so letting it rejoin a run after a break
+    # collects courses that no longer touch that plat. Measured on covid 4981's
+    # 55.73 ac tract: contiguous gives 3 courses fitting to 10.78 ft, while
+    # rejoining after breaks gives 28 courses fitting to 49.38 ft and failing.
+    blocks: list[tuple[str, list[int]]] = []
+    open_block: list[int] | None = None
+    index, counted = 0, 0
     for segment in segments:
         here = len(extract_courses(segment))
         counted += here
         if here == 0:
             continue
-        named = any(adjoiner_name_key(segment[m.end():m.end() + 60]).startswith(key[:12])
-                    for m in _CONTACT_NAMED_RE.finditer(segment))
-        # "continuing with said North line" names no plat -- it inherits the one
-        # the previous course was running with, and only that.
-        inherited = previous_was_contact and bool(_CONTACT_CONTINUING_RE.search(segment))
-        if named or inherited:
-            contact_courses.extend(range(index, index + here))
-            previous_was_contact = True
+        owner = None
+        for m in _CONTACT_NAMED_RE.finditer(segment):
+            named = _line_owner_after(segment, m.end())
+            if named:
+                owner = named
+        if owner is None and current and _CONTACT_CONTINUING_RE.search(segment):
+            owner = current            # "continuing with said west line" inherits
+        if owner:
+            if open_block is not None and current and adjoiner_name_key(owner) == \
+                    adjoiner_name_key(current):
+                open_block.extend(range(index, index + here))
+            else:
+                open_block = list(range(index, index + here))
+                blocks.append((adjoiner_name_key(owner), open_block))
+            current = owner
         else:
-            previous_was_contact = False
+            open_block, current = None, None
         index += here
 
     if counted != total_courses:
-        return None
-    if len(contact_courses) < 2:
-        return None
+        return []
+    names = {}
+    for segment in [preamble] + segments:
+        for m in _CONTACT_NAMED_RE.finditer(segment):
+            named = _line_owner_after(segment, m.end())
+            if named:
+                names.setdefault(adjoiner_name_key(named), named)
+    out = []
+    for key, course_list in blocks:
+        if len(course_list) < 2:
+            continue
+        out.append({"adjoiner": names.get(key, key), "adjoiner_key": key,
+                    "contact_courses": sorted(set(course_list)),
+                    "contact_indices": sorted({v for c in course_list for v in (c, c + 1)})})
+    out.sort(key=lambda r: -len(r["contact_courses"]))
+    return out
 
-    vertices = sorted({i for c in contact_courses for i in (c, c + 1)})
-    return {"adjoiner": adjoiner, "contact_indices": vertices,
-            "contact_courses": contact_courses}
+
+def courses_running_with_adjoiner(deed_text: str, total_courses: int) -> dict | None:
+    """The run belonging to the plat the POB names, or the longest run if the POB
+    names none. Kept as the single-run entry point; adjoiner_contact_runs is the
+    general form."""
+    runs = adjoiner_contact_runs(deed_text, total_courses)
+    if not runs:
+        return None
+    pob = point_of_beginning_adjoiner(deed_text)
+    if pob:
+        key = adjoiner_name_key(pob)
+        for run in runs:
+            if run["adjoiner_key"] == key:
+                return run
+    return runs[0]
