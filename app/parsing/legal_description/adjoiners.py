@@ -182,7 +182,14 @@ def extract_adjoining_subdivisions(deed_text: str | None) -> list[dict]:
 # answer over 1,000 ft wrong (see that module's own comment).
 
 _CONTACT_NAMED_RE = re.compile(
-    r"\bwith\s+(?:a|an|the|said)\s+[\w\- ]{0,24}?lines?\s+of\s+(?:said\s+)?", re.IGNORECASE)
+    # "with a North line of said X" is the common form, but a deed may establish
+    # the line it is running along with IN or ALONG instead and only then switch
+    # to "continuing with said west line" -- covid 4981's 55.73 ac tract does
+    # exactly that ("being an exterior ell corner IN the west line of said
+    # Heights At Westridge Phase III"), and requiring "with" made Tier 0d decline
+    # a tract whose POB names a published plat corner outright.
+    r"\b(?:with|in|along)\s+(?:a|an|the|said)\s+[\w\- ]{0,24}?lines?\s+of\s+(?:said\s+)?",
+    re.IGNORECASE)
 _CONTACT_CONTINUING_RE = re.compile(
     r"\b(?:continuing|along)\s+with\s+said\b|\bwith\s+said\s+[\w\- ]{0,24}?lines?\b",
     re.IGNORECASE)
