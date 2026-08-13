@@ -275,7 +275,12 @@ _DMS_OCR = (r"(" + _D + r"{1,3})\s*(?:degrees?|deg\.?|[°º˚\"”])" + _SEP +
 _CHORD_CURVE_RE = re.compile(
     r"(?:curve\s+to\s+the\s+(right|left)[^.;]{0,80}?)?"
     r"arc\s+(?:distance|length)\s+of\s+([\d,]+\.?\d*)\s*" + _FEET +
-    r"[^.;]{0,40}?[Cc]hord\s+[Bb]e[a4]ring\s+(North|South)\s*" + _DMS_OCR + _SEP +
+    # "a chord bearing AND DISTANCE OF North 06 degrees 51 minutes 37 seconds
+    # East, 488.53 feet" -- covid 4781's Exhibit A states the chord that way, and
+    # requiring the cardinal to follow "bearing" directly dropped the whole curve.
+    # Its cost was exact and is the signature to look for: the traverse closed
+    # 488.678 ft out against the missing chord's own 488.53 ft.
+    r"[^.;]{0,40}?[Cc]hord\s+[Bb]e[a4]ring\s+(?:and\s+distance\s+of\s+)?(North|South)\s*" + _DMS_OCR + _SEP +
     r"(" + _EAST + r"|" + _WEST + r")[,\s]*[-–—]?[,\s]*([\d,]+\.?\d*)\s*" + _FEET,
     re.IGNORECASE | re.DOTALL,
 )
