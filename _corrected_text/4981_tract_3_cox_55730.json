@@ -54,8 +54,14 @@
    },
    "index_naming_trap": "Collin's plat index spells this subdivision 'HEIGHTS WESTRIDGE #3'; the deed says 'The Heights at Westridge Phase III' and the CAD says 'HEIGHTS AT WESTRIDGE PHASE III THE'. Searches on the deed's phrasing return ZERO rows and were briefly read as 'the plat is not indexed'. Search the base name and filter."
   },
-  "tie_status": "tract 3 is anchored but its Phase III tie is MARGINAL -- 10.78 ft residual over 414 ft of frontage, overlap at the 2,000 sq ft cap, best rotation -0.50 deg. Four hypotheses died on that residual (street buffer, footprint fragment, short contact leg, frontage) and only the fragment was a real bug. Usable for acreage; not for boundary-parcel calls until the platted west line is read."
+  "tie_status": "tract 3 is anchored on the Phase III adjoining-plat tie and that placement is INDEPENDENTLY CORROBORATED: its POB lands 13.3 ft from Collin's published southwest corner of Heights at Westridge Phase III -- which is what the deed says the POB IS -- and 12 of covid 4981's 88 census parcels fall inside it, with the tract touching the Phase III footprint (1,938 sq ft overlap). Neither check depends on the fit that produced the placement. The 10.78 ft residual is therefore a statement about fit quality along 414 ft of contact, NOT about gross position, and the four dead hypotheses about it matter less than they appeared to.",
+  "stated_coordinate_rejected": {
+   "coordinate": "X 2504190.311, Y 7117368.305 (EPSG 2276), printed on PLAT/2007/554",
+   "marks": "read at 400 dpi: the leader terminates at the south end of a 00-25-11 160.38 ft course",
+   "why_rejected": "that is NOT tract 3's closing 160.38 ft course. Placing tract 3's POB there puts it 4,470 ft from Phase III's published SW corner, 1,493 ft clear of the Phase III footprint, and containing 0 of 88 census parcels. Two courses of the same bearing and the same length exist ~4,470 ft apart in a development full of repeated street-crossing geometry; the coincidence was treated as an identity.",
+   "do_not_retry": "not without first matching the coordinate to a vertex of the PLAT's own recited traverse (sheet 2), then relating that to tract 3 through the shared line"
+  }
  },
  "chars": 6235,
- "recorded_at": "2026-08-13T16:54:03.105956+00:00"
+ "recorded_at": "2026-08-13T17:23:03.171713+00:00"
 }
